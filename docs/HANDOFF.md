@@ -204,7 +204,11 @@ All registered under `DISCORD_GUILD_ID`. Operator = `DISCORD_OPERATOR_USER_ID`.
 | `/panic` | `liquidate_all?` (default false) | Set kill switch `"true"` (+ optional full liquidation) |
 
 Buttons on the ONBOARDED embed: `⏸ Pause / ▶ Resume` toggles
-ACTIVE/PAUSED; `💰 Liquidate & Close` sells all, marks CLOSED, archives thread.
+ACTIVE/PAUSED; `💰 Liquidate & Close` sells all, marks CLOSED, archives the
+thread, and then disables both buttons. Liquidation validates first: an
+already-CLOSED or untracked market is reported without any sale, and a
+Manifold-resolved market is not sold because its positions settle
+automatically.
 
 Embeds: `[ONBOARDED]`, `[SIGNAL]`, `[TRADE]`, `[ERROR]`.
 
