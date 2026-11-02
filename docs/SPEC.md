@@ -149,7 +149,8 @@ CREATE TABLE tracked_markets (
   belief_updated_at    INTEGER NOT NULL,
   sieve_source         TEXT NOT NULL,
   discord_thread_id    TEXT NOT NULL,
-  created_at           INTEGER NOT NULL
+  created_at           INTEGER NOT NULL,
+  deleted_at           INTEGER            -- NULL while tracked; set by /untrack
 );
 
 CREATE TABLE signal_ledger (
@@ -184,6 +185,23 @@ CREATE TABLE kv (
   value TEXT NOT NULL
 );  -- 'jetstream_cursor_us', 'global_kill_switch'
 ```
+
+### 5.1 Market lifecycle and soft deletion
+
+- `ACTIVE` / `PAUSED` / `CLOSED` describe trading: a `CLOSED` market keeps its
+  row but no longer trades.
+- `deleted_at` describes tracking: `NULL` means the market is tracked. Setting
+  it (via `/untrack`) also forces `status = 'CLOSED'`.
+- A soft-deleted row, its `market_answers`, and its `signal_ledger` /
+  `trade_ledger` history stay in the database. Every listing query
+  (`list_markets`, `list_markets_by_status`) skips it, so it leaves the market
+  cache, `/status`, autocomplete, and `/panic` sweeps.
+- `get_market` still returns soft-deleted rows, so stale Discord embeds and a
+  repeated `/untrack` report "already untracked" instead of "not tracked".
+- Only re-onboarding is a hard delete: when `/track` targets a market whose
+  existing row is `CLOSED` (including a soft-deleted one), activation removes
+  that row and its answers before inserting the fresh lifecycle. The ledgers
+  keep the old history.
 
 ## 6. Components
 
@@ -430,7 +448,7 @@ Triggered by `/track url:<url> budget:<mana>`:
 | Command | Params | Behavior |
 |---|---|---|
 | `/track` | `url`, `budget` (default 100), `initial_prob` (optional) | Run onboarding. Reply with progress messages. |
-| `/untrack` | `market` (autocomplete), `liquidate` (default true) | Remove Sieve engine. If `liquidate`, sell all shares. Archive thread. |
+| `/untrack` | `market` (autocomplete), `liquidate` (default true) | Remove Sieve engine. If `liquidate`, sell all shares. Soft delete the market, keep its row and history, archive thread. |
 | `/budget` | `market`, `new_budget` | Update `budget_mana`. |
 | `/status` | `market` (optional) | Without arg: table of all markets (budget, invested, PnL, P_int vs P_mkt, triage queue depth, last signal). With arg: that market's full state including Sieve source and top 10 recent signals. |
 | `/override` | `market`, `probability` (1–99) | Set `p_internal_log_odds`. Trigger trade check. |
