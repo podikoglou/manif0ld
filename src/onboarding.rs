@@ -126,14 +126,23 @@ pub struct ManifoldSlugMarket {
     pub resolution_criteria: Option<String>,
     #[serde(rename = "closeTime", default)]
     pub close_time_ms: Option<i64>,
-    /// Present only on `BINARY` markets; absent on `MULTIPLE_CHOICE` and other
-    /// outcome types. Always `Some` after `validate_market` succeeds.
+    /// Present on `BINARY` markets; absent on `MULTIPLE_CHOICE`.
     #[serde(default)]
     pub probability: Option<f64>,
     #[serde(rename = "outcomeType")]
     pub outcome_type: String,
     #[serde(rename = "isResolved")]
     pub is_resolved: bool,
+    #[serde(default)]
+    pub answers: Option<Vec<ManifoldSlugAnswer>>,
+}
+
+/// One answer from a multiple choice market response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManifoldSlugAnswer {
+    pub id: String,
+    pub text: String,
+    pub probability: Option<f64>,
 }
 
 /// A Bluesky actor that may become a VIP for one market.
@@ -164,6 +173,7 @@ pub struct OnboardingDraft {
     pub vips: Vec<VipEntry>,
     pub sieve_source: String,
     pub warnings: Vec<String>,
+    pub answers: Vec<crate::types::TrackedAnswer>,
 }
 
 /// Fetches, synthesizes, and activates tracked markets.
@@ -236,11 +246,34 @@ impl OnboardingService {
         let sieve_source = synthesis.sieve_program;
         let tracked = build_market(&market, &slug, budget, initial_prob, sieve_source.clone());
 
+        let now = Utc::now().timestamp();
+        let answers: Vec<crate::types::TrackedAnswer> = market
+            .answers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|ans| {
+                let p = ans.probability.unwrap_or(0.5).clamp(0.01, 0.99);
+                crate::types::TrackedAnswer {
+                    id: ans.id.clone(),
+                    market_id: market.id.clone(),
+                    text: ans.text.clone(),
+                    p_internal_log_odds: belief::logit(p),
+                    p_market_last: p,
+                    belief_updated_at: now,
+                    yes_shares: 0.0,
+                    no_shares: 0.0,
+                    created_at: now,
+                }
+            })
+            .collect();
+
         Ok(OnboardingDraft {
             market: tracked,
             vips,
             sieve_source,
             warnings,
+            answers,
         })
     }
 
@@ -254,6 +287,7 @@ impl OnboardingService {
             mut market,
             vips,
             sieve_source,
+            answers,
             ..
         } = draft;
 
@@ -261,10 +295,18 @@ impl OnboardingService {
         self.db.insert_market(&market)?;
 
         let rollback = |market_id: &str| {
+            let _ = self.db.delete_answers_for_market(market_id);
             let _ = self.db.delete_vips_for_market(market_id);
             let _ = self.db.delete_market(market_id);
             let _ = self.registry.unregister(market_id);
         };
+
+        for answer in &answers {
+            if let Err(error) = self.db.upsert_answer(answer) {
+                rollback(&market.id);
+                return Err(error);
+            }
+        }
 
         if let Err(error) = self
             .registry
@@ -432,16 +474,12 @@ pub fn parse_slug(url: &str) -> AppResult<String> {
         .ok_or_else(|| anyhow!("Manifold market URL must include a market slug, got {url}"))
 }
 
-/// Rejects markets that cannot be traded as a simple binary contract.
-///
-/// Checks are ordered so the most descriptive error appears first: outcome type
-/// is validated before probability so a `MULTIPLE_CHOICE` market produces
-/// "not a binary market" rather than a missing-field parse error.
+/// Validates that a market is active and either BINARY or MULTIPLE_CHOICE with answers.
 pub fn validate_market(market: &ManifoldSlugMarket) -> AppResult<()> {
-    if market.outcome_type != "BINARY" {
+    if market.outcome_type != "BINARY" && market.outcome_type != "MULTIPLE_CHOICE" {
         bail!(
-            "market {} is not a binary market (outcomeType {}); \
-             only BINARY markets can be traded",
+            "market {} is neither BINARY nor MULTIPLE_CHOICE (outcomeType {}); \
+             only BINARY and MULTIPLE_CHOICE markets can be traded",
             market.id,
             market.outcome_type
         );
@@ -449,18 +487,26 @@ pub fn validate_market(market: &ManifoldSlugMarket) -> AppResult<()> {
     if market.is_resolved {
         bail!("market {} is already resolved", market.id);
     }
-    let probability = market.probability.ok_or_else(|| {
-        anyhow!(
-            "market {} is missing a probability (unexpected for a BINARY market)",
-            market.id
-        )
-    })?;
-    if !(probability > 0.0 && probability < 1.0) {
-        bail!(
-            "market {} probability {} must be strictly between 0 and 1",
-            market.id,
-            probability
-        );
+
+    if market.outcome_type == "BINARY" {
+        let probability = market.probability.ok_or_else(|| {
+            anyhow!(
+                "market {} is missing a probability (unexpected for a BINARY market)",
+                market.id
+            )
+        })?;
+        if !(probability > 0.0 && probability < 1.0) {
+            bail!(
+                "market {} probability {} must be strictly between 0 and 1",
+                market.id,
+                probability
+            );
+        }
+    } else if market.outcome_type == "MULTIPLE_CHOICE" {
+        let answers = market.answers.as_deref().unwrap_or(&[]);
+        if answers.is_empty() {
+            bail!("MULTIPLE_CHOICE market {} has no answers", market.id);
+        }
     }
     Ok(())
 }
@@ -487,9 +533,20 @@ pub fn build_sieve_user_prompt(market: &ManifoldSlugMarket) -> String {
         .filter(|text| !text.trim().is_empty())
         .unwrap_or(description);
 
+    let answers_section = if let Some(answers) = &market.answers {
+        if !answers.is_empty() {
+            let names: Vec<String> = answers.iter().map(|a| format!("\"{}\"", a.text)).collect();
+            format!("\nCandidate Answers / Options: {}\n", names.join(", "))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     format!(
         r#"Market id: {id}
-Market question: {question}
+Market question: {question}{answers_section}
 Market description: {description}
 Resolution criteria: {resolution}
 Market close time: {close_time}
@@ -502,6 +559,7 @@ Respond as JSON only, using exactly this shape:
 }}"#,
         id = market.id,
         question = market.question,
+        answers_section = answers_section,
     )
 }
 
@@ -694,6 +752,7 @@ mod tests {
             probability: Some(0.63),
             outcome_type: "BINARY".to_owned(),
             is_resolved: false,
+            answers: None,
         }
     }
 
@@ -741,6 +800,7 @@ mod tests {
             ],
             sieve_source: GOOD_SIEVE.to_owned(),
             warnings: Vec::new(),
+            answers: Vec::new(),
         }
     }
 
@@ -790,9 +850,23 @@ mod tests {
 
     #[test]
     fn validate_market_rejects_non_binary_resolved_and_extreme_probabilities() {
-        let mut non_binary = sample_market();
-        non_binary.outcome_type = "MULTIPLE_CHOICE".to_owned();
-        assert!(validate_market(&non_binary).is_err());
+        let mut non_binary_no_answers = sample_market();
+        non_binary_no_answers.outcome_type = "MULTIPLE_CHOICE".to_owned();
+        non_binary_no_answers.answers = None;
+        assert!(validate_market(&non_binary_no_answers).is_err());
+
+        let mut other_type = sample_market();
+        other_type.outcome_type = "NUMERIC".to_owned();
+        assert!(validate_market(&other_type).is_err());
+
+        let mut multi_valid = sample_market();
+        multi_valid.outcome_type = "MULTIPLE_CHOICE".to_owned();
+        multi_valid.answers = Some(vec![ManifoldSlugAnswer {
+            id: "ans-1".into(),
+            text: "Option A".into(),
+            probability: Some(0.4),
+        }]);
+        assert!(validate_market(&multi_valid).is_ok());
 
         let mut resolved = sample_market();
         resolved.is_resolved = true;
@@ -806,8 +880,7 @@ mod tests {
         one.probability = Some(1.0);
         assert!(validate_market(&one).is_err());
 
-        // A market missing probability (as returned by MULTIPLE_CHOICE markets)
-        // with a BINARY outcomeType is caught by the probability None check.
+        // A market missing probability with a BINARY outcomeType is caught by the probability None check.
         let mut no_prob = sample_market();
         no_prob.probability = None;
         assert!(validate_market(&no_prob).is_err());

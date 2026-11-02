@@ -2074,6 +2074,7 @@ mod tests {
             ],
             sieve_source: "match Market_M1 { \"rain\" }".to_owned(),
             warnings: Vec::new(),
+            answers: Vec::new(),
         };
 
         let embed = onboarded_embed(&draft);
