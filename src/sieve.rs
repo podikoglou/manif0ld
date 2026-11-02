@@ -31,12 +31,30 @@ use crate::types::MarketId;
 /// author is considered relevant by construction.
 pub type VipLookup = HashMap<MarketId, HashSet<String>>;
 
+/// A compiled engine that may be shared between threads.
+///
+/// `sieve::CompiledSieve` keeps a Cranelift `JITModule` alive, and that type is
+/// conservatively `!Send + !Sync` because it contains a `RefCell` symbol cache
+/// and boxed symbol-lookup closures. None of those fields are reachable after
+/// compilation: the only operation this crate performs on an engine is
+/// `matches`, which reads immutable prefilter data and calls generated machine
+/// code. The JIT module is held solely to keep the executable pages mapped.
+/// Wrapping the engine lets the registry live in `Arc` and be shared by the
+/// ingest task and per-market triage workers.
+struct SendEngine(sieve::CompiledSieve);
+
+// SAFETY: see the type comment. Construction happens on one thread; afterwards
+// `matches` is a pure read and generated code is immutable. Dropping the JIT
+// module frees mmap-backed memory and is not tied to the creating thread.
+unsafe impl Send for SendEngine {}
+unsafe impl Sync for SendEngine {}
+
 /// Compiled Sieve engines for every tracked market.
 ///
 /// The map is hot-swappable: registering an ID that already exists replaces the
 /// previous engine. All methods are safe to call from multiple threads.
 pub struct EngineRegistry {
-    engines: RwLock<HashMap<MarketId, sieve::CompiledSieve>>,
+    engines: RwLock<HashMap<MarketId, SendEngine>>,
 }
 
 impl Default for EngineRegistry {
@@ -57,14 +75,14 @@ impl EngineRegistry {
     ///
     /// A panic while holding the write lock must not take matching down with
     /// it: the map itself is still structurally valid, so the guard is reused.
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<MarketId, sieve::CompiledSieve>> {
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<MarketId, SendEngine>> {
         self.engines
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Acquires a write guard, recovering from lock poisoning.
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<MarketId, sieve::CompiledSieve>> {
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<MarketId, SendEngine>> {
         self.engines
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -74,7 +92,7 @@ impl EngineRegistry {
     ///
     /// Replacement is the hot-swap path used when a market is re-onboarded.
     pub fn register(&self, id: MarketId, engine: sieve::CompiledSieve) {
-        self.write().insert(id, engine);
+        self.write().insert(id, SendEngine(engine));
     }
 
     /// Compiles `source` and registers it for `id`.
@@ -110,7 +128,7 @@ impl EngineRegistry {
             let is_vip = vip_lookup
                 .get(id)
                 .is_some_and(|dids| dids.contains(author_did));
-            if is_vip || !engine.matches(text).is_empty() {
+            if is_vip || !engine.0.matches(text).is_empty() {
                 matched.push(id.clone());
             }
         }
