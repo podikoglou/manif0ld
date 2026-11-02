@@ -68,7 +68,7 @@ const DISCORD_CONTENT_LIMIT: usize = 2000;
 const MAX_STATUS_FIELDS: usize = 25;
 
 /// Characters per Sieve source field.
-const SIEVE_CHUNK_CHARS: usize = 1000;
+const SIEVE_CHUNK_CHARS: usize = 900;
 
 /// Maximum Sieve source fields kept in a status embed.
 ///
@@ -547,7 +547,7 @@ fn status_for_market(state: &DiscordState, query: &str) -> AppResult<CreateEmbed
         } else {
             format!("Sieve source ({})", index + 1)
         };
-        let mut value = chunk.clone();
+        let mut value = format!("```sieve\n{chunk}\n```");
         if index + 1 == shown && omitted > 0 {
             value.push_str(&format!(
                 "\n… {omitted} more field(s) truncated; see the database for the full rule."
@@ -679,7 +679,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
         .create_followup(
             &ctx.http,
             CreateInteractionResponseFollowup::new()
-                .content("Fetching market and writing the Sieve rule…")
+                .content("Tracking market…")
                 .ephemeral(true),
         )
         .await
@@ -706,13 +706,13 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             let header = match &attempt.error {
                 Some(_) => {
                     format!(
-                        "Sieve rule attempt {}/{} — failed",
+                        "Attempt {}/{} failed",
                         attempt.attempt, attempt.max_attempts
                     )
                 }
                 None => {
                     format!(
-                        "Sieve rule attempt {}/{} — compiled",
+                        "Attempt {}/{} compiled",
                         attempt.attempt, attempt.max_attempts
                     )
                 }
@@ -747,7 +747,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             send_followup(
                 ctx,
                 interaction,
-                "Market onboarding timed out after 120 seconds.",
+                "Timed out after 120 seconds.",
             )
             .await;
         }
@@ -763,7 +763,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
                 .and_then(|last| last.as_ref().filter(|a| a.error.is_some()).cloned());
             if let Some(attempt) = failed {
                 let header = format!(
-                    "Sieve rule synthesis failed after {} attempts.",
+                    "Failed after {} attempts.",
                     attempt.max_attempts
                 );
                 send_followup(
@@ -783,11 +783,10 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
                 .any(|cause| cause.to_string().contains("synthesizing a Sieve rule"));
             let content = if synthesis_failed {
                 format!(
-                    "Failed to track the market: the model request failed before any \
-                     Sieve program was written.\n{error:#}"
+                    "Failed to track market: model request failed.\n{error:#}"
                 )
             } else {
-                format!("Failed to track the market: {error:#}")
+                format!("Failed to track market: {error:#}")
             };
             send_followup(ctx, interaction, &content).await;
         }
@@ -852,7 +851,7 @@ async fn onboard(
         tracing::error!(thread_id, error = %error, "failed to post the [ONBOARDED] embed");
     }
 
-    Ok(format!("Market onboarded: <#{thread_id}>"))
+    Ok(format!("<#{thread_id}>"))
 }
 
 // -----------------------------------------------------------------------------
@@ -1869,7 +1868,7 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
 
     let mut embed = CreateEmbed::new()
         .title(truncate_chars(
-            &format!("✅ [ONBOARDED] {}", market.question),
+            &market.question,
             MAX_TITLE_CHARS,
         ))
         .field(
@@ -1893,7 +1892,7 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
     let shown = chunks.len().min(MAX_SIEVE_CHUNKS);
     let omitted = chunks.len().saturating_sub(shown);
     for (index, chunk) in chunks.iter().take(shown).enumerate() {
-        let mut value = chunk.clone();
+        let mut value = format!("```sieve\n{chunk}\n```");
         if index + 1 == shown && omitted > 0 {
             value.push_str(&format!(
                 "\n… {omitted} more field(s) truncated; see `/status` or the database for the \
@@ -2229,8 +2228,8 @@ mod tests {
         // CreateEmbed keeps its fields private; inspect the serialized form.
         let value = serde_json::to_value(&embed).expect("embed serializes");
         let title = value["title"].as_str().unwrap_or_default();
-        assert!(title.contains("[ONBOARDED]"), "{title}");
-        assert!(title.contains("Will it rain?"), "{title}");
+        assert!(!title.contains("[ONBOARDED]"), "{title}");
+        assert_eq!(title, "Will it rain?");
 
         let fields = value["fields"].as_array().expect("embed fields");
         let names: Vec<&str> = fields
@@ -2239,6 +2238,19 @@ mod tests {
             .collect();
         assert!(names.contains(&"Sieve source #1"), "{names:?}");
         assert!(names.contains(&"VIP handles"), "{names:?}");
+
+        let sieve_field = fields
+            .iter()
+            .find(|field| field["name"] == "Sieve source #1")
+            .expect("sieve source field");
+        assert!(
+            sieve_field["value"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("```sieve\nmatch Market_M1"),
+            "{:?}",
+            sieve_field["value"]
+        );
 
         let market_field = fields
             .iter()
