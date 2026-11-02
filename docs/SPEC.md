@@ -251,7 +251,17 @@ pub fn extract(event: &serde_json::Value) -> Option<ExtractedPost> {
     let text = parts.join(" ");
     if text.trim().is_empty() { return None; }
     Some(ExtractedPost {
-        uri: event["commit"]["uri"].as_str()?.to_string(),
+        // Jetstream commit events omit `commit.uri` and carry only `commit.rkey`.
+        // Build the canonical AT URI when the explicit field is absent.
+        uri: match event["commit"]["uri"].as_str() {
+            Some(uri) => uri.to_string(),
+            None => format!(
+                "at://{}/{}/{}",
+                event["did"].as_str()?,
+                event["commit"]["collection"].as_str()?,
+                event["commit"]["rkey"].as_str()?
+            ),
+        },
         did: event["did"].as_str()?.to_string(),
         handle: /* from account cache, or fallback to DID */,
         text,
@@ -259,6 +269,12 @@ pub fn extract(event: &serde_json::Value) -> Option<ExtractedPost> {
     })
 }
 ```
+
+**Jetstream event shape.** Real `commit` events contain `did`, `time_us`, `kind`, and a
+`commit` object with `rev`, `operation`, `collection`, `rkey`, `record`, and `cid`.
+They do **not** contain `commit.uri`; the canonical `at://{did}/{collection}/{rkey}`
+URI must be constructed. An explicit `commit.uri`, if a future event ever carries one,
+is preferred verbatim.
 
 **Explicitly not done here** (and belongs to Sieve, §7):
 
