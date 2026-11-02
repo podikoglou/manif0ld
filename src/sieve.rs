@@ -19,17 +19,11 @@
 //! cost N `matches` calls on a shared map with no per-post allocation beyond
 //! the returned market list.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::error::{anyhow, AppResult, Context};
 use crate::types::MarketId;
-
-/// VIP allow-list keyed by market ID.
-///
-/// An author DID in a market's set bypasses that market's Sieve rule: the
-/// author is considered relevant by construction.
-pub type VipLookup = HashMap<MarketId, HashSet<String>>;
 
 /// A compiled engine that may be shared between threads.
 ///
@@ -110,25 +104,16 @@ impl EngineRegistry {
         self.write().remove(id).is_some()
     }
 
-    /// Returns markets whose Sieve rule matched `text`, or whose VIP set
-    /// contains `author_did`.
+    /// Returns markets whose Sieve rule matched `text`.
     ///
     /// `text` is passed to Sieve verbatim. The result is sorted so callers get
     /// deterministic ordering regardless of hash-map iteration order.
-    pub fn matching_markets(
-        &self,
-        text: &str,
-        author_did: &str,
-        vip_lookup: &VipLookup,
-    ) -> Vec<MarketId> {
+    pub fn matching_markets(&self, text: &str) -> Vec<MarketId> {
         let engines = self.read();
         let mut matched = Vec::new();
 
         for (id, engine) in engines.iter() {
-            let is_vip = vip_lookup
-                .get(id)
-                .is_some_and(|dids| dids.contains(author_did));
-            if is_vip || !engine.0.matches(text).is_empty() {
+            if !engine.0.matches(text).is_empty() {
                 matched.push(id.clone());
             }
         }
@@ -176,7 +161,7 @@ mod tests {
     }
 
     fn matched(registry: &EngineRegistry, text: &str) -> Vec<MarketId> {
-        registry.matching_markets(text, "did:plc:author", &VipLookup::new())
+        registry.matching_markets(text)
     }
 
     #[test]
@@ -209,26 +194,6 @@ mod tests {
         let leetspeak = EngineRegistry::new();
         leetspeak.register("M".to_owned(), engine(r#"match M { "scam"~ }"#));
         assert_eq!(matched(&leetspeak, "S.C.A.M"), vec!["M".to_owned()]);
-    }
-
-    #[test]
-    fn vip_authors_bypass_the_sieve_rule() {
-        let registry = EngineRegistry::new();
-        registry.register("M".to_owned(), engine(r#"match M { "bitcoin" }"#));
-
-        let mut vip_lookup = VipLookup::new();
-        vip_lookup
-            .entry("M".to_owned())
-            .or_default()
-            .insert("did:plc:vip".to_owned());
-
-        assert_eq!(
-            registry.matching_markets("unrelated topic", "did:plc:vip", &vip_lookup),
-            vec!["M".to_owned()]
-        );
-        assert!(registry
-            .matching_markets("unrelated topic", "did:plc:other", &vip_lookup)
-            .is_empty());
     }
 
     #[test]
@@ -288,7 +253,7 @@ mod tests {
         let post = crate::extract::extract(&event).expect("event should extract");
         assert_eq!(post.text, "Apple just announced a new product");
         assert_eq!(
-            registry.matching_markets(&post.text, &post.did, &VipLookup::new()),
+            registry.matching_markets(&post.text),
             vec!["M".to_owned()]
         );
     }
