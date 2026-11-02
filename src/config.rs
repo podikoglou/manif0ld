@@ -32,7 +32,6 @@ pub struct Config {
     pub triage_model: String,
     pub onboarding_model: String,
     pub manifold_api_key: String,
-    pub manifold_bot_user_id: String,
     pub discord_bot_token: String,
     pub discord_guild_id: u64,
     pub discord_control_channel_id: u64,
@@ -71,7 +70,6 @@ impl Config {
         let triage_model = required(&get, "TRIAGE_MODEL")?;
         let onboarding_model = required(&get, "ONBOARDING_MODEL")?;
         let manifold_api_key = required(&get, "MANIFOLD_API_KEY")?;
-        let manifold_bot_user_id = required(&get, "MANIFOLD_BOT_USER_ID")?;
         let discord_bot_token = required(&get, "DISCORD_BOT_TOKEN")?;
         let discord_guild_id = required_u64(&get, "DISCORD_GUILD_ID")?;
         let discord_control_channel_id = required_u64(&get, "DISCORD_CONTROL_CHANNEL_ID")?;
@@ -99,7 +97,6 @@ impl Config {
             triage_model,
             onboarding_model,
             manifold_api_key,
-            manifold_bot_user_id,
             discord_bot_token,
             discord_guild_id,
             discord_control_channel_id,
@@ -207,7 +204,6 @@ mod tests {
             ("TRIAGE_MODEL", "@cf/google/gemini-test"),
             ("ONBOARDING_MODEL", "@cf/deepseek/test"),
             ("MANIFOLD_API_KEY", "manifold-key"),
-            ("MANIFOLD_BOT_USER_ID", "bot-user"),
             ("DISCORD_BOT_TOKEN", "discord-token"),
             ("DISCORD_GUILD_ID", "123456789012345678"),
             ("DISCORD_CONTROL_CHANNEL_ID", "223456789012345678"),

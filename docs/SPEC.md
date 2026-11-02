@@ -87,7 +87,7 @@ ONBOARDING_MODEL=@cf/deepseek/deepseek-v4.1-flash-1017 # verify exact identifier
 
 # Manifold
 MANIFOLD_API_KEY=...
-MANIFOLD_BOT_USER_ID=...
+# The bot user ID is fetched from GET /v0/me at startup.
 
 # Discord
 DISCORD_BOT_TOKEN=...
@@ -405,7 +405,7 @@ if no position and edge < −ENTRY_EDGE_THRESHOLD and target_mana >= MIN_TRADE_S
 |---|---|---|
 | Buy | `POST /v0/bet` | `{contractId, amount, outcome:"YES"|"NO", limitProb: 0.99 for YES / 0.01 for NO}` |
 | Sell | `POST /v0/market/{id}/sell` | `{outcome:"YES"|"NO", shares: <amount>}` |
-| Position | `GET /v0/bets?contractId={id}&userId={bot_user_id}` | — |
+| Position | `GET /v0/bets?contractId={id}&userId={bot_user_id}` (bot ID from `GET /v0/me` at startup) | — |
 | Market | `GET /v0/market/{id}` | — |
 
 Using `limitProb=0.99` (YES) / `0.01` (NO) emulates a market buy that fills at the current price, sweeping the AMM if needed. Verify this behavior on a test market before going live.
