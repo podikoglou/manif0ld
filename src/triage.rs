@@ -352,7 +352,8 @@ pub(crate) fn snippet(text: &str) -> String {
         return text.to_owned();
     }
 
-    let mut end = ERROR_SNIPPET_BYTES;
+    // Leave room for the ellipsis so the whole excerpt stays within the budget.
+    let mut end = ERROR_SNIPPET_BYTES - '…'.len_utf8();
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -547,6 +548,22 @@ mod tests {
                 "shape: {shape}"
             );
         }
+    }
+
+    #[test]
+    fn snippet_stays_within_the_byte_budget_and_never_splits_a_character() {
+        let long = "é".repeat(400);
+        let out = snippet(&long);
+
+        assert!(out.len() <= ERROR_SNIPPET_BYTES, "{}", out.len());
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn extract_json_object_tolerates_fences_and_surrounding_prose() {
+        let raw = format!("Here you go:\n```json\n{}\n```\nDone.", valid_json());
+        let value = WorkersAiClient::extract_json_object(&raw).expect("JSON object");
+        assert_eq!(value["direction"], "yes");
     }
 
     #[test]
