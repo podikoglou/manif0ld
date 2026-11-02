@@ -15,6 +15,7 @@
 mod belief;
 mod config;
 mod db;
+mod discord;
 mod error;
 mod extract;
 mod ingest;
@@ -32,6 +33,7 @@ use tokio::sync::broadcast;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{AppResult, Context};
+use crate::onboarding::OnboardingService;
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::trade::TradeExecutor;
 use crate::types::MarketStatus;
@@ -64,6 +66,16 @@ async fn main() -> AppResult<()> {
     );
 
     let cache = Arc::new(MarketCache::load(&db)?);
+
+    // Onboarding shares the registry; build it before the registry is moved
+    // into the pipeline.
+    let onboarding = Arc::new(OnboardingService::new(
+        &config,
+        db.clone(),
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+    )?);
+
     let pipeline = Arc::new(Pipeline::new(
         Arc::clone(&config),
         db.clone(),
@@ -74,6 +86,9 @@ async fn main() -> AppResult<()> {
     // Subscribe before spawning the executor: the broadcast channel has no
     // history, so a subscriber created later would miss early signals.
     let trade_events = pipeline.events().subscribe();
+    // Discord subscribes before either loop starts for the same reason: a
+    // receiver created after the tasks are running may miss startup events.
+    let discord_pipeline_events = pipeline.events().subscribe();
 
     // Resolving the bot identity here makes a bad API key a startup failure
     // instead of silently disabling trading.
@@ -86,6 +101,17 @@ async fn main() -> AppResult<()> {
         bot_user_id = executor.client().bot_user_id(),
         "Manifold client ready"
     );
+    let discord_trade_events = executor.events().subscribe();
+
+    let discord_state = discord::DiscordState {
+        config: Arc::clone(&config),
+        db: db.clone(),
+        registry: Arc::clone(&pipeline.registry),
+        cache: Arc::clone(&cache),
+        pipeline: Arc::clone(&pipeline),
+        onboarding,
+        executor: Arc::clone(&executor),
+    };
 
     let post_tx = ingest::channel();
     let post_rx = post_tx.subscribe();
@@ -114,6 +140,14 @@ async fn main() -> AppResult<()> {
         }
     });
 
+    let discord_task = tokio::spawn(async move {
+        if let Err(error) =
+            discord::run(discord_state, discord_pipeline_events, discord_trade_events).await
+        {
+            tracing::error!(error = %error, "discord stopped");
+        }
+    });
+
     let event_task = tokio::spawn(async move {
         loop {
             match pipeline_events.recv().await {
@@ -135,6 +169,7 @@ async fn main() -> AppResult<()> {
     trade_task.abort();
     ingest_task.abort();
     event_task.abort();
+    discord_task.abort();
 
     Ok(())
 }
