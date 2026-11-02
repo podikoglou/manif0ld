@@ -513,7 +513,7 @@ fn status_for_market(state: &DiscordState, query: &str) -> AppResult<CreateEmbed
 
     let mut embed = CreateEmbed::new()
         .title(truncate_chars(
-            &format!("📈 {}", market.question),
+            &market.question,
             MAX_TITLE_CHARS,
         ))
         .field("ID", &market.id, true)
@@ -855,7 +855,7 @@ async fn onboard(
     }
 
     let thread_name = format!(
-        "📈 [M{budget}] {}",
+        "[M{budget}] {}",
         shorten_question(&draft.market.question, 50)
     );
     let thread = ChannelId::new(state.config.discord_control_channel_id)
@@ -1214,7 +1214,7 @@ async fn panic_mode(state: &DiscordState, ctx: &Context, interaction: &CommandIn
             .context("setting the global kill switch")?;
 
         let mut summary = String::from(
-            "⚠️ Global kill switch is **ON**. Future buys are blocked; sells remain allowed.\n\
+            "Global kill switch is **ON**. Future buys are blocked; sells remain allowed.\n\
              To disable it, edit the `global_kill_switch` kv entry (or hand off to an operator); \
              there is no un-panic command.",
         );
@@ -1475,10 +1475,10 @@ async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: Comp
             let paused = new_status == MarketStatus::Paused;
             let buttons = vec![
                 CreateButton::new(button_custom_id("pause", &market_id))
-                    .label(if paused { "▶ Resume" } else { "⏸ Pause" })
+                    .label(if paused { "Resume" } else { "Pause" })
                     .style(ButtonStyle::Secondary),
                 CreateButton::new(button_custom_id("liquidate", &market_id))
-                    .label("💰 Liquidate & Close")
+                    .label("Liquidate & Close")
                     .style(ButtonStyle::Secondary),
             ];
             // Only the buttons are replaced; the embed is preserved.
@@ -1660,7 +1660,7 @@ async fn consume_pipeline_events(
                 let channel = channel_for_market(&db, &config, Some(&market_id));
 
                 let mut embed = CreateEmbed::new()
-                    .title(truncate_chars(&format!("📡 {question}"), MAX_TITLE_CHARS))
+                    .title(truncate_chars(&format!("[SIGNAL] {question}"), MAX_TITLE_CHARS))
                     .description(truncate_chars(&text, MAX_DESCRIPTION_CHARS))
                     .field(
                         "Author",
@@ -1718,7 +1718,7 @@ async fn consume_pipeline_events(
                 tracing::error!(market_id = ?market_id, message = %message, "pipeline error");
                 let channel = channel_for_market(&db, &config, market_id.as_deref());
                 let mut embed = CreateEmbed::new()
-                    .title("❌ [ERROR]")
+                    .title("[ERROR]")
                     .colour(Colour::RED)
                     .description(truncate_chars(&message, MAX_DESCRIPTION_CHARS));
                 if let Some(market_id) = market_id {
@@ -1755,7 +1755,7 @@ async fn consume_trade_events(
             }) => {
                 let channel = channel_for_market(&db, &config, Some(&market_id));
                 let embed = CreateEmbed::new()
-                    .title(format!("💸 {action}"))
+                    .title(format!("[TRADE] {action}"))
                     .field("Market", &market_id, false)
                     .field("Mana amount", format!("{mana_amount:.4}"), true)
                     .field("Shares delta", format!("{shares_delta:+.4}"), true)
@@ -1776,7 +1776,7 @@ async fn consume_trade_events(
                 tracing::error!(market_id = ?market_id, message = %message, "trade error");
                 let channel = channel_for_market(&db, &config, market_id.as_deref());
                 let mut embed = CreateEmbed::new()
-                    .title("❌ [ERROR]")
+                    .title("[ERROR]")
                     .colour(Colour::RED)
                     .description(truncate_chars(&message, MAX_DESCRIPTION_CHARS));
                 if let Some(market_id) = market_id {
@@ -1953,10 +1953,10 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
 fn onboarded_buttons(market_id: &str) -> Vec<CreateButton> {
     vec![
         CreateButton::new(button_custom_id("pause", market_id))
-            .label("⏸ Pause")
+            .label("Pause")
             .style(ButtonStyle::Secondary),
         CreateButton::new(button_custom_id("liquidate", market_id))
-            .label("💰 Liquidate & Close")
+            .label("Liquidate & Close")
             .style(ButtonStyle::Secondary),
     ]
 }
