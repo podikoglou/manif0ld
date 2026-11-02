@@ -39,7 +39,7 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{bail, AppResult, Context as AnyhowContext};
-use crate::onboarding::{OnboardingDraft, OnboardingService, SieveAttempt};
+use crate::onboarding::{OnboardUpdate, OnboardingDraft, OnboardingService, SieveAttempt};
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
 use crate::trade::{LiquidationOutcome, TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
@@ -661,11 +661,13 @@ fn discord_timestamp(timestamp: i64) -> String {
 ///
 /// The heavy Manifold + LLM + Bluesky lookups are wrapped in
 /// [`ONBOARD_TIMEOUT`]. A progress message is posted after deferral so the
-/// operator knows the command is running while the lookups complete; during
-/// Sieve synthesis that same message is edited on every attempt to show the
-/// current program and, when it failed to parse or compile, the error below it.
-/// A failed synthesis reports the last edited attempt again as the final
-/// message so the operator keeps a complete record.
+/// operator knows the command is running while the lookups complete. Every
+/// [`OnboardUpdate`] replaces that message the moment it is produced: a phase
+/// line while a slow step runs, and one report per Sieve attempt showing the
+/// program in a code block and, below it, the validation error in a second code
+/// block. A failed synthesis leaves the last attempt on screen under a final
+/// attempt count, so the operator keeps a complete record without waiting for
+/// every try to run first.
 async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
     let Some(url) = string_option(interaction, "url") else {
         respond_ephemeral(ctx, interaction, "Missing the required `url` option.").await;
@@ -705,39 +707,39 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
     };
     let progress_id = progress.id;
 
-    // Each Sieve generation replaces the previous report on the progress
-    // message; only the current attempt is ever shown. `last_attempt` keeps the
-    // terminal report so a failed synthesis can be re-sent as the final message.
-    let (attempts_tx, mut attempts_rx) = mpsc::channel::<SieveAttempt>(2);
-    let last_attempt = Arc::new(Mutex::new(None));
+    // Each update replaces the previous report on the progress message. A
+    // failed attempt is remembered so a failed synthesis can be closed out with
+    // a final attempt count.
+    let (updates_tx, mut updates_rx) = mpsc::channel::<OnboardUpdate>(4);
+    let last_failure = Arc::new(Mutex::new(None));
     let update_ctx = ctx.clone();
-    let last_for_update = Arc::clone(&last_attempt);
+    let last_for_update = Arc::clone(&last_failure);
     let updater = tokio::spawn(async move {
-        while let Some(attempt) = attempts_rx.recv().await {
-            if let Ok(mut last) = last_for_update.lock() {
-                *last = Some(attempt.clone());
-            }
-            let header = match &attempt.error {
-                Some(_) => {
-                    format!(
-                        "Attempt {}/{} failed",
-                        attempt.attempt, attempt.max_attempts
-                    )
-                }
-                None => {
-                    format!(
-                        "Attempt {}/{} compiled",
-                        attempt.attempt, attempt.max_attempts
-                    )
+        let mut editing = true;
+        while let Some(update) = updates_rx.recv().await {
+            let content = match update {
+                OnboardUpdate::Phase(text) => text,
+                OnboardUpdate::Sieve(attempt) => {
+                    if attempt.error.is_some() {
+                        if let Ok(mut last) = last_for_update.lock() {
+                            *last = Some(attempt.clone());
+                        }
+                    }
+                    let header = sieve_header(&attempt);
+                    sieve_report(&header, &attempt.script, attempt.error.as_deref())
                 }
             };
-            let content = sieve_report(&header, &attempt.script, attempt.error.as_deref());
+            // An edit failure must not stall onboarding: keep draining the
+            // channel so senders never block, and report the first failure once.
+            if !editing {
+                continue;
+            }
             if let Err(error) = progress
                 .edit(&update_ctx.http, EditMessage::new().content(content))
                 .await
             {
                 tracing::warn!(error = %error, "failed to update the /track sieve status message");
-                break;
+                editing = false;
             }
         }
     });
@@ -750,7 +752,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             &url,
             budget,
             initial_prob,
-            attempts_tx,
+            updates_tx,
         ),
     )
     .await;
@@ -758,51 +760,44 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
 
     match result {
         Err(_) => {
-            send_followup(
+            finish_track_progress(
                 ctx,
                 interaction,
+                progress_id,
                 "Timed out after 120 seconds.",
             )
             .await;
         }
         Ok(Err(error)) => {
             tracing::warn!(error = ?error, "/track failed");
-            // When synthesis itself failed, the last attempt already carries
-            // the script and the error; report it in one block instead of the
-            // plain error text. Other failures keep the current message. The
-            // attempt is extracted (and the guard released) before any await.
-            let failed = last_attempt
-                .lock()
-                .ok()
-                .and_then(|last| last.as_ref().filter(|a| a.error.is_some()).cloned());
-            if let Some(attempt) = failed {
-                let header = format!(
-                    "Failed after {} attempts.",
-                    attempt.max_attempts
-                );
-                send_followup(
-                    ctx,
-                    interaction,
-                    &sieve_report(&header, &attempt.script, attempt.error.as_deref()),
-                )
-                .await;
-                return;
-            }
-            // No attempt was ever reported: the model request itself failed
-            // before any program was written, or a pre-synthesis step failed.
-            // Either way the operator needs the whole error chain, which the
-            // legacy `{}` render hid behind the outermost context label.
-            let synthesis_failed = error
-                .chain()
-                .any(|cause| cause.to_string().contains("synthesizing a Sieve rule"));
-            let content = if synthesis_failed {
-                format!(
-                    "Failed to track market: model request failed.\n{error:#}"
-                )
-            } else {
-                format!("Failed to track market: {error:#}")
+            // When synthesis itself failed, the progress message already shows
+            // the last program and its error; only the header changes, so the
+            // operator keeps the complete record in one message. Other failures
+            // fall back to the plain error chain. The failure is extracted (and
+            // the guard released) before any await.
+            let failed = last_failure.lock().ok().and_then(|last| last.clone());
+            let content = match failed {
+                Some(attempt) => {
+                    let header = format!("Failed after {} attempts.", attempt.max_attempts);
+                    sieve_report(&header, &attempt.script, attempt.error.as_deref())
+                }
+                None => {
+                    // No attempt was ever reported: the model request itself
+                    // failed before any program was written, or a pre-synthesis
+                    // step failed. Either way the operator needs the whole error
+                    // chain, which the legacy `{}` render hid behind the
+                    // outermost context label.
+                    let synthesis_failed = error
+                        .chain()
+                        .any(|cause| cause.to_string().contains("synthesizing a Sieve rule"));
+                    if synthesis_failed {
+                        format!("Failed to track market: model request failed.\n{error:#}")
+                    } else {
+                        format!("Failed to track market: {error:#}")
+                    }
+                }
             };
-            send_followup(ctx, interaction, &content).await;
+            finish_track_progress(ctx, interaction, progress_id, &content).await;
         }
         Ok(Ok(_)) => {
             if let Err(error) = interaction.delete_followup(&ctx.http, progress_id).await {
@@ -812,6 +807,32 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
                 tracing::debug!(error = %error, "failed to delete interaction response");
             }
         }
+    }
+}
+
+/// Replaces the `/track` progress followup with its terminal content.
+///
+/// Editing keeps one run to a single message, so a timeout or a failure lands
+/// where the operator is already looking instead of in another message. When
+/// the edit fails (for example the message was deleted), the same content is
+/// sent as a new followup so the result is never lost.
+async fn finish_track_progress(
+    ctx: &Context,
+    interaction: &CommandInteraction,
+    progress_id: MessageId,
+    content: &str,
+) {
+    let trimmed = truncate_chars(content, DISCORD_CONTENT_LIMIT);
+    let edit = interaction
+        .edit_followup(
+            &ctx.http,
+            progress_id,
+            CreateInteractionResponseFollowup::new().content(trimmed),
+        )
+        .await;
+    if let Err(error) = edit {
+        tracing::warn!(error = %error, "failed to edit the /track progress message");
+        send_followup(ctx, interaction, content).await;
     }
 }
 
@@ -827,9 +848,9 @@ async fn onboard(
     url: &str,
     budget: f64,
     initial_prob: Option<u8>,
-    attempts: mpsc::Sender<SieveAttempt>,
+    updates: mpsc::Sender<OnboardUpdate>,
 ) -> AppResult<()> {
-    let draft = state.onboarding.prepare(url, budget, initial_prob, &attempts).await?;
+    let draft = state.onboarding.prepare(url, budget, initial_prob, &updates).await?;
 
     if let Some(existing) = state.db.get_market(&draft.market.id)? {
         if existing.status != MarketStatus::Closed {
@@ -1261,16 +1282,23 @@ async fn send_followup(ctx: &Context, interaction: &CommandInteraction, content:
 
 /// Renders one Sieve synthesis report for a message's `content`.
 ///
-/// The program the model wrote and, below it, its validation error appear
-/// inside one code block, so the error cannot be mistaken for prose. A report
-/// without an error is the compiled candidate. Content stays within Discord's
-/// character limit: when needed the script is truncated from the end so the
-/// error and the closing fence always survive.
+/// The program the model wrote sits in its own `sieve` block and, when
+/// validation failed, the error sits in a second block below it, so the error
+/// can neither be mistaken for prose nor be read as part of the program. A
+/// report without an error is the compiled candidate. Content stays within
+/// Discord's character limit: the script is truncated first, and the error is
+/// bounded too, so both blocks and the closing fences always survive.
 fn sieve_report(header: &str, script: &str, error: Option<&str>) -> String {
+    const ERROR_LIMIT: usize = 700;
     let opening = "```sieve\n";
     let closing = "\n```";
     let suffix = error
-        .map(|error| format!("\n\nError: {error}"))
+        .map(|error| {
+            format!(
+                "\n\nError\n```text\n{}\n```",
+                truncate_chars(error, ERROR_LIMIT)
+            )
+        })
         .unwrap_or_default();
     let overhead: usize = header.chars().count()
         + 1
@@ -1278,7 +1306,21 @@ fn sieve_report(header: &str, script: &str, error: Option<&str>) -> String {
         + closing.chars().count()
         + suffix.chars().count();
     let script = truncate_chars(script, DISCORD_CONTENT_LIMIT.saturating_sub(overhead));
-    format!("{header}\n{opening}{script}{suffix}{closing}")
+    format!("{header}\n{opening}{script}{closing}{suffix}")
+}
+
+/// The one-line header of a Sieve synthesis report.
+fn sieve_header(attempt: &SieveAttempt) -> String {
+    match attempt.error {
+        Some(_) => format!(
+            "Attempt {}/{} failed",
+            attempt.attempt, attempt.max_attempts
+        ),
+        None => format!(
+            "Attempt {}/{} compiled",
+            attempt.attempt, attempt.max_attempts
+        ),
+    }
 }
 
 /// Responds to a synchronous command with its success message or truncated error.
@@ -2077,42 +2119,74 @@ mod tests {
     // -- Sieve synthesis report ---------------------------------------------
 
     #[test]
-    fn sieve_report_shows_script_and_error_in_one_block() {
+    fn sieve_report_shows_script_and_error_in_separate_blocks() {
         let report = sieve_report(
-            "Sieve rule attempt 2/5 — failed",
+            "Attempt 2/5 failed",
             "match Market_x { \"unterminated }",
             Some("unterminated string literal at 1:24"),
         );
         assert!(
-            report.starts_with("Sieve rule attempt 2/5 — failed\n```sieve\n"),
+            report.starts_with("Attempt 2/5 failed\n```sieve\n"),
             "report: {report}"
         );
-        assert!(report.contains("match Market_x { \"unterminated }"));
-        assert!(report.contains("Error: unterminated string literal at 1:24"));
-        assert!(report.ends_with("\n```"), "report: {report}");
+        assert_eq!(
+            report,
+            "Attempt 2/5 failed\n\
+             ```sieve\n\
+             match Market_x { \"unterminated }\n\
+             ```\n\n\
+             Error\n\
+             ```text\n\
+             unterminated string literal at 1:24\n\
+             ```",
+            "report: {report}"
+        );
         assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
     }
 
     #[test]
     fn sieve_report_without_error_shows_only_the_script() {
         let report = sieve_report(
-            "Sieve rule attempt 3/5 — compiled",
+            "Attempt 3/5 compiled",
             "match Market_x { \"launch\" }",
             None,
         );
-        assert!(report.ends_with("\n```"), "report: {report}");
-        assert!(report.contains("match Market_x { \"launch\" }"));
-        assert!(!report.contains("Error:"));
+        assert_eq!(
+            report,
+            "Attempt 3/5 compiled\n```sieve\nmatch Market_x { \"launch\" }\n```",
+            "report: {report}"
+        );
+        assert!(!report.contains("Error"));
         assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
     }
 
     #[test]
-    fn sieve_report_truncates_a_long_script_but_keeps_error_and_fence() {
+    fn sieve_report_truncates_long_parts_but_keeps_both_fences() {
         let long_script: String = "x".repeat(3000);
-        let report = sieve_report("Sieve rule attempt 1/5 — failed", &long_script, Some("boom"));
+        let long_error: String = "y".repeat(3000);
+        let report = sieve_report("Attempt 1/5 failed", &long_script, Some(&long_error));
         assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
-        assert!(report.ends_with("Error: boom\n```"), "report: {report}");
         assert!(report.contains('…'), "truncation marker missing in: {report}");
+        assert_eq!(report.matches("```").count(), 4, "report: {report}");
+        assert!(report.contains("Error\n```text\n"), "report: {report}");
+        assert!(report.ends_with("```"), "report: {report}");
+    }
+
+    #[test]
+    fn sieve_header_names_the_attempt_and_outcome() {
+        let failed = SieveAttempt {
+            attempt: 2,
+            max_attempts: 5,
+            script: "x".to_owned(),
+            error: Some("boom".to_owned()),
+        };
+        assert_eq!(sieve_header(&failed), "Attempt 2/5 failed");
+
+        let compiled = SieveAttempt {
+            error: None,
+            ..failed
+        };
+        assert_eq!(sieve_header(&compiled), "Attempt 2/5 compiled");
     }
 
     #[test]
