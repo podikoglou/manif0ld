@@ -134,6 +134,9 @@ pub struct ExtractedPost {
 pub struct TrackedMarket {
     pub id: String,
     pub slug: String,
+    /// Canonical Manifold page URL captured at onboarding time. Empty for rows
+    /// created before migration 002; renderers fall back to a slug-only URL.
+    pub market_url: String,
     pub question: String,
     pub description: String,
     pub resolution_criteria: String,
@@ -406,6 +409,7 @@ mod tests {
         let market = TrackedMarket {
             id: "m".into(),
             slug: "m".into(),
+            market_url: String::new(),
             question: "?".into(),
             description: String::new(),
             resolution_criteria: String::new(),
@@ -431,6 +435,7 @@ mod tests {
         let mut market = TrackedMarket {
             id: "m".into(),
             slug: "m".into(),
+            market_url: String::new(),
             question: "?".into(),
             description: String::new(),
             resolution_criteria: String::new(),

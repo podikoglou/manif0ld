@@ -441,6 +441,7 @@ mod tests {
         TrackedMarket {
             id: MarketId::from("Market_test"),
             slug: "will-the-thing-happen".to_owned(),
+            market_url: String::new(),
             question: "Will the thing happen by Friday?".to_owned(),
             description: "A market about the thing.".to_owned(),
             resolution_criteria: "Resolves YES if the thing happens.".to_owned(),

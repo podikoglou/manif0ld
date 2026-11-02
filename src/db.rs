@@ -14,7 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::types::{MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, TradeRecord};
 
-const MARKET_COLUMNS: &str = "id, slug, question, description, resolution_criteria, close_time, \
+const MARKET_COLUMNS: &str = "id, slug, market_url, question, description, resolution_criteria, close_time, \
      status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, no_shares, \
      p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, discord_thread_id, \
      created_at";
@@ -77,9 +77,24 @@ impl Db {
         }
         conn.execute_batch(include_str!("../migrations/001_init.sql"))
             .context("applying database schema")?;
+        Self::apply_migrations(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Applies guarded, one-way migrations on top of the base schema.
+    ///
+    /// The base file uses `IF NOT EXISTS`, so it is safe to run on every open.
+    /// Anything beyond that must be checked first because existing databases
+    /// were created before the column existed.
+    fn apply_migrations(conn: &Connection) -> AppResult<()> {
+        // 002: `market_url` on `tracked_markets`. Run the ALTER exactly once.
+        if !table_has_column(conn, "tracked_markets", "market_url")? {
+            conn.execute_batch(include_str!("../migrations/002_market_url.sql"))
+                .context("applying database migration 002 (market_url)")?;
+        }
+        Ok(())
     }
 
     fn lock(&self) -> AppResult<MutexGuard<'_, Connection>> {
@@ -98,14 +113,15 @@ impl Db {
     pub fn insert_market(&self, market: &TrackedMarket) -> AppResult<()> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO tracked_markets (id, slug, question, description, resolution_criteria, \
+            "INSERT INTO tracked_markets (id, slug, market_url, question, description, resolution_criteria, \
              close_time, status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, \
              no_shares, p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, \
              discord_thread_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 market.id,
                 market.slug,
+                market.market_url,
                 market.question,
                 market.description,
                 market.resolution_criteria,
@@ -536,27 +552,44 @@ fn invalid_text(column: usize, message: String) -> rusqlite::Error {
     )
 }
 
+/// Reports whether `table` has a column named `column`.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .context("preparing column listing")?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("querying table columns")?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn market_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedMarket> {
-    let status: String = row.get(6)?;
+    let status: String = row.get(7)?;
     Ok(TrackedMarket {
         id: row.get(0)?,
         slug: row.get(1)?,
-        question: row.get(2)?,
-        description: row.get(3)?,
-        resolution_criteria: row.get(4)?,
-        close_time: row.get(5)?,
-        status: status.parse().map_err(|message| invalid_text(6, message))?,
-        budget_mana: row.get(7)?,
-        invested_mana: row.get(8)?,
-        realized_pnl_mana: row.get(9)?,
-        yes_shares: row.get(10)?,
-        no_shares: row.get(11)?,
-        p_internal_log_odds: row.get(12)?,
-        p_market_last: row.get(13)?,
-        belief_updated_at: row.get(14)?,
-        sieve_source: row.get(15)?,
-        discord_thread_id: row.get(16)?,
-        created_at: row.get(17)?,
+        market_url: row.get(2)?,
+        question: row.get(3)?,
+        description: row.get(4)?,
+        resolution_criteria: row.get(5)?,
+        close_time: row.get(6)?,
+        status: status.parse().map_err(|message| invalid_text(7, message))?,
+        budget_mana: row.get(8)?,
+        invested_mana: row.get(9)?,
+        realized_pnl_mana: row.get(10)?,
+        yes_shares: row.get(11)?,
+        no_shares: row.get(12)?,
+        p_internal_log_odds: row.get(13)?,
+        p_market_last: row.get(14)?,
+        belief_updated_at: row.get(15)?,
+        sieve_source: row.get(16)?,
+        discord_thread_id: row.get(17)?,
+        created_at: row.get(18)?,
     })
 }
 
@@ -621,6 +654,7 @@ mod tests {
         TrackedMarket {
             id: id.to_owned(),
             slug: format!("slug-{id}"),
+            market_url: String::new(),
             question: format!("Question {id}?"),
             description: "Description".to_owned(),
             resolution_criteria: "Resolves YES if the thing happens.".to_owned(),
@@ -723,6 +757,55 @@ mod tests {
         let market = sample_market("m1", 1);
         db.insert_market(&market).expect("first insert");
         assert!(db.insert_market(&market).is_err());
+    }
+
+    #[test]
+    fn market_url_survives_a_roundtrip_through_the_database() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let mut market = sample_market("m1", 1);
+        market.market_url = "https://manifold.markets/Jack1/2026-melbourne-cup-winner".to_owned();
+        db.insert_market(&market).expect("insert market");
+
+        let loaded = db.get_market("m1").expect("load market").expect("row exists");
+        assert_eq!(loaded.market_url, market.market_url);
+    }
+
+    #[test]
+    fn market_url_migration_backfills_existing_rows() {
+        // Simulate a database created before migration 002: run only the base
+        // schema and insert a row without the column.
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch(include_str!("../migrations/001_init.sql"))
+            .expect("base schema applies");
+        conn.execute(
+            "INSERT INTO tracked_markets \
+             (id, slug, question, description, resolution_criteria, status, budget_mana, \
+              invested_mana, realized_pnl_mana, yes_shares, no_shares, p_internal_log_odds, \
+              p_market_last, belief_updated_at, sieve_source, discord_thread_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                "old", "old-slug", "Q?", "D", "C", "ACTIVE", 100.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.5, 1, "match Old { \"x\" }", "", 1,
+            ],
+        )
+        .expect("pre-migration row inserts");
+
+        Db::apply_migrations(&conn).expect("migration 002 applies");
+        assert!(table_has_column(&conn, "tracked_markets", "market_url").expect("has column"));
+
+        // The pre-existing row is readable and defaults to an empty URL.
+        let loaded: TrackedMarket = conn
+            .query_row(
+                &format!("SELECT {MARKET_COLUMNS} FROM tracked_markets WHERE id = 'old'"),
+                [],
+                market_from_row,
+            )
+            .expect("pre-002 row still reads");
+        assert_eq!(loaded.market_url, "");
+        assert_eq!(loaded.slug, "old-slug");
+
+        // Applying again is a no-op.
+        Db::apply_migrations(&conn).expect("migration 002 is idempotent");
     }
 
     #[test]

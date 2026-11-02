@@ -681,6 +681,7 @@ mod tests {
         TrackedMarket {
             id: id.to_owned(),
             slug: format!("slug-{id}"),
+            market_url: String::new(),
             question: format!("Question {id}?"),
             description: "Description".to_owned(),
             resolution_criteria: "Resolves YES if the thing happens.".to_owned(),

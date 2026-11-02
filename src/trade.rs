@@ -1500,6 +1500,7 @@ mod tests {
         TrackedMarket {
             id: "Market_test".to_owned(),
             slug: "will-the-thing-happen".to_owned(),
+            market_url: String::new(),
             question: "Will the thing happen?".to_owned(),
             description: String::new(),
             resolution_criteria: String::new(),
