@@ -66,7 +66,11 @@ const ERROR_SNIPPET_CHARS: usize = 500;
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Key in the `kv` table holding the panic switch.
-const KILL_SWITCH_KEY: &str = "global_kill_switch";
+///
+/// Published so the Discord `/panic` command can write the same key the trading
+/// layer reads. The switch is enabled only by writing the literal `true`; there
+/// is deliberately no disable command, operators clear it by editing the entry.
+pub(crate) const KILL_SWITCH_KEY: &str = "global_kill_switch";
 
 /// Capacity of the trade event stream consumed by the Discord layer.
 const EVENT_CAPACITY: usize = 256;
