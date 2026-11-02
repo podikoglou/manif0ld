@@ -112,26 +112,32 @@ Pipelines ticks every 60s per active market (fresh prob + position, decide).
 
 These are deliberate; read them before changing things.
 
-### 5.1 Cloudflare: Workers AI REST endpoint, not the old gateway route
-The spec §4 note suggested `gateway.ai.cloudflare.com/.../compat`. The env
-actually has `CF_AI_GATEWAY_URL`, `CF_AI_GATEWAY_ID`, and `CF_API_KEY`, so the
-implementation uses:
+### 5.1 Cloudflare: Workers AI `/ai/run` through the vendored `rig`
+Every LLM call goes through the vendored `rig` Cloudflare provider. Upstream
+rig has no `/ai/run` provider, so this repo's `rig/` checkout adds one
+(`crates/rig-core/src/providers/cloudflare.rs` plus a wire hook). It posts one
+stateless JSON request to `/ai/run` with the universal envelope:
 
 ```
 POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run
-Authorization: Bearer {CF_API_KEY}
-cf-aig-gateway-id: {CF_AI_GATEWAY_ID}
-{"model": "{TRIAGE_MODEL}", "input": {"messages": [...]}}
+Authorization: Bearer {CLOUDFLARE_API_TOKEN}
+cf-aig-gateway-id: {CLOUDFLARE_AI_GATEWAY_ID}
+{"model": "{model}", "input": {"messages": [...]}}
 ```
 
-- `{account_id}` is parsed from the last path segment of `CF_AI_GATEWAY_URL`
-  (`Config::cf_account_id`); startup fails if the `.env.example` placeholder
-  `{account_id}` is still present.
-- **`CF_API_KEY` is the same credential the old `CF_AI_GATEWAY_TOKEN` var was
-  meant to hold.** The name was changed.
+- `{account_id}` comes from `CLOUDFLARE_ACCOUNT_ID`; a missing or placeholder
+  value fails at startup (`Config` guard), not as a confusing 404 on the first
+  call.
+- The gateway id comes from `CLOUDFLARE_AI_GATEWAY_ID` (the legacy
+  `CF_AI_GATEWAY_ID` name is accepted) and defaults to Cloudflare's `default`
+  gateway.
+- The `/ai/run` reply (`{"result": {"response": "…"}}`) is translated back
+  into the OpenAI `choices` shape rig's decoder expects, so `response.text()`
+  returns the assistant text.
 - Target route is any Workers AI account that exposes `/ai/run` for universal
-  models. OpenAI-compatible routing (`/ai/v1/chat/completions`) is noted as a
-  fallback in the triage module docs if a model is not available on `/ai/run`.
+  models (e.g. `openai/gpt-4.1`) and `@cf/…` models. The OpenAI-compatible
+  gateway route (`/ai/v1/chat/completions`) is NOT used: the two routes speak
+  different envelopes, and this account serves `/ai/run`.
 
 ### 5.2 Manifold: positions, not bets, for reconciliation
 Spec §6.6 said to reconcile via `GET /v0/bets`. That cannot distinguish held
@@ -145,11 +151,14 @@ mixes realized + unrealized).
 There is no such thing; the bot user ID is fetched from `GET /v0/me` at
 startup by `TradeExecutor::new`.
 
-### 5.4 No `rig`
-`rig` 0.46 has no Workers AI `/ai/run` provider, and its OpenAI-compatible
-client does not emit the `{model, input:{messages}}` envelope. The LLM calls
-are one stateless JSON POST, so `reqwest` is used directly. Rationale in the
-`triage.rs` module doc.
+### 5.4 LLM transport: the vendored `rig` Cloudflare provider
+Upstream `rig` 0.46 has no Workers AI `/ai/run` provider, so this repo's
+vendored `rig/` checkout adds one: `crates/rig-core/src/providers/cloudflare.rs`
+plus an additive `BodyRewrite` and reply-translation hook in the openai wire.
+The application only uses `rig::providers::cloudflare::from_env()` and rig's
+standard `completion` builder, so vendor changes stay inside `rig/`. Do not
+replace this with a hand-rolled client; keep every patch inside the vendored
+checkout. Rationale in the `triage.rs` module doc.
 
 ### 5.5 Sieve engine is `Send + Sync` via a newtype
 Cranelift's `JITModule` is conservatively `!Send + !Sync`. `src/sieve.rs`

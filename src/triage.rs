@@ -6,30 +6,31 @@
 //! [`TriageResult`], and [`is_material`] applies the materiality threshold from
 //! the specification.
 //!
-//! # Transport: the `rig` Cloudflare provider
+//! # Transport: the `rig` Cloudflare provider, patched for `/ai/run`
 //!
 //! Every LLM call in this crate goes through the vendored `rig` library's
-//! [`cloudflare`](rig::providers::cloudflare) provider, which speaks the OpenAI
-//! Chat Completions wire to `…/accounts/{account_id}/ai/v1/chat/completions`.
+//! [`cloudflare`](rig::providers::cloudflare) provider (added in this repo's
+//! `rig/` checkout; upstream rig has no `/ai/run` provider). It posts to the
+//! Workers AI universal endpoint `…/accounts/{account_id}/ai/run` with the
+//! `{model, input: {messages}}` envelope and translates the `{"result":
+//! {"response": …}}` reply back into the OpenAI shape rig's decoder expects.
 //! The provider reads `CLOUDFLARE_API_TOKEN` (an `Authorization: Bearer`
 //! credential), `CLOUDFLARE_ACCOUNT_ID` (the URL's account segment, validated
-//! by [`crate::config::Config`] at startup), and `CLOUDFLARE_AI_GATEWAY_ID`
-//! (default `default`) from the process environment, and stamps
-//! `cf-aig-gateway-id` on every request. [`LlmClient`] wraps the rig client so
-//! triage and onboarding share one handle; [`TriageClient`] adds only the
-//! triage prompt and model choice.
+//! by [`crate::config::Config`] at startup), and the gateway id from
+//! `CLOUDFLARE_AI_GATEWAY_ID` (the legacy `CF_AI_GATEWAY_ID` name is accepted;
+//! default `default`), and stamps `cf-aig-gateway-id` on every request.
+//! [`LlmClient`] wraps the rig client so triage and onboarding share one
+//! handle; [`TriageClient`] adds only the triage prompt and model choice.
 //!
 //! # JSON extraction
 //!
 //! Triage prompts the model for JSON and then parses it resiliently
 //! ([`extract_json_object`]: Markdown fences, leading prose, and trailing text
-//! are tolerated). rig's native structured output (`response_format:
-//! json_schema`) is deliberately not used: it only works on models that honor
-//! `response_format` on the chat-completions route, and the triage parse is
-//! the risk filter for the whole program, so the crate does not want to depend
-//! on that capability across the `@cf/…` models a Cloudflare gateway serves.
-//! The resilient parse keeps the exact reliability envelope this module was
-//! already tested against.
+//! are tolerated). Structured output is deliberately not used: it only works
+//! on models that honor it, and the triage parse is the risk filter for the
+//! whole program, so the crate does not want to depend on that capability
+//! across the `@cf/…` models Workers AI serves. The resilient parse keeps the
+//! exact reliability envelope this module was already tested against.
 //!
 //! Request timeouts are the bundled `rig` reqwest client's (reqwest's
 //! 30-second default); the API token is held by the rig provider and never

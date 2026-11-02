@@ -28,8 +28,11 @@ reference and API contracts.
   − invested`; never exceed `budget_mana` net.
 - **No autonomous market discovery.** Markets enter only via the operator
   `/track` command.
-- **Cloudflare LLM calls use `/ai/run`** with `cf-aig-gateway-id` and
-  `CF_API_KEY`, not the legacy gateway/compat route (see `docs/HANDOFF.md` §5.1).
+- **Cloudflare LLM calls use `/ai/run`** through the vendored `rig`
+  Cloudflare provider with `cf-aig-gateway-id` and `CLOUDFLARE_API_TOKEN`,
+  not the legacy gateway/compat route (see `docs/HANDOFF.md` §5.1). Never
+  replace that provider with a hand-rolled client; patch the `rig/` vendor if
+  the wire must change.
 - **Position truth = Manifold `/positions`**, and the bot user ID comes from
   `/v0/me` — there is no bot-user env var (`docs/HANDOFF.md` §5.2–5.3).
 
