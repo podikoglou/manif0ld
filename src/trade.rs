@@ -68,6 +68,9 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(60);
 /// Key in the `kv` table holding the panic switch.
 const KILL_SWITCH_KEY: &str = "global_kill_switch";
 
+/// Capacity of the trade event stream consumed by the Discord layer.
+const EVENT_CAPACITY: usize = 256;
+
 /// Limit price that emulates a market buy of YES shares.
 const YES_LIMIT_PROB: f64 = 0.99;
 
@@ -673,6 +676,34 @@ pub fn apply_sell(
 // Executor
 // -----------------------------------------------------------------------------
 
+/// Events published by the trading layer for downstream consumers.
+///
+/// The Discord layer renders these as `[TRADE]` and `[ERROR]` embeds. Events
+/// are emitted only for executed trades and for failures the trade loop
+/// observes; a no-op decision stays silent because there is nothing to report.
+#[derive(Debug, Clone)]
+pub enum TradeEvent {
+    /// One buy or sell was filled and persisted.
+    Trade {
+        market_id: MarketId,
+        action: TradeAction,
+        /// Mana paid for a buy or received for a sell, fees included.
+        mana_amount: f64,
+        /// Signed share change: positive for a buy, negative for a sell.
+        shares_delta: f64,
+        p_internal: f64,
+        p_market: f64,
+        /// Budget still deployable after the trade.
+        available_budget: f64,
+        bet_id: Option<String>,
+    },
+    /// A trade check or execution failed.
+    Error {
+        market_id: Option<MarketId>,
+        message: String,
+    },
+}
+
 /// Executes trades and keeps local state in step with Manifold.
 ///
 /// All state-changing operations ([`TradeExecutor::evaluate_market`],
@@ -686,6 +717,7 @@ pub struct TradeExecutor {
     params: TradeParams,
     halflife_hours: f64,
     execution_lock: Mutex<()>,
+    events: broadcast::Sender<TradeEvent>,
 }
 
 impl TradeExecutor {
@@ -697,6 +729,7 @@ impl TradeExecutor {
         let client = ManifoldClient::new(config)
             .await
             .context("initializing the Manifold client")?;
+        let (events, _) = broadcast::channel(EVENT_CAPACITY);
 
         Ok(Self {
             client,
@@ -705,7 +738,13 @@ impl TradeExecutor {
             params: TradeParams::from_config(config),
             halflife_hours: config.belief_halflife_hours,
             execution_lock: Mutex::new(()),
+            events,
         })
+    }
+
+    /// Returns a sender that can be subscribed to for trade events.
+    pub fn events(&self) -> broadcast::Sender<TradeEvent> {
+        self.events.clone()
     }
 
     /// The underlying Manifold client, used for direct queries by callers such
@@ -812,6 +851,7 @@ impl TradeExecutor {
         };
 
         self.persist_market(&market)?;
+        self.emit_trade(&market, &record);
         Ok(Some(record))
     }
 
@@ -923,10 +963,12 @@ impl TradeExecutor {
                 amount_mana: 0.0,
                 shares: Some(held),
             };
-            self.execute_sell(&mut market, &decision, p_internal, p_market, None, now)
+            let record = self
+                .execute_sell(&mut market, &decision, p_internal, p_market, None, now)
                 .await
                 .with_context(|| format!("liquidating {action} on market {market_id}"))?;
             self.persist_market(&market)?;
+            self.emit_trade(&market, &record);
         }
 
         Ok(())
@@ -953,6 +995,19 @@ impl TradeExecutor {
             }
         }
         errors
+    }
+
+    /// Publishes a filled trade after the database and cache were updated.
+    ///
+    /// A receiver that is not running yet is normal: the broadcast channel has
+    /// no history and events are best-effort.
+    fn emit_trade(&self, market: &TrackedMarket, record: &TradeRecord) {
+        let _ = self.events.send(trade_event(market, record));
+    }
+
+    /// Publishes a trade-loop failure.
+    fn emit_error(&self, market_id: Option<MarketId>, message: String) {
+        let _ = self.events.send(TradeEvent::Error { market_id, message });
     }
 
     /// Consumes pipeline signals and runs a 60-second sync ticker.
@@ -992,6 +1047,7 @@ impl TradeExecutor {
                                     error = %error,
                                     "trade check failed after a material signal"
                                 );
+                                self.emit_error(Some(market_id), error.to_string());
                             }
                         }
                         Ok(_) => {}
@@ -1010,6 +1066,10 @@ impl TradeExecutor {
                             market_id = %market_id,
                             error = %error,
                             "scheduled market sync failed"
+                        );
+                        self.emit_error(
+                            Some(market_id).filter(|id| !id.is_empty()),
+                            error.to_string(),
                         );
                     }
                 }
@@ -1167,6 +1227,23 @@ impl TradeExecutor {
 /// Whether an action opens a position.
 fn is_buy(action: TradeAction) -> bool {
     matches!(action, TradeAction::BuyYes | TradeAction::BuyNo)
+}
+
+/// Builds the event for a persisted trade.
+///
+/// The available budget is read from the already-updated market snapshot, so it
+/// reflects the post-trade position rather than the size that was requested.
+fn trade_event(market: &TrackedMarket, record: &TradeRecord) -> TradeEvent {
+    TradeEvent::Trade {
+        market_id: record.market_id.clone(),
+        action: record.action,
+        mana_amount: record.mana_amount,
+        shares_delta: record.shares_delta,
+        p_internal: record.p_internal,
+        p_market: record.p_market,
+        available_budget: available_budget(market),
+        bet_id: record.manifold_bet_id.clone(),
+    }
 }
 
 /// Replaces the local position fields with Manifold's and warns when they
@@ -1688,6 +1765,59 @@ mod tests {
         });
         let position = parse_position(&raw, "bot-1");
         assert_close(position.yes_shares, 5.0);
+    }
+
+    #[test]
+    fn trade_event_reports_the_post_trade_available_budget() {
+        // After a successful sell the released basis and profit are available
+        // again, so the event must not report the pre-trade budget.
+        let market = market_with(100.0, 10.0, 2.0, 20.0, 0.0);
+        let record = TradeRecord {
+            id: 7,
+            market_id: market.id.clone(),
+            action: TradeAction::SellYes,
+            mana_amount: 12.0,
+            shares_delta: -20.0,
+            p_internal: 0.55,
+            p_market: 0.5,
+            trigger_post_uri: None,
+            manifold_bet_id: Some("bet-9".to_owned()),
+            created_at: 1_700_000_000,
+        };
+
+        match trade_event(&market, &record) {
+            TradeEvent::Trade {
+                market_id,
+                action,
+                mana_amount,
+                shares_delta,
+                available_budget,
+                bet_id,
+                ..
+            } => {
+                assert_eq!(market_id, "Market_test");
+                assert_eq!(action, TradeAction::SellYes);
+                assert_close(mana_amount, 12.0);
+                assert_close(shares_delta, -20.0);
+                // 100 budget + 2 realized PnL - 10 still invested.
+                assert_close(available_budget, 92.0);
+                assert_eq!(bet_id.as_deref(), Some("bet-9"));
+            }
+            other => panic!("expected a trade event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_op_decision_has_no_trade_to_report() {
+        // The event is emitted only after a filled trade; a flat market whose
+        // edge sits inside the entry band produces no decision at all.
+        let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
+        assert!(decide_trade(&market, 0.54, 0.5, params()).is_none());
+        assert!(decide_trade(&market, 0.46, 0.5, params()).is_none());
+
+        let (sender, mut receiver) = broadcast::channel::<TradeEvent>(4);
+        assert!(receiver.try_recv().is_err(), "no event may be queued");
+        assert_eq!(sender.receiver_count(), 1);
     }
 
     #[test]
