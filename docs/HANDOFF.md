@@ -30,11 +30,11 @@ Single Rust crate plus the Sieve engine it depends on.
 | `src/db.rs` | SQLite (rusqlite) access layer |
 | `src/ingest.rs` | Jetstream websocket, reconnect, cursor persistence |
 | `src/extract.rs` | Jetstream event → `ExtractedPost` (structural only) |
-| `src/sieve.rs` | `EngineRegistry` (one compiled Sieve per market) + VIP bypass |
+| `src/sieve.rs` | `EngineRegistry` (one compiled Sieve per market) |
 | `src/triage.rs` | `WorkersAiClient` transport + LLM triage call/parse |
 | `src/belief.rs` | Log-odds belief, time decay, impulse |
 | `src/trade.rs` | Manifold client, Kelly sizing, `TradeExecutor`, position sync |
-| `src/onboarding.rs` | `/track`: fetch market, LLM Sieve synthesis, VIP resolution |
+| `src/onboarding.rs` | `/track`: fetch market, LLM Sieve synthesis |
 | `src/pipeline.rs` | Orchestration: match → triage queue → belief → ledger → events |
 | `src/discord.rs` | Bot, commands, buttons, embeds, event consumers |
 | `migrations/001_init.sql` | Schema (applied automatically at startup) |
@@ -73,7 +73,7 @@ key).
 ## 4. Data flow
 
 ```
-Jetstream WS ─► ingest ─► extract ─► pipeline (per market: Sieve match | VIP)
+Jetstream WS ─► ingest ─► extract ─► pipeline (per market: Sieve match)
                                         │
                                         ▼
                                per-market bounded queue (30, drop-oldest)
@@ -196,12 +196,11 @@ All registered under `DISCORD_GUILD_ID`. Operator = `DISCORD_OPERATOR_USER_ID`.
 
 | Command | Params | Behavior |
 |---|---|---|
-| `/track` | `url`, `budget?` (default `DEFAULT_MARKET_BUDGET`), `initial_prob?` (1–99) | Fetch market, LLM Sieve synthesis, compile, resolve VIPs, create thread `📈 [M{budget}] {short}`, post `[ONBOARDED]` embed with buttons |
+| `/track` | `url`, `budget?` (default `DEFAULT_MARKET_BUDGET`), `initial_prob?` (1–99) | Fetch market, LLM Sieve synthesis, compile, create thread `📈 [M{budget}] {short}`, post `[ONBOARDED]` embed with buttons |
 | `/untrack` | `market` (autocomplete), `liquidate?` (default true) | Liquidate, unregister engine, delete rows, archive thread |
 | `/budget` | `market`, `new_budget` | Update budget, refresh cache |
 | `/status` | `market?` | Overview table or per-market detail incl. Sieve source + last 10 signals |
 | `/override` | `market`, `probability` (1–99) | Set internal probability, trigger one trade check |
-| `/vip` | `market`, `handle` | Resolve handle → DID via Bluesky, insert VIP |
 | `/panic` | `liquidate_all?` (default false) | Set kill switch `"true"` (+ optional full liquidation) |
 
 Buttons on the ONBOARDED embed: `⏸ Pause / ▶ Resume` toggles
@@ -218,7 +217,7 @@ deleted). Documented in `discord.rs`.
 ## 7. Verification status
 
 ### Done
-- `cargo test`: 168 passed, 0 failed.
+- `cargo test`: 172 passed, 0 failed.
 - `cargo clippy -p bsky-manifold-arb --all-targets --no-deps -- -D warnings`: clean.
 - `cargo build --release`: builds.
 - Unit coverage includes: `extract.rs` byte-for-byte preservation (`"S.C.A.M 🚨"`,
@@ -226,7 +225,7 @@ deleted). Documented in `discord.rs`.
   belief decay/half-life/clamping, Kelly sizing, buy/sell accounting,
   positions parsing, cursor tracker, queue depth accounting, Discord helpers
   (option parsing, thread naming, autocomplete, button id round-trip),
-  onboarding slug/validation/synthesis parsing/VIP selection.
+  onboarding slug/validation/synthesis parsing.
 - Verified against Manifold docs (2026): `/v0/me`, `/v0/market/{id}`,
   `/v0/bet` limitProb, `/v0/market/{id}/sell`, positions, ms timestamps.
 
@@ -251,15 +250,15 @@ deleted). Documented in `discord.rs`.
   `git status` shows `?? sieve/`.
 - **Kill switch clearing** is manual (§6). A `/resume` command is a small
   addition if desired.
-- **Handle resolution** falls back to DIDs (§5.7). VIP bypass works by DID.
-  Bluesky handles in `[SIGNAL]` embeds may be DIDs for non-VIP authors.
+- **Handle resolution** falls back to DIDs (§5.7); Bluesky handles in
+  `[SIGNAL]` embeds may appear as DIDs.
 - **Bluesky account cache** in `ingest.rs`: exclude-self filtering is minimal;
   the bot processes all `app.bsky.feed.post` creations, including the
   operator's own posts.
 - **`/status` market probability** is the cached `p_market_last`, updated on
   signals and the 60s ticker, not fresh per call.
-- **Rate limits**: Manifold 500 req/min, Bluesky public API applies to VIP
-  lookup; the executor serializes trades per process with a tokio mutex and
+- **Rate limits**: Manifold 500 req/min; the executor serializes trades per
+  process with a tokio mutex and
   emits per-market errors without stopping.
 - Arguably the biggest risk: a token with a wrong `DISCORD_CONTROL_CHANNEL_ID`
   or an autocomplete-heavy guild command set will make interaction handlers
