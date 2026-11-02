@@ -11,6 +11,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rig = { path = "rig", default-features = false, features = ["reqwest", "rustls"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +26,9 @@ url = "2"
 
 [workspace]
 members = ["sieve"]
+# `rig` is its own workspace (vendored); Cargo must treat it as an external
+# path dependency, not absorb it as a member of this workspace.
+exclude = ["rig"]
 
 # Keep debug artifacts small; this project is large enough to fill a disk.
 [profile.dev]

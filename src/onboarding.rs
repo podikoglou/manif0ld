@@ -11,8 +11,8 @@
 //!    insert rolls the new row back.
 //!
 //! All Manifold and Bluesky HTTP calls use short timeouts and put the HTTP
-//! status plus a bounded body excerpt into errors. The Workers AI key lives in
-//! [`WorkersAiClient`] and never appears in an error or log line.
+//! status plus a bounded body excerpt into errors. The Cloudflare credential
+//! lives in the rig provider and never appears in an error or log line.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use crate::db::Db;
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::pipeline::MarketCache;
 use crate::sieve::{self, EngineRegistry};
-use crate::triage::{snippet, WorkersAiClient};
+use crate::triage::{extract_json_object, snippet, LlmClient};
 use crate::types::{MarketStatus, TrackedMarket, VipEntry};
 
 /// Manifold slug lookup endpoint; the slug is appended as a path segment.
@@ -160,7 +160,7 @@ pub struct OnboardingDraft {
 
 /// Fetches, synthesizes, and activates tracked markets.
 pub struct OnboardingService {
-    ai: WorkersAiClient,
+    ai: LlmClient,
     model: String,
     db: Db,
     registry: Arc<EngineRegistry>,
@@ -176,7 +176,7 @@ impl OnboardingService {
         cache: Arc<MarketCache>,
     ) -> AppResult<Self> {
         Ok(Self {
-            ai: WorkersAiClient::new(config)?,
+            ai: LlmClient::new()?,
             model: config.onboarding_model.clone(),
             db,
             registry,
@@ -488,8 +488,7 @@ Respond as JSON only, using exactly this shape:
 
 /// Parses a synthesis answer into its Sieve program and VIP queries.
 pub fn parse_sieve_synthesis(raw: &str) -> AppResult<SieveSynthesis> {
-    let value =
-        WorkersAiClient::extract_json_object(raw).context("parsing Sieve synthesis response")?;
+    let value = extract_json_object(raw).context("parsing Sieve synthesis response")?;
     let synthesis: SieveSynthesis =
         serde_json::from_value(value).context("parsing Sieve synthesis JSON")?;
 
@@ -727,7 +726,7 @@ mod tests {
         cache: Arc<MarketCache>,
     ) -> OnboardingService {
         OnboardingService {
-            ai: WorkersAiClient::for_test(),
+            ai: LlmClient::for_test(),
             model: "test-model".to_owned(),
             db,
             registry,

@@ -26,9 +26,7 @@ const DEFAULT_BELIEF_HALFLIFE_HOURS: f64 = 4.0;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub jetstream_url: String,
-    pub cf_ai_gateway_url: String,
-    pub cf_ai_gateway_id: String,
-    pub cf_api_key: String,
+    pub cloudflare_account_id: String,
     pub triage_model: String,
     pub onboarding_model: String,
     pub manifold_api_key: String,
@@ -64,9 +62,12 @@ impl Config {
         let jetstream_url =
             optional(&get, "JETSTREAM_URL").unwrap_or_else(|| DEFAULT_JETSTREAM_URL.to_owned());
 
-        let cf_ai_gateway_url = required(&get, "CF_AI_GATEWAY_URL")?;
-        let cf_ai_gateway_id = required(&get, "CF_AI_GATEWAY_ID")?;
-        let cf_api_key = required(&get, "CF_API_KEY")?;
+        // The rig cloudflare provider reads `CLOUDFLARE_API_TOKEN` and
+        // `CLOUDFLARE_AI_GATEWAY_ID` from the process environment itself. This
+        // struct validates the account id here so a missing or placeholder
+        // value fails at startup, and owns the model names the LLM calls use.
+        let cloudflare_account_id = required(&get, "CLOUDFLARE_ACCOUNT_ID")?;
+        validate_cloudflare_account_id(&cloudflare_account_id)?;
         let triage_model = required(&get, "TRIAGE_MODEL")?;
         let onboarding_model = required(&get, "ONBOARDING_MODEL")?;
         let manifold_api_key = required(&get, "MANIFOLD_API_KEY")?;
@@ -91,9 +92,7 @@ impl Config {
 
         let config = Self {
             jetstream_url,
-            cf_ai_gateway_url,
-            cf_ai_gateway_id,
-            cf_api_key,
+            cloudflare_account_id,
             triage_model,
             onboarding_model,
             manifold_api_key,
@@ -111,48 +110,29 @@ impl Config {
             db_path,
         };
 
-        // Fail at startup, not on the first LLM call, if the gateway URL is
-        // still the placeholder from .env.example.
-        config.cf_account_id()?;
         Ok(config)
     }
+}
 
-    /// Extracts the Cloudflare account ID from the gateway URL.
-    ///
-    /// `CF_AI_GATEWAY_URL` has the shape
-    /// `https://gateway.ai.cloudflare.com/v1/{account_id}`, so the last path
-    /// segment is the account ID. A literal `{account_id}` placeholder is
-    /// rejected with a clear error.
-    pub fn cf_account_id(&self) -> AppResult<String> {
-        let account_id = self
-            .cf_ai_gateway_url
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .trim();
-
-        if account_id.is_empty() || account_id.starts_with('{') {
-            bail!(
-                "CF_AI_GATEWAY_URL must end with the Cloudflare account id; \
-                 see .env.example"
-            );
-        }
-
-        Ok(account_id.to_owned())
+/// Rejects an account id no URL can carry.
+///
+/// `CLOUDFLARE_ACCOUNT_ID` is interpolated into the endpoint URL by the rig
+/// cloudflare provider, which already refuses anything that could not live in
+/// a path segment. The extra guard catches the literal `{account_id}`
+/// placeholder from `.env.example` (previously `CF_AI_GATEWAY_URL` carried it)
+/// so a setup error fails at config load rather than as a confusing 404 on the
+/// first LLM call.
+fn validate_cloudflare_account_id(account_id: &str) -> AppResult<()> {
+    if account_id.starts_with('{')
+        || account_id.contains('/')
+        || account_id.chars().any(char::is_whitespace)
+    {
+        bail!(
+            "CLOUDFLARE_ACCOUNT_ID must be a non-empty account id with no `/`, braces, or \
+             whitespace; replace the `{{account_id}}` placeholder in .env.example"
+        );
     }
-
-    /// Builds the Workers AI `/ai/run` endpoint.
-    ///
-    /// The request also needs `Authorization: Bearer <CF_API_KEY>` and
-    /// `cf-aig-gateway-id: <CF_AI_GATEWAY_ID>` headers. The triage client adds
-    /// those headers; they are not part of the URL.
-    pub fn cf_ai_run_url(&self) -> AppResult<String> {
-        Ok(format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/ai/run",
-            self.cf_account_id()?
-        ))
-    }
+    Ok(())
 }
 
 /// Returns a trimmed, non-empty value, or `None` when the variable is absent or
@@ -198,9 +178,7 @@ mod tests {
     /// are intentionally omitted so defaults can be asserted.
     fn required_vars() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("CF_AI_GATEWAY_URL", "https://gateway.example/v1/a"),
-            ("CF_AI_GATEWAY_ID", "test-gateway"),
-            ("CF_API_KEY", "cf-token"),
+            ("CLOUDFLARE_ACCOUNT_ID", "test-account"),
             ("TRIAGE_MODEL", "@cf/google/gemini-test"),
             ("ONBOARDING_MODEL", "@cf/deepseek/test"),
             ("MANIFOLD_API_KEY", "manifold-key"),
@@ -311,33 +289,37 @@ mod tests {
     }
 
     #[test]
-    fn extracts_cloudflare_account_id_and_run_url() {
-        let mut vars = required_vars();
-        vars.retain(|(name, _)| *name != "CF_AI_GATEWAY_URL");
-        vars.push((
-            "CF_AI_GATEWAY_URL",
-            "https://gateway.ai.cloudflare.com/v1/0123456789abcdef/",
-        ));
+    fn stores_cloudflare_account_id_and_models() {
+        let config = config_from(&required_vars()).expect("config should load");
 
-        let config = config_from(&vars).expect("config should load");
-        assert_eq!(config.cf_account_id().unwrap(), "0123456789abcdef");
-        assert_eq!(
-            config.cf_ai_run_url().unwrap(),
-            "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef/ai/run"
-        );
+        assert_eq!(config.cloudflare_account_id, "test-account");
+        assert_eq!(config.triage_model, "@cf/google/gemini-test");
+        assert_eq!(config.onboarding_model, "@cf/deepseek/test");
     }
 
     #[test]
     fn rejects_placeholder_account_id() {
         let mut vars = required_vars();
-        vars.retain(|(name, _)| *name != "CF_AI_GATEWAY_URL");
-        vars.push((
-            "CF_AI_GATEWAY_URL",
-            "https://gateway.ai.cloudflare.com/v1/{account_id}",
-        ));
+        vars.retain(|(name, _)| *name != "CLOUDFLARE_ACCOUNT_ID");
+        vars.push(("CLOUDFLARE_ACCOUNT_ID", "{account_id}"));
 
         let error = config_from(&vars).expect_err("placeholder should fail");
-        assert!(error.to_string().contains("CF_AI_GATEWAY_URL"));
+        assert!(error.to_string().contains("CLOUDFLARE_ACCOUNT_ID"), "{error}");
+    }
+
+    #[test]
+    fn rejects_account_id_that_cannot_live_in_a_url() {
+        for bad in ["has whitespace", "has/slash"] {
+            let mut vars = required_vars();
+            vars.retain(|(name, _)| *name != "CLOUDFLARE_ACCOUNT_ID");
+            vars.push(("CLOUDFLARE_ACCOUNT_ID", bad));
+
+            let error = config_from(&vars).expect_err("unusable account id should fail");
+            assert!(
+                error.to_string().contains("CLOUDFLARE_ACCOUNT_ID"),
+                "{bad}: {error}"
+            );
+        }
     }
 
     #[test]

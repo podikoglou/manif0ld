@@ -1,4 +1,4 @@
-//! LLM triage: one Cloudflare Workers AI call per matched post.
+//! LLM triage: one Cloudflare AI Gateway call per matched post.
 //!
 //! Triage asks a small model whether a Bluesky post is material evidence for a
 //! prediction market, and if so in which direction and how strongly. The model
@@ -6,32 +6,41 @@
 //! [`TriageResult`], and [`is_material`] applies the materiality threshold from
 //! the specification.
 //!
-//! # Why `reqwest` instead of `rig`
+//! # Transport: the `rig` Cloudflare provider
 //!
-//! This client talks directly to the Workers AI REST endpoint
-//! (`/accounts/{account_id}/ai/run`) with a `{model, input: {messages}}`
-//! envelope and the `cf-aig-gateway-id` header. `rig` 0.46 has no Workers AI
-//! `/ai/run` provider, and its OpenAI-compatible client does not emit this
-//! envelope. Triage is a single stateless JSON call, so a direct `reqwest` POST
-//! is simpler and matches the documented request shape exactly.
+//! Every LLM call in this crate goes through the vendored `rig` library's
+//! [`cloudflare`](rig::providers::cloudflare) provider, which speaks the OpenAI
+//! Chat Completions wire to `…/accounts/{account_id}/ai/v1/chat/completions`.
+//! The provider reads `CLOUDFLARE_API_TOKEN` (an `Authorization: Bearer`
+//! credential), `CLOUDFLARE_ACCOUNT_ID` (the URL's account segment, validated
+//! by [`crate::config::Config`] at startup), and `CLOUDFLARE_AI_GATEWAY_ID`
+//! (default `default`) from the process environment, and stamps
+//! `cf-aig-gateway-id` on every request. [`LlmClient`] wraps the rig client so
+//! triage and onboarding share one handle; [`TriageClient`] adds only the
+//! triage prompt and model choice.
 //!
-//! [`WorkersAiClient`] owns the transport and is shared with onboarding, which
-//! uses the same endpoint for Sieve-rule synthesis. [`TriageClient`] adds only
-//! the triage prompt and model choice. The API key is held in the transport and
-//! sent in the `Authorization` header. It is never logged, and error messages
-//! contain only the endpoint, HTTP status, and a short response snippet.
+//! # JSON extraction
+//!
+//! Triage prompts the model for JSON and then parses it resiliently
+//! ([`extract_json_object`]: Markdown fences, leading prose, and trailing text
+//! are tolerated). rig's native structured output (`response_format:
+//! json_schema`) is deliberately not used: it only works on models that honor
+//! `response_format` on the chat-completions route, and the triage parse is
+//! the risk filter for the whole program, so the crate does not want to depend
+//! on that capability across the `@cf/…` models a Cloudflare gateway serves.
+//! The resilient parse keeps the exact reliability envelope this module was
+//! already tested against.
+//!
+//! Request timeouts are the bundled `rig` reqwest client's (reqwest's
+//! 30-second default); the API token is held by the rig provider and never
+//! appears in an error or log line.
 
-use std::time::Duration;
-
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use serde_json::{json, Value};
+use rig::completion::CompletionRequest;
+use serde_json::Value;
 
 use crate::config::Config;
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::types::{Direction, ExtractedPost, TrackedMarket, TriageResult};
-
-/// Request timeout for one Workers AI call.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Longest response excerpt included in an error message, in bytes.
 const ERROR_SNIPPET_BYTES: usize = 500;
@@ -42,170 +51,64 @@ const MAX_STRENGTH: u8 = 3;
 /// System message from the triage prompt in the specification.
 const SYSTEM_PROMPT: &str = "You evaluate Bluesky posts as signal for a prediction market.";
 
-/// HTTP transport for the Cloudflare Workers AI `/ai/run` endpoint.
+/// Shared Cloudflare AI Gateway completion client built on rig.
 ///
-/// Cloneable so triage and onboarding can each hold a handle. The underlying
-/// `reqwest::Client` pools connections across clones.
+/// Cloneable so triage and onboarding can each hold a handle; the underlying
+/// rig client shares one connection pool.
 #[derive(Clone)]
-pub struct WorkersAiClient {
-    client: reqwest::Client,
-    run_url: String,
-    api_key: String,
-    gateway_id: String,
+pub struct LlmClient {
+    client: rig::providers::openai::OpenAI,
 }
 
-impl WorkersAiClient {
-    /// Builds a transport from process configuration.
+impl LlmClient {
+    /// Builds the client from the process environment.
     ///
-    /// The Workers AI URL is validated here so a malformed configuration fails
-    /// at startup rather than on the first LLM call.
-    pub fn new(config: &Config) -> AppResult<Self> {
-        let run_url = config.cf_ai_run_url()?;
-        let parsed = url::Url::parse(&run_url)
-            .with_context(|| format!("validating Cloudflare Workers AI URL {run_url}"))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            bail!(
-                "Cloudflare Workers AI URL must use http or https, got {}",
-                parsed.scheme()
-            );
-        }
-
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("building Workers AI HTTP client")?;
-
-        Ok(Self {
-            client,
-            run_url,
-            api_key: config.cf_api_key.clone(),
-            gateway_id: config.cf_ai_gateway_id.clone(),
-        })
+    /// [`rig::providers::cloudflare::from_env`] reads `CLOUDFLARE_ACCOUNT_ID`
+    /// and `CLOUDFLARE_API_TOKEN` here, so a misconfigured environment fails
+    /// at construction (i.e. at startup) rather than on the first LLM call.
+    pub fn new() -> AppResult<Self> {
+        let client = rig::providers::cloudflare::from_env()
+            .map_err(|error| anyhow!("initializing the Cloudflare AI Gateway client: {error}"))?;
+        Ok(Self { client })
     }
 
     /// Sends one chat-completion request and returns the assistant text.
     ///
-    /// Workers AI wraps the answer in several possible envelope shapes; the
-    /// extraction logic accepts all of them. A non-2xx status or a response
-    /// without assistant text is an error that includes a short body excerpt.
+    /// rig parses the standard OpenAI reply natively, so this wrapper strips
+    /// no response envelope. A JSON body the model returns is left to the
+    /// caller (see [`extract_json_object`]).
     pub async fn complete(&self, model: &str, system: &str, user: &str) -> AppResult<String> {
-        let body = json!({
-            "model": model,
-            "input": {
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ]
-            }
-        });
-
+        let request = CompletionRequest::new(user).preamble(system);
         let response = self
             .client
-            .post(&self.run_url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header("cf-aig-gateway-id", &self.gateway_id)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body.to_string())
-            .send()
+            .completion(model)
+            .call(request)
             .await
-            .context("sending request to Cloudflare Workers AI")?;
-
-        let status = response.status();
-        let raw = response
-            .text()
-            .await
-            .context("reading Cloudflare Workers AI response body")?;
-
-        if !status.is_success() {
-            bail!(
-                "Cloudflare Workers AI request failed with HTTP {status}: {}",
-                snippet(&raw)
-            );
+            .context("calling the Cloudflare AI Gateway")?;
+        let text = response.text();
+        if text.trim().is_empty() {
+            bail!("the Cloudflare AI Gateway returned no assistant text");
         }
-
-        let payload: Value = serde_json::from_str(&raw).with_context(|| {
-            format!(
-                "parsing Cloudflare Workers AI response as JSON: {}",
-                snippet(&raw)
-            )
-        })?;
-
-        Self::extract_assistant_text(&payload).ok_or_else(|| {
-            anyhow!(
-                "Cloudflare Workers AI response contained no assistant text: {}",
-                snippet(&raw)
-            )
-        })
+        Ok(text)
     }
 
-    /// Extracts assistant text from the response shapes Workers AI may return.
+    /// Builds a client with placeholder credentials for unit tests.
     ///
-    /// Accepted paths, in order:
-    ///
-    /// - `result.response`
-    /// - `response`
-    /// - `result.choices[0].message.content`
-    /// - `choices[0].message.content`
-    pub fn extract_assistant_text(value: &Value) -> Option<String> {
-        let direct = value
-            .pointer("/result/response")
-            .or_else(|| value.pointer("/response"))
-            .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .map(str::to_owned);
-        if direct.is_some() {
-            return direct;
-        }
-
-        value
-            .pointer("/result/choices/0/message/content")
-            .or_else(|| value.pointer("/choices/0/message/content"))
-            .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .map(str::to_owned)
-    }
-
-    /// Extracts the first JSON object from an LLM answer.
-    ///
-    /// The model may wrap its JSON in a Markdown fence or add a sentence before
-    /// it, so the parser strips fences and then takes the substring from the
-    /// first `{` to the last `}`.
-    pub fn extract_json_object(raw: &str) -> AppResult<Value> {
-        let unfenced = strip_code_fence(raw.trim());
-        let start = unfenced
-            .find('{')
-            .ok_or_else(|| anyhow!("response did not contain a JSON object"))?;
-        let end = unfenced
-            .rfind('}')
-            .ok_or_else(|| anyhow!("response did not contain a complete JSON object"))?;
-        if end < start {
-            bail!("response JSON object is malformed");
-        }
-
-        serde_json::from_str(&unfenced[start..=end])
-            .with_context(|| "parsing response JSON object".to_owned())
-    }
-
-    /// Builds a transport with placeholder credentials for unit tests.
-    ///
-    /// No test calls it, so the loopback URL is never contacted.
+    /// No test calls it, so the surrounding environment is never read.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            client: reqwest::Client::new(),
-            run_url: "http://127.0.0.1/ai/run".to_owned(),
-            api_key: "test-key".to_owned(),
-            gateway_id: "test-gateway".to_owned(),
+            client: rig::providers::cloudflare::new("test-key"),
         }
     }
 }
 
-/// Triage client: the triage prompt plus the shared Workers AI transport.
+/// Triage client: the triage prompt plus the shared LLM client.
 ///
 /// Cloneable so each pipeline worker can hold its own handle.
 #[derive(Clone)]
 pub struct TriageClient {
-    ai: WorkersAiClient,
+    ai: LlmClient,
     model: String,
 }
 
@@ -213,7 +116,7 @@ impl TriageClient {
     /// Builds a triage client from process configuration.
     pub fn new(config: &Config) -> AppResult<Self> {
         Ok(Self {
-            ai: WorkersAiClient::new(config)?,
+            ai: LlmClient::new()?,
             model: config.triage_model.clone(),
         })
     }
@@ -288,11 +191,11 @@ Evaluate this post. Respond as JSON only:
 
 /// Parses the assistant's JSON answer into a [`TriageResult`].
 ///
-/// The shared [`WorkersAiClient::extract_json_object`] tolerates Markdown
-/// fences and surrounding prose. A strength outside `0..=3` and a blank
-/// rationale are rejected instead of being silently repaired.
+/// [`extract_json_object`] tolerates Markdown fences and surrounding prose. A
+/// strength outside `0..=3` and a blank rationale are rejected instead of being
+/// silently repaired.
 pub fn parse_triage_response(raw: &str) -> AppResult<TriageResult> {
-    let value = WorkersAiClient::extract_json_object(raw)
+    let value = extract_json_object(raw)
         .map_err(|error| anyhow!("parsing triage response JSON: {error}"))?;
     let result: TriageResult = serde_json::from_value(value)
         .map_err(|error| anyhow!("parsing triage response JSON: {error}"))?;
@@ -316,6 +219,27 @@ pub fn parse_triage_response(raw: &str) -> AppResult<TriageResult> {
 /// non-neutral direction, and assigned at least weak evidence strength.
 pub fn is_material(result: &TriageResult) -> bool {
     result.material && result.direction != Direction::Neutral && result.strength >= 1
+}
+
+/// Extracts the first JSON object from an LLM answer.
+///
+/// The model may wrap its JSON in a Markdown fence or add a sentence before
+/// it, so the parser strips fences and then takes the substring from the
+/// first `{` to the last `}`.
+pub(crate) fn extract_json_object(raw: &str) -> AppResult<Value> {
+    let unfenced = strip_code_fence(raw.trim());
+    let start = unfenced
+        .find('{')
+        .ok_or_else(|| anyhow!("response did not contain a JSON object"))?;
+    let end = unfenced
+        .rfind('}')
+        .ok_or_else(|| anyhow!("response did not contain a complete JSON object"))?;
+    if end < start {
+        bail!("response JSON object is malformed");
+    }
+
+    serde_json::from_str(&unfenced[start..=end])
+        .with_context(|| "parsing response JSON object".to_owned())
 }
 
 /// Removes a single Markdown code fence around the payload, if present.
@@ -366,7 +290,6 @@ pub(crate) fn snippet(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::types::{MarketId, MarketStatus};
-    use serde_json::json;
 
     fn sample_market() -> TrackedMarket {
         TrackedMarket {
@@ -532,25 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_assistant_text_accepts_all_workers_ai_shapes() {
-        let answer = "{\"material\":true}";
-        let shapes = [
-            json!({"result": {"response": answer}}),
-            json!({"response": answer}),
-            json!({"result": {"choices": [{"message": {"content": answer}}]}}),
-            json!({"choices": [{"message": {"content": answer}}]}),
-        ];
-
-        for shape in shapes {
-            assert_eq!(
-                WorkersAiClient::extract_assistant_text(&shape).as_deref(),
-                Some(answer),
-                "shape: {shape}"
-            );
-        }
-    }
-
-    #[test]
     fn snippet_stays_within_the_byte_budget_and_never_splits_a_character() {
         let long = "é".repeat(400);
         let out = snippet(&long);
@@ -562,17 +466,7 @@ mod tests {
     #[test]
     fn extract_json_object_tolerates_fences_and_surrounding_prose() {
         let raw = format!("Here you go:\n```json\n{}\n```\nDone.", valid_json());
-        let value = WorkersAiClient::extract_json_object(&raw).expect("JSON object");
+        let value = extract_json_object(&raw).expect("JSON object");
         assert_eq!(value["direction"], "yes");
-    }
-
-    #[test]
-    fn extract_assistant_text_rejects_missing_or_blank_text() {
-        assert!(WorkersAiClient::extract_assistant_text(&json!({"result": {}})).is_none());
-        assert!(
-            WorkersAiClient::extract_assistant_text(&json!({"result": {"response": "   "}}))
-                .is_none()
-        );
-        assert!(WorkersAiClient::extract_assistant_text(&json!({"choices": []})).is_none());
     }
 }
