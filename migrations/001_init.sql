@@ -19,14 +19,6 @@ CREATE TABLE IF NOT EXISTS tracked_markets (
   created_at           INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS market_vip_dids (
-  market_id  TEXT NOT NULL,
-  did        TEXT NOT NULL,
-  handle     TEXT NOT NULL,
-  PRIMARY KEY (market_id, did),
-  FOREIGN KEY (market_id) REFERENCES tracked_markets(id)
-);
-
 CREATE TABLE IF NOT EXISTS signal_ledger (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id      TEXT NOT NULL,
@@ -83,3 +75,6 @@ CREATE INDEX IF NOT EXISTS idx_signal_market_created
 
 CREATE INDEX IF NOT EXISTS idx_trade_market_created
   ON trade_ledger(market_id, created_at DESC);
+
+-- The VIP author bypass list was removed; drop it from existing databases.
+DROP TABLE IF EXISTS market_vip_dids;

@@ -1,11 +1,10 @@
-//! SQLite persistence for markets, VIPs, signals, trades, and key/value state.
+//! SQLite persistence for markets, signals, trades, and key/value state.
 //!
 //! [`Db`] is a cheaply cloneable handle around a single connection. Every query
 //! is short and synchronous; callers share one handle across tasks and the
 //! internal mutex serializes access. Async callers should keep critical
 //! sections small and avoid holding a connection guard across `.await` points.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -13,9 +12,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::{anyhow, bail, AppResult, Context};
-use crate::types::{
-    MarketId, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, TradeRecord, VipEntry,
-};
+use crate::types::{MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, TradeRecord};
 
 const MARKET_COLUMNS: &str = "id, slug, question, description, resolution_criteria, close_time, \
      status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, no_shares, \
@@ -254,90 +251,10 @@ impl Db {
     }
 
     /// Removes a market row.
-    ///
-    /// VIP rows are not cascaded; call [`Db::delete_vips_for_market`] first when
-    /// discarding a market permanently.
     pub fn delete_market(&self, id: &str) -> AppResult<()> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM tracked_markets WHERE id = ?1", params![id])
             .with_context(|| format!("deleting market {id}"))?;
-        Ok(())
-    }
-
-    // ---------------------------------------------------------------------
-    // VIP authors
-    // ---------------------------------------------------------------------
-
-    /// Inserts or updates a VIP author for a market.
-    pub fn add_vip(&self, market_id: &str, vip: &VipEntry) -> AppResult<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO market_vip_dids (market_id, did, handle) VALUES (?1, ?2, ?3)",
-            params![market_id, vip.did, vip.handle],
-        )
-        .with_context(|| format!("adding VIP {} to market {market_id}", vip.handle))?;
-        Ok(())
-    }
-
-    /// Lists the VIP authors of one market, ordered by handle.
-    pub fn list_vips(&self, market_id: &str) -> AppResult<Vec<VipEntry>> {
-        let conn = self.lock()?;
-        let mut statement = conn
-            .prepare(
-                "SELECT did, handle FROM market_vip_dids WHERE market_id = ?1 ORDER BY handle ASC",
-            )
-            .context("preparing VIP listing")?;
-        let rows = statement
-            .query_map(params![market_id], |row| {
-                Ok(VipEntry {
-                    did: row.get(0)?,
-                    handle: row.get(1)?,
-                })
-            })
-            .with_context(|| format!("querying VIPs for market {market_id}"))?;
-        collect_rows(rows, "listing VIPs")
-    }
-
-    /// Loads every market's VIP authors in one query.
-    ///
-    /// Used on the hot matching path so an incoming post can check all markets
-    /// without a query per market. Markets with no VIPs are absent from the map.
-    pub fn all_vips(&self) -> AppResult<HashMap<MarketId, Vec<VipEntry>>> {
-        let conn = self.lock()?;
-        let mut statement = conn
-            .prepare(
-                "SELECT market_id, did, handle FROM market_vip_dids \
-                 ORDER BY market_id ASC, handle ASC",
-            )
-            .context("preparing VIP snapshot")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    VipEntry {
-                        did: row.get(1)?,
-                        handle: row.get(2)?,
-                    },
-                ))
-            })
-            .context("querying all VIPs")?;
-
-        let mut by_market: HashMap<MarketId, Vec<VipEntry>> = HashMap::new();
-        for row in rows {
-            let (market_id, vip) = row.context("reading VIP row")?;
-            by_market.entry(market_id).or_default().push(vip);
-        }
-        Ok(by_market)
-    }
-
-    /// Removes all VIP authors for one market.
-    pub fn delete_vips_for_market(&self, market_id: &str) -> AppResult<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "DELETE FROM market_vip_dids WHERE market_id = ?1",
-            params![market_id],
-        )
-        .with_context(|| format!("deleting VIPs for market {market_id}"))?;
         Ok(())
     }
 
@@ -887,68 +804,6 @@ mod tests {
             .update_market_status("missing", MarketStatus::Closed)
             .is_err());
         assert!(db.set_thread_id("missing", "t").is_err());
-    }
-
-    #[test]
-    fn vips_roundtrip_and_are_grouped_by_market() {
-        let db = Db::open_in_memory().expect("in-memory DB");
-        db.insert_market(&sample_market("m1", 1))
-            .expect("market m1");
-        db.insert_market(&sample_market("m2", 2))
-            .expect("market m2");
-
-        db.add_vip(
-            "m1",
-            &VipEntry {
-                did: "did:plc:z".to_owned(),
-                handle: "zed.test".to_owned(),
-            },
-        )
-        .expect("add vip");
-        db.add_vip(
-            "m1",
-            &VipEntry {
-                did: "did:plc:a".to_owned(),
-                handle: "alice.test".to_owned(),
-            },
-        )
-        .expect("add vip");
-        db.add_vip(
-            "m2",
-            &VipEntry {
-                did: "did:plc:b".to_owned(),
-                handle: "bob.test".to_owned(),
-            },
-        )
-        .expect("add vip");
-
-        let m1 = db.list_vips("m1").expect("list vips");
-        assert_eq!(m1.len(), 2);
-        assert_eq!(m1[0].handle, "alice.test");
-        assert_eq!(m1[1].handle, "zed.test");
-
-        // INSERT OR REPLACE updates the handle for an existing DID.
-        db.add_vip(
-            "m1",
-            &VipEntry {
-                did: "did:plc:a".to_owned(),
-                handle: "alice2.test".to_owned(),
-            },
-        )
-        .expect("replace vip");
-        let m1 = db.list_vips("m1").expect("list vips");
-        assert_eq!(m1.len(), 2);
-        assert!(m1.iter().any(|vip| vip.handle == "alice2.test"));
-
-        let all = db.all_vips().expect("all vips");
-        assert_eq!(all.len(), 2);
-        assert_eq!(all["m1"].len(), 2);
-        assert_eq!(all["m2"][0].did, "did:plc:b");
-        assert!(!all.contains_key("m3"));
-
-        db.delete_vips_for_market("m1").expect("delete vips");
-        assert!(db.list_vips("m1").expect("list after delete").is_empty());
-        assert_eq!(db.list_vips("m2").expect("unaffected market").len(), 1);
     }
 
     #[test]
