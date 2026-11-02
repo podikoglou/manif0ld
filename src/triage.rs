@@ -15,9 +15,11 @@
 //! envelope. Triage is a single stateless JSON call, so a direct `reqwest` POST
 //! is simpler and matches the documented request shape exactly.
 //!
-//! The API key is held in [`TriageClient`] and sent in the `Authorization`
-//! header. It is never logged, and error messages contain only the endpoint,
-//! HTTP status, and a short response snippet.
+//! [`WorkersAiClient`] owns the transport and is shared with onboarding, which
+//! uses the same endpoint for Sieve-rule synthesis. [`TriageClient`] adds only
+//! the triage prompt and model choice. The API key is held in the transport and
+//! sent in the `Authorization` header. It is never logged, and error messages
+//! contain only the endpoint, HTTP status, and a short response snippet.
 
 use std::time::Duration;
 
@@ -28,11 +30,11 @@ use crate::config::Config;
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::types::{Direction, ExtractedPost, TrackedMarket, TriageResult};
 
-/// Request timeout for one triage call.
+/// Request timeout for one Workers AI call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Longest response snippet included in an error message.
-const ERROR_SNIPPET_CHARS: usize = 400;
+/// Longest response excerpt included in an error message, in bytes.
+const ERROR_SNIPPET_BYTES: usize = 500;
 
 /// Maximum accepted evidence strength (`0..=3`).
 const MAX_STRENGTH: u8 = 3;
@@ -40,24 +42,23 @@ const MAX_STRENGTH: u8 = 3;
 /// System message from the triage prompt in the specification.
 const SYSTEM_PROMPT: &str = "You evaluate Bluesky posts as signal for a prediction market.";
 
-/// HTTP client for the Cloudflare Workers AI `/ai/run` endpoint.
+/// HTTP transport for the Cloudflare Workers AI `/ai/run` endpoint.
 ///
-/// Cloneable so each pipeline worker can hold its own handle. The underlying
+/// Cloneable so triage and onboarding can each hold a handle. The underlying
 /// `reqwest::Client` pools connections across clones.
 #[derive(Clone)]
-pub struct TriageClient {
+pub struct WorkersAiClient {
     client: reqwest::Client,
     run_url: String,
     api_key: String,
     gateway_id: String,
-    model: String,
 }
 
-impl TriageClient {
-    /// Builds a triage client from process configuration.
+impl WorkersAiClient {
+    /// Builds a transport from process configuration.
     ///
     /// The Workers AI URL is validated here so a malformed configuration fails
-    /// at startup rather than on the first matched post.
+    /// at startup rather than on the first LLM call.
     pub fn new(config: &Config) -> AppResult<Self> {
         let run_url = config.cf_ai_run_url()?;
         let parsed = url::Url::parse(&run_url)
@@ -72,31 +73,24 @@ impl TriageClient {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .context("building triage HTTP client")?;
+            .context("building Workers AI HTTP client")?;
 
         Ok(Self {
             client,
             run_url,
             api_key: config.cf_api_key.clone(),
             gateway_id: config.cf_ai_gateway_id.clone(),
-            model: config.triage_model.clone(),
         })
     }
 
-    /// Sends one triage request and parses the model's JSON answer.
+    /// Sends one chat-completion request and returns the assistant text.
     ///
-    /// `followers` is optional because the ingestion path does not resolve
-    /// follower counts; the prompt renders `unknown` in that case.
-    pub async fn evaluate(
-        &self,
-        market: &TrackedMarket,
-        post: &ExtractedPost,
-        followers: Option<u64>,
-        p_market: f64,
-    ) -> AppResult<TriageResult> {
-        let (system, user) = build_prompt(market, post, followers, p_market);
+    /// Workers AI wraps the answer in several possible envelope shapes; the
+    /// extraction logic accepts all of them. A non-2xx status or a response
+    /// without assistant text is an error that includes a short body excerpt.
+    pub async fn complete(&self, model: &str, system: &str, user: &str) -> AppResult<String> {
         let body = json!({
-            "model": self.model,
+            "model": model,
             "input": {
                 "messages": [
                     {"role": "system", "content": system},
@@ -114,7 +108,7 @@ impl TriageClient {
             .body(body.to_string())
             .send()
             .await
-            .context("sending triage request to Cloudflare Workers AI")?;
+            .context("sending request to Cloudflare Workers AI")?;
 
         let status = response.status();
         let raw = response
@@ -124,7 +118,7 @@ impl TriageClient {
 
         if !status.is_success() {
             bail!(
-                "Cloudflare Workers AI triage failed with HTTP {status}: {}",
+                "Cloudflare Workers AI request failed with HTTP {status}: {}",
                 snippet(&raw)
             );
         }
@@ -136,13 +130,107 @@ impl TriageClient {
             )
         })?;
 
-        let text = extract_assistant_text(&payload).ok_or_else(|| {
+        Self::extract_assistant_text(&payload).ok_or_else(|| {
             anyhow!(
                 "Cloudflare Workers AI response contained no assistant text: {}",
                 snippet(&raw)
             )
-        })?;
+        })
+    }
 
+    /// Extracts assistant text from the response shapes Workers AI may return.
+    ///
+    /// Accepted paths, in order:
+    ///
+    /// - `result.response`
+    /// - `response`
+    /// - `result.choices[0].message.content`
+    /// - `choices[0].message.content`
+    pub fn extract_assistant_text(value: &Value) -> Option<String> {
+        let direct = value
+            .pointer("/result/response")
+            .or_else(|| value.pointer("/response"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned);
+        if direct.is_some() {
+            return direct;
+        }
+
+        value
+            .pointer("/result/choices/0/message/content")
+            .or_else(|| value.pointer("/choices/0/message/content"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Extracts the first JSON object from an LLM answer.
+    ///
+    /// The model may wrap its JSON in a Markdown fence or add a sentence before
+    /// it, so the parser strips fences and then takes the substring from the
+    /// first `{` to the last `}`.
+    pub fn extract_json_object(raw: &str) -> AppResult<Value> {
+        let unfenced = strip_code_fence(raw.trim());
+        let start = unfenced
+            .find('{')
+            .ok_or_else(|| anyhow!("response did not contain a JSON object"))?;
+        let end = unfenced
+            .rfind('}')
+            .ok_or_else(|| anyhow!("response did not contain a complete JSON object"))?;
+        if end < start {
+            bail!("response JSON object is malformed");
+        }
+
+        serde_json::from_str(&unfenced[start..=end])
+            .with_context(|| "parsing response JSON object".to_owned())
+    }
+
+    /// Builds a transport with placeholder credentials for unit tests.
+    ///
+    /// No test calls it, so the loopback URL is never contacted.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            run_url: "http://127.0.0.1/ai/run".to_owned(),
+            api_key: "test-key".to_owned(),
+            gateway_id: "test-gateway".to_owned(),
+        }
+    }
+}
+
+/// Triage client: the triage prompt plus the shared Workers AI transport.
+///
+/// Cloneable so each pipeline worker can hold its own handle.
+#[derive(Clone)]
+pub struct TriageClient {
+    ai: WorkersAiClient,
+    model: String,
+}
+
+impl TriageClient {
+    /// Builds a triage client from process configuration.
+    pub fn new(config: &Config) -> AppResult<Self> {
+        Ok(Self {
+            ai: WorkersAiClient::new(config)?,
+            model: config.triage_model.clone(),
+        })
+    }
+
+    /// Sends one triage request and parses the model's JSON answer.
+    ///
+    /// `followers` is optional because the ingestion path does not resolve
+    /// follower counts; the prompt renders `unknown` in that case.
+    pub async fn evaluate(
+        &self,
+        market: &TrackedMarket,
+        post: &ExtractedPost,
+        followers: Option<u64>,
+        p_market: f64,
+    ) -> AppResult<TriageResult> {
+        let (system, user) = build_prompt(market, post, followers, p_market);
+        let text = self.ai.complete(&self.model, &system, &user).await?;
         parse_triage_response(&text)
     }
 }
@@ -200,23 +288,13 @@ Evaluate this post. Respond as JSON only:
 
 /// Parses the assistant's JSON answer into a [`TriageResult`].
 ///
-/// The model may wrap its JSON in a Markdown fence or add a sentence before it,
-/// so the parser strips fences and then takes the substring from the first `{`
-/// to the last `}`. A strength outside `0..=3` and a blank rationale are
-/// rejected instead of being silently repaired.
+/// The shared [`WorkersAiClient::extract_json_object`] tolerates Markdown
+/// fences and surrounding prose. A strength outside `0..=3` and a blank
+/// rationale are rejected instead of being silently repaired.
 pub fn parse_triage_response(raw: &str) -> AppResult<TriageResult> {
-    let unfenced = strip_code_fence(raw.trim());
-    let start = unfenced
-        .find('{')
-        .ok_or_else(|| anyhow!("triage response did not contain a JSON object"))?;
-    let end = unfenced
-        .rfind('}')
-        .ok_or_else(|| anyhow!("triage response did not contain a complete JSON object"))?;
-    if end < start {
-        bail!("triage response JSON object is malformed");
-    }
-
-    let result: TriageResult = serde_json::from_str(&unfenced[start..=end])
+    let value = WorkersAiClient::extract_json_object(raw)
+        .map_err(|error| anyhow!("parsing triage response JSON: {error}"))?;
+    let result: TriageResult = serde_json::from_value(value)
         .map_err(|error| anyhow!("parsing triage response JSON: {error}"))?;
 
     if result.strength > MAX_STRENGTH {
@@ -238,33 +316,6 @@ pub fn parse_triage_response(raw: &str) -> AppResult<TriageResult> {
 /// non-neutral direction, and assigned at least weak evidence strength.
 pub fn is_material(result: &TriageResult) -> bool {
     result.material && result.direction != Direction::Neutral && result.strength >= 1
-}
-
-/// Extracts assistant text from the response shapes Workers AI may return.
-///
-/// Accepted paths, in order:
-///
-/// - `result.response`
-/// - `response`
-/// - `result.choices[0].message.content`
-/// - `choices[0].message.content`
-fn extract_assistant_text(value: &Value) -> Option<String> {
-    let direct = value
-        .pointer("/result/response")
-        .or_else(|| value.pointer("/response"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty())
-        .map(str::to_owned);
-    if direct.is_some() {
-        return direct;
-    }
-
-    value
-        .pointer("/result/choices/0/message/content")
-        .or_else(|| value.pointer("/choices/0/message/content"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty())
-        .map(str::to_owned)
 }
 
 /// Removes a single Markdown code fence around the payload, if present.
@@ -293,12 +344,20 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// Truncates response text for an error message without splitting a character.
-fn snippet(text: &str) -> String {
-    let mut out: String = text.chars().take(ERROR_SNIPPET_CHARS).collect();
-    if text.chars().count() > ERROR_SNIPPET_CHARS {
-        out.push('…');
+/// Truncates response text to [`ERROR_SNIPPET_BYTES`] without splitting a
+/// character or exceeding the byte budget.
+pub(crate) fn snippet(text: &str) -> String {
+    let text = text.trim();
+    if text.len() <= ERROR_SNIPPET_BYTES {
+        return text.to_owned();
     }
+
+    let mut end = ERROR_SNIPPET_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_owned();
+    out.push('…');
     out
 }
 
@@ -483,7 +542,7 @@ mod tests {
 
         for shape in shapes {
             assert_eq!(
-                extract_assistant_text(&shape).as_deref(),
+                WorkersAiClient::extract_assistant_text(&shape).as_deref(),
                 Some(answer),
                 "shape: {shape}"
             );
@@ -492,8 +551,11 @@ mod tests {
 
     #[test]
     fn extract_assistant_text_rejects_missing_or_blank_text() {
-        assert!(extract_assistant_text(&json!({"result": {}})).is_none());
-        assert!(extract_assistant_text(&json!({"result": {"response": "   "}})).is_none());
-        assert!(extract_assistant_text(&json!({"choices": []})).is_none());
+        assert!(WorkersAiClient::extract_assistant_text(&json!({"result": {}})).is_none());
+        assert!(
+            WorkersAiClient::extract_assistant_text(&json!({"result": {"response": "   "}}))
+                .is_none()
+        );
+        assert!(WorkersAiClient::extract_assistant_text(&json!({"choices": []})).is_none());
     }
 }
