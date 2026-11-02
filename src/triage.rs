@@ -458,6 +458,7 @@ mod tests {
             sieve_source: "match Market_test { \"thing\" }".to_owned(),
             discord_thread_id: String::new(),
             created_at: 1_690_000_000,
+            deleted_at: None,
         }
     }
 

@@ -153,6 +153,19 @@ pub struct TrackedMarket {
     pub sieve_source: String,
     pub discord_thread_id: String,
     pub created_at: i64,
+    /// Unix seconds at which the operator ran `/untrack`; `None` while the
+    /// market is still tracked.
+    pub deleted_at: Option<i64>,
+}
+
+impl TrackedMarket {
+    /// Whether `/untrack` removed this market.
+    ///
+    /// A soft-deleted row stays in the database and keeps its ledger history,
+    /// but it is hidden from listings and no longer trades.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
 }
 
 /// A ledger action after a trade decision.
@@ -426,6 +439,7 @@ mod tests {
             sieve_source: "match M { \"x\" }".into(),
             discord_thread_id: String::new(),
             created_at: 0,
+            deleted_at: None,
         };
         assert_eq!(available_budget(&market), 70.0);
     }
@@ -452,6 +466,7 @@ mod tests {
             sieve_source: String::new(),
             discord_thread_id: String::new(),
             created_at: 0,
+            deleted_at: None,
         };
         assert_eq!(available_budget(&market), -20.0);
         market.invested_mana = 0.0;

@@ -1517,6 +1517,7 @@ mod tests {
             sieve_source: String::new(),
             discord_thread_id: String::new(),
             created_at: 0,
+            deleted_at: None,
         }
     }
 

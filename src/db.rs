@@ -17,7 +17,7 @@ use crate::types::{MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, Tra
 const MARKET_COLUMNS: &str = "id, slug, market_url, question, description, resolution_criteria, close_time, \
      status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, no_shares, \
      p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, discord_thread_id, \
-     created_at";
+     created_at, deleted_at";
 
 const ANSWER_COLUMNS: &str = "id, market_id, text, p_internal_log_odds, p_market_last, \
      belief_updated_at, yes_shares, no_shares, created_at";
@@ -94,6 +94,11 @@ impl Db {
             conn.execute_batch(include_str!("../migrations/002_market_url.sql"))
                 .context("applying database migration 002 (market_url)")?;
         }
+        // 003: `deleted_at` on `tracked_markets`, the soft-delete marker.
+        if !table_has_column(conn, "tracked_markets", "deleted_at")? {
+            conn.execute_batch(include_str!("../migrations/003_soft_delete.sql"))
+                .context("applying database migration 003 (soft delete)")?;
+        }
         Ok(())
     }
 
@@ -116,8 +121,8 @@ impl Db {
             "INSERT INTO tracked_markets (id, slug, market_url, question, description, resolution_criteria, \
              close_time, status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, \
              no_shares, p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, \
-             discord_thread_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             discord_thread_id, created_at, deleted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 market.id,
                 market.slug,
@@ -138,13 +143,18 @@ impl Db {
                 market.sieve_source,
                 market.discord_thread_id,
                 market.created_at,
+                market.deleted_at,
             ],
         )
         .with_context(|| format!("inserting market {}", market.id))?;
         Ok(())
     }
 
-    /// Fetches one market by contract ID.
+    /// Fetches one market by contract ID, including untracked rows.
+    ///
+    /// A soft-deleted row is still returned so stale Discord embeds and
+    /// repeated commands can report the truth instead of "not tracked". Use
+    /// [`TrackedMarket::is_deleted`] to tell the two apart.
     pub fn get_market(&self, id: &str) -> AppResult<Option<TrackedMarket>> {
         let conn = self.lock()?;
         conn.query_row(
@@ -156,12 +166,13 @@ impl Db {
         .with_context(|| format!("loading market {id}"))
     }
 
-    /// Lists all markets in creation order.
+    /// Lists every tracked market in creation order, excluding soft deletes.
     pub fn list_markets(&self) -> AppResult<Vec<TrackedMarket>> {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(&format!(
-                "SELECT {MARKET_COLUMNS} FROM tracked_markets ORDER BY created_at ASC, id ASC"
+                "SELECT {MARKET_COLUMNS} FROM tracked_markets WHERE deleted_at IS NULL \
+                 ORDER BY created_at ASC, id ASC"
             ))
             .context("preparing market listing")?;
         let rows = statement
@@ -170,13 +181,31 @@ impl Db {
         collect_rows(rows, "listing markets")
     }
 
-    /// Lists markets in one lifecycle state, in creation order.
+    /// Lists every market row, including soft-deleted ones.
+    ///
+    /// Only `/untrack` needs this: it must recognize a market that was already
+    /// untracked and answer with a clear message rather than "not tracked".
+    pub fn list_markets_including_deleted(&self) -> AppResult<Vec<TrackedMarket>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT {MARKET_COLUMNS} FROM tracked_markets ORDER BY created_at ASC, id ASC"
+            ))
+            .context("preparing market listing including deleted")?;
+        let rows = statement
+            .query_map([], market_from_row)
+            .context("querying all markets")?;
+        collect_rows(rows, "listing all markets")
+    }
+
+    /// Lists markets in one lifecycle state, in creation order, excluding soft
+    /// deletes.
     pub fn list_markets_by_status(&self, status: MarketStatus) -> AppResult<Vec<TrackedMarket>> {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(&format!(
                 "SELECT {MARKET_COLUMNS} FROM tracked_markets WHERE status = ?1 \
-                 ORDER BY created_at ASC, id ASC"
+                 AND deleted_at IS NULL ORDER BY created_at ASC, id ASC"
             ))
             .context("preparing market listing by status")?;
         let rows = statement
@@ -266,12 +295,34 @@ impl Db {
         ensure_updated(updated, id)
     }
 
-    /// Removes a market row.
+    /// Removes a market row outright.
+    ///
+    /// Only lifecycle replacement uses this: re-onboarding a market whose row
+    /// is dead, and the rollback of a failed activation. `/untrack` soft deletes
+    /// instead (see [`Db::soft_delete_market`]), so an operator's decision stays
+    /// auditable.
     pub fn delete_market(&self, id: &str) -> AppResult<()> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM tracked_markets WHERE id = ?1", params![id])
             .with_context(|| format!("deleting market {id}"))?;
         Ok(())
+    }
+
+    /// Marks a market untracked while keeping its row, answers, and ledgers.
+    ///
+    /// The status becomes `CLOSED` so the trading layer stops acting on it, and
+    /// `deleted_at` hides it from every listing query. The call is idempotent:
+    /// re-deleting keeps the original `deleted_at`.
+    pub fn soft_delete_market(&self, id: &str, deleted_at: i64) -> AppResult<()> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE tracked_markets SET status = ?2, deleted_at = COALESCE(deleted_at, ?3) \
+                 WHERE id = ?1",
+                params![id, MarketStatus::Closed.as_str(), deleted_at],
+            )
+            .with_context(|| format!("soft deleting market {id}"))?;
+        ensure_updated(updated, id)
     }
 
     // ---------------------------------------------------------------------
@@ -590,6 +641,7 @@ fn market_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedMarket> {
         sieve_source: row.get(16)?,
         discord_thread_id: row.get(17)?,
         created_at: row.get(18)?,
+        deleted_at: row.get(19)?,
     })
 }
 
@@ -671,6 +723,7 @@ mod tests {
             sieve_source: "match Market { \"thing\" }".to_owned(),
             discord_thread_id: String::new(),
             created_at,
+            deleted_at: None,
         }
     }
 
@@ -726,6 +779,7 @@ mod tests {
         assert_eq!(actual.sieve_source, expected.sieve_source);
         assert_eq!(actual.discord_thread_id, expected.discord_thread_id);
         assert_eq!(actual.created_at, expected.created_at);
+        assert_eq!(actual.deleted_at, expected.deleted_at);
     }
 
     fn market_ids(markets: &[TrackedMarket]) -> Vec<&str> {
@@ -849,6 +903,75 @@ mod tests {
             .list_markets_by_status(MarketStatus::Closed)
             .expect("list closed");
         assert_eq!(market_ids(&closed), vec!["closed"]);
+    }
+
+    #[test]
+    fn soft_delete_closes_the_row_and_hides_it_from_listings() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        db.insert_market(&sample_market("m1", 1))
+            .expect("insert market");
+
+        db.soft_delete_market("m1", 1_700_000_900)
+            .expect("soft delete");
+
+        // Every listing skips the row, including the CLOSED listing.
+        assert!(db.list_markets().expect("list markets").is_empty());
+        assert!(
+            db.list_markets_by_status(MarketStatus::Active)
+                .expect("list active")
+                .is_empty()
+        );
+        assert!(
+            db.list_markets_by_status(MarketStatus::Closed)
+                .expect("list closed")
+                .is_empty()
+        );
+
+        // The row itself survives, closed and time-stamped.
+        let row = db.get_market("m1").expect("get market").expect("row kept");
+        assert_eq!(row.status, MarketStatus::Closed);
+        assert_eq!(row.deleted_at, Some(1_700_000_900));
+        assert!(row.is_deleted());
+
+        // `resolve`-style lookups that need deleted rows still find it.
+        let all = db.list_markets_including_deleted().expect("list all");
+        assert_eq!(market_ids(&all), vec!["m1"]);
+    }
+
+    #[test]
+    fn soft_delete_keeps_answers_and_is_idempotent() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        db.insert_market(&sample_market("m1", 1))
+            .expect("insert market");
+        db.upsert_answer(&TrackedAnswer {
+            id: "answer-1".to_owned(),
+            market_id: "m1".to_owned(),
+            text: "Yes".to_owned(),
+            p_internal_log_odds: 0.0,
+            p_market_last: 0.5,
+            belief_updated_at: 1,
+            yes_shares: 0.0,
+            no_shares: 0.0,
+            created_at: 1,
+        })
+        .expect("insert answer");
+
+        db.soft_delete_market("m1", 1_700_000_900)
+            .expect("first soft delete");
+        db.soft_delete_market("m1", 1_700_001_999)
+            .expect("second soft delete");
+
+        let row = db.get_market("m1").expect("get market").expect("row kept");
+        assert_eq!(
+            row.deleted_at,
+            Some(1_700_000_900),
+            "the first removal time is kept"
+        );
+        assert_eq!(
+            db.list_answers("m1").expect("list answers").len(),
+            1,
+            "answers are kept for audit"
+        );
     }
 
     #[test]
