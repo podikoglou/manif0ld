@@ -2,14 +2,14 @@
 //!
 //! Startup is deliberately linear: load configuration, open the database,
 //! compile one Sieve engine per active market, build the market cache, then
-//! connect ingestion to the triage pipeline. Discord and trading are not
-//! started yet; [`pipeline::PipelineEvent`] is the extension point a Discord
-//! consumer subscribes to.
+//! connect ingestion to the triage pipeline and the pipeline to the trade
+//! executor. Discord is not started yet; [`pipeline::PipelineEvent`] is the
+//! extension point a Discord consumer subscribes to.
 //!
 //! The process runs until Ctrl-C, then aborts its spawned tasks.
 
 // Several module APIs are exercised by unit tests or reserved for the Discord
-// and trading layers that are wired in later.
+// layer that is wired in later.
 #![allow(dead_code)]
 
 mod belief;
@@ -20,6 +20,7 @@ mod extract;
 mod ingest;
 mod pipeline;
 mod sieve;
+mod trade;
 mod triage;
 mod types;
 
@@ -31,6 +32,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::error::{AppResult, Context};
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
+use crate::trade::TradeExecutor;
 use crate::types::MarketStatus;
 
 #[tokio::main]
@@ -65,9 +67,24 @@ async fn main() -> AppResult<()> {
         Arc::clone(&config),
         db.clone(),
         registry,
-        cache,
+        Arc::clone(&cache),
     )?);
     let mut pipeline_events = pipeline.events().subscribe();
+    // Subscribe before spawning the executor: the broadcast channel has no
+    // history, so a subscriber created later would miss early signals.
+    let trade_events = pipeline.events().subscribe();
+
+    // Resolving the bot identity here makes a bad API key a startup failure
+    // instead of silently disabling trading.
+    let executor = Arc::new(
+        TradeExecutor::new(&config, db.clone(), Arc::clone(&cache))
+            .await
+            .context("initializing the trade executor")?,
+    );
+    tracing::info!(
+        bot_user_id = executor.client().bot_user_id(),
+        "Manifold client ready"
+    );
 
     let post_tx = ingest::channel();
     let post_rx = post_tx.subscribe();
@@ -77,6 +94,15 @@ async fn main() -> AppResult<()> {
         async move {
             if let Err(error) = pipeline.run(post_rx).await {
                 tracing::error!(error = %error, "pipeline stopped");
+            }
+        }
+    });
+
+    let trade_task = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        async move {
+            if let Err(error) = executor.run(trade_events).await {
+                tracing::error!(error = %error, "trade executor stopped");
             }
         }
     });
@@ -105,6 +131,7 @@ async fn main() -> AppResult<()> {
     tracing::info!("shutting down");
 
     pipeline_task.abort();
+    trade_task.abort();
     ingest_task.abort();
     event_task.abort();
 
