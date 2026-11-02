@@ -27,7 +27,7 @@
 //! whole signal path down.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -86,6 +86,17 @@ impl MarketCache {
             .collect();
         active.sort_by(|left, right| left.id.cmp(&right.id));
         active
+    }
+
+    /// Number of active markets without cloning their snapshots.
+    ///
+    /// The heartbeat calls this every few seconds, so it avoids allocating a
+    /// `Vec<TrackedMarket>` just to read its length.
+    pub fn active_count(&self) -> usize {
+        self.read()
+            .values()
+            .filter(|market| market.status == MarketStatus::Active)
+            .count()
     }
 
     /// Inserts or replaces one market.
@@ -256,6 +267,8 @@ pub struct Pipeline {
     triage: TriageClient,
     events: broadcast::Sender<PipelineEvent>,
     queues: Mutex<HashMap<MarketId, QueueHandle>>,
+    /// Extracted posts received from ingest since process start.
+    processed_posts: AtomicU64,
 }
 
 impl Pipeline {
@@ -276,12 +289,18 @@ impl Pipeline {
             triage,
             events,
             queues: Mutex::new(HashMap::new()),
+            processed_posts: AtomicU64::new(0),
         })
     }
 
     /// Returns a sender that can be subscribed to for pipeline events.
     pub fn events(&self) -> broadcast::Sender<PipelineEvent> {
         self.events.clone()
+    }
+
+    /// Total extracted posts the pipeline has received from ingest since start.
+    pub fn processed_posts(&self) -> u64 {
+        self.processed_posts.load(Ordering::Relaxed)
     }
 
     /// Number of jobs waiting for one market.
@@ -303,14 +322,19 @@ impl Pipeline {
     /// Consumes extracted posts until the ingest channel closes.
     ///
     /// Post-stream lag is logged and skipped: those posts were already dropped
-    /// by the ingest broadcast channel, so there is nothing to replay.
+    /// by the ingest broadcast channel, so there is nothing to replay. Every
+    /// received post advances [`Pipeline::processed_posts`], which the
+    /// heartbeat in `main` reports as throughput.
     pub async fn run(
         self: Arc<Self>,
         mut posts: broadcast::Receiver<ExtractedPost>,
     ) -> AppResult<()> {
         loop {
             match posts.recv().await {
-                Ok(post) => self.dispatch(post),
+                Ok(post) => {
+                    self.processed_posts.fetch_add(1, Ordering::Relaxed);
+                    self.dispatch(post);
+                }
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {
                     tracing::warn!(
                         dropped,
@@ -728,6 +752,21 @@ mod tests {
             vec!["m1"],
             "paused markets are not active"
         );
+    }
+
+    #[test]
+    fn active_count_excludes_paused_markets() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        db.insert_market(&sample_market("m1", MarketStatus::Active, 1))
+            .expect("insert m1");
+        db.insert_market(&sample_market("m2", MarketStatus::Paused, 2))
+            .expect("insert m2");
+
+        let cache = MarketCache::load(&db).expect("load cache");
+        assert_eq!(cache.active_count(), 1, "paused markets are not counted");
+
+        cache.remove("m1");
+        assert_eq!(cache.active_count(), 0);
     }
 
     #[test]

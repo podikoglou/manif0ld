@@ -27,6 +27,7 @@ mod triage;
 mod types;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
@@ -37,6 +38,9 @@ use crate::onboarding::OnboardingService;
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::trade::TradeExecutor;
 use crate::types::MarketStatus;
+
+/// How often the INFO heartbeat reports throughput and active markets.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -132,6 +136,38 @@ async fn main() -> AppResult<()> {
         }
     });
 
+    let heartbeat_task = tokio::spawn({
+        let pipeline = Arc::clone(&pipeline);
+        async move {
+            let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick completes immediately; skip it so the first line
+            // reports a full interval of throughput.
+            ticker.tick().await;
+            let mut last_count = pipeline.processed_posts();
+            let mut last_at = Instant::now();
+            loop {
+                ticker.tick().await;
+                let now = Instant::now();
+                let count = pipeline.processed_posts();
+                let elapsed = now.saturating_duration_since(last_at).as_secs_f64();
+                let per_sec = if elapsed > 0.0 {
+                    count.saturating_sub(last_count) as f64 / elapsed
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    messages_per_sec = %format!("{per_sec:.1}"),
+                    messages_processed = count,
+                    active_markets = pipeline.cache.active_count(),
+                    "heartbeat"
+                );
+                last_count = count;
+                last_at = now;
+            }
+        }
+    });
+
     let trade_task = tokio::spawn({
         let executor = Arc::clone(&executor);
         async move {
@@ -173,6 +209,7 @@ async fn main() -> AppResult<()> {
     tracing::info!("shutting down");
 
     pipeline_task.abort();
+    heartbeat_task.abort();
     trade_task.abort();
     ingest_task.abort();
     event_task.abort();
