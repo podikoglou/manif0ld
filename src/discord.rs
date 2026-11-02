@@ -1872,7 +1872,11 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
         ))
         .field(
             "Market",
-            format!("https://manifold.markets/{}", market.slug),
+            if draft.url.trim().is_empty() {
+                format!("https://manifold.markets/{}", market.slug)
+            } else {
+                draft.url.clone()
+            },
             true,
         )
         .field("Budget", format!("{:.2}", market.budget_mana), true)
@@ -2261,6 +2265,7 @@ mod tests {
             market,
             sieve_source: "match Market_M1 { \"rain\" }".to_owned(),
             answers: Vec::new(),
+            url: "https://manifold.markets/will-it-rain".to_owned(),
         };
 
         let embed = onboarded_embed(&draft);

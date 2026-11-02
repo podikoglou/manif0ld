@@ -109,6 +109,11 @@ modifier    = "+" | "~" | "*" | "!" ;
 pub struct ManifoldSlugMarket {
     pub id: String,
     pub question: String,
+    /// Canonical page URL set by Manifold (e.g.
+    /// `https://manifold.markets/Jack1/2026-melbourne-cup-winner`); fails open
+    /// to the slug-only form when absent.
+    #[serde(rename = "url", default)]
+    pub url: String,
     #[serde(rename = "textDescription", default)]
     pub text_description: String,
     #[serde(rename = "resolutionCriteria", default)]
@@ -204,6 +209,8 @@ pub struct OnboardingDraft {
     pub market: TrackedMarket,
     pub sieve_source: String,
     pub answers: Vec<crate::types::TrackedAnswer>,
+    /// Canonical Manifold page URL for the market.
+    pub url: String,
 }
 
 /// Fetches, synthesizes, and activates tracked markets.
@@ -304,6 +311,7 @@ impl OnboardingService {
             market: tracked,
             sieve_source,
             answers,
+            url: market.url,
         })
     }
 
@@ -317,6 +325,7 @@ impl OnboardingService {
             mut market,
             sieve_source,
             answers,
+            ..
         } = draft;
 
         market.discord_thread_id = thread_id.to_owned();
@@ -679,6 +688,7 @@ mod tests {
             question: "Will the Bitcoin ETF launch by Friday?".to_owned(),
             text_description: "A market about the Bitcoin ETF approval.".to_owned(),
             resolution_criteria: Some("Resolves YES if a spot ETF launches.".to_owned()),
+            url: "https://manifold.markets/Alice/will-the-thing-happen".to_owned(),
             close_time_ms: Some(1_700_000_000_000),
             probability: Some(0.63),
             outcome_type: "BINARY".to_owned(),
@@ -712,6 +722,7 @@ mod tests {
             market,
             sieve_source: GOOD_SIEVE.to_owned(),
             answers: Vec::new(),
+            url: format!("https://manifold.markets/{}", id),
         }
     }
 
