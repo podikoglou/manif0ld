@@ -821,6 +821,44 @@ pub enum TradeEvent {
     },
 }
 
+/// What a liquidation request actually did.
+///
+/// Liquidation is idempotent: asking twice must not sell twice, and a request
+/// on a market that cannot trade must do nothing. The outcome lets the caller
+/// report the truth instead of a generic success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidationOutcome {
+    /// The local row was already `Closed`. No Manifold call was made.
+    AlreadyClosed,
+    /// Manifold already resolved the market. Resolved positions settle
+    /// automatically, so the executor sold nothing.
+    AlreadyResolved,
+    /// The position held no YES and no NO shares.
+    NoPosition,
+    /// At least one side was sold.
+    Sold,
+}
+
+/// Lists the sides a liquidation must sell.
+///
+/// A resolved market cannot be traded and Manifold settles resolved positions
+/// automatically, so no side is sold. A side with no shares is not sold
+/// either, which keeps a repeated liquidation from selling twice.
+fn liquidation_sides(yes_shares: f64, no_shares: f64, resolved: bool) -> Vec<(TradeAction, f64)> {
+    if resolved {
+        return Vec::new();
+    }
+
+    let mut sides = Vec::new();
+    if yes_shares > 0.0 {
+        sides.push((TradeAction::SellYes, yes_shares));
+    }
+    if no_shares > 0.0 {
+        sides.push((TradeAction::SellNo, no_shares));
+    }
+    sides
+}
+
 /// Executes trades and keeps local state in step with Manifold.
 ///
 /// All state-changing operations ([`TradeExecutor::evaluate_market`],
@@ -1034,12 +1072,20 @@ impl TradeExecutor {
     /// The remote position is fetched first, so shares already sold manually or
     /// by a previous partial liquidation are not sold twice. Each side is
     /// recorded and persisted before the next side is attempted.
-    pub async fn liquidate(&self, market_id: &str) -> AppResult<()> {
+    ///
+    /// The request is idempotent. A locally closed market makes no HTTP call.
+    /// A resolved market is not sold because Manifold settles it automatically.
+    /// The returned [`LiquidationOutcome`] tells the caller what happened.
+    pub async fn liquidate(&self, market_id: &str) -> AppResult<LiquidationOutcome> {
         let _guard = self.execution_lock.lock().await;
 
         let Some(mut market) = self.db.get_market(market_id)? else {
             bail!("market {market_id} is not tracked");
         };
+        if market.status == MarketStatus::Closed {
+            tracing::info!(market_id = %market_id, "market is already closed; skipping liquidation");
+            return Ok(LiquidationOutcome::AlreadyClosed);
+        }
 
         let snapshot = self
             .client
@@ -1069,15 +1115,20 @@ impl TradeExecutor {
         );
         self.persist_market(&market)?;
 
-        for action in [TradeAction::SellYes, TradeAction::SellNo] {
-            let held = match action {
-                TradeAction::SellYes => market.yes_shares,
-                _ => market.no_shares,
-            };
-            if held <= 0.0 {
-                continue;
-            }
+        let sides = liquidation_sides(market.yes_shares, market.no_shares, snapshot.is_resolved);
+        if snapshot.is_resolved {
+            tracing::info!(
+                market_id = %market_id,
+                "market is resolved on Manifold; positions settle automatically"
+            );
+            return Ok(LiquidationOutcome::AlreadyResolved);
+        }
+        if sides.is_empty() {
+            tracing::info!(market_id = %market_id, "no shares to liquidate");
+            return Ok(LiquidationOutcome::NoPosition);
+        }
 
+        for (action, held) in sides {
             let decision = TradeDecision {
                 action,
                 amount_mana: 0.0,
@@ -1092,7 +1143,7 @@ impl TradeExecutor {
             self.emit_trade(&market, &record);
         }
 
-        Ok(())
+        Ok(LiquidationOutcome::Sold)
     }
 
     /// Liquidates every market that is not already closed.
@@ -1702,6 +1753,28 @@ mod tests {
         assert!(apply_sell(&mut market, TradeAction::BuyNo, 1.0, 1.0).is_err());
         assert!(apply_sell(&mut market, TradeAction::SellNo, 1.0, 1.0).is_err());
         assert!(apply_sell(&mut market, TradeAction::SellYes, 0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn liquidation_sells_only_the_sides_that_hold_shares() {
+        assert_eq!(
+            liquidation_sides(20.0, 5.0, false),
+            vec![(TradeAction::SellYes, 20.0), (TradeAction::SellNo, 5.0)]
+        );
+        assert_eq!(
+            liquidation_sides(20.0, 0.0, false),
+            vec![(TradeAction::SellYes, 20.0)]
+        );
+        assert_eq!(
+            liquidation_sides(0.0, 5.0, false),
+            vec![(TradeAction::SellNo, 5.0)]
+        );
+    }
+
+    #[test]
+    fn liquidation_of_a_resolved_or_empty_position_sells_nothing() {
+        assert!(liquidation_sides(20.0, 5.0, true).is_empty());
+        assert!(liquidation_sides(0.0, 0.0, false).is_empty());
     }
 
     // -- Wire format --------------------------------------------------------
