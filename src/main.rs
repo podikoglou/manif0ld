@@ -7,11 +7,13 @@
 // components added in later phases.
 #![allow(dead_code)]
 
+mod belief;
 mod config;
 mod db;
 mod error;
 mod extract;
 mod ingest;
+mod sieve;
 mod types;
 
 use crate::config::Config;
