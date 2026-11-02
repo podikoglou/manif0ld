@@ -539,7 +539,8 @@ impl Pipeline {
             halflife,
         );
 
-        let result = match self.triage.evaluate(&market, &post, None, p_market).await {
+        let answers = self.db.list_answers(&market.id).unwrap_or_default();
+        let result = match self.triage.evaluate(&market, &answers, &post, None, p_market).await {
             Ok(result) => result,
             Err(error) => {
                 self.emit(PipelineEvent::Error {
@@ -551,6 +552,71 @@ impl Pipeline {
         };
 
         let material = triage::is_material(&result);
+
+        if !answers.is_empty() {
+            // Multiple-choice market processing
+            for ans_triage in &result.affected_answers {
+                if ans_triage.direction == Direction::Neutral || ans_triage.strength == 0 {
+                    continue;
+                }
+                if let Ok(Some(ans)) = self.db.get_answer(&market.id, &ans_triage.answer_id) {
+                    let mut log_odds = ans.p_internal_log_odds;
+                    let mut updated_at = ans.belief_updated_at;
+                    let ans_p_market = ans.p_market_last;
+                    let applied_impulse = belief::apply_post(
+                        &mut log_odds,
+                        &mut updated_at,
+                        ans_triage.direction,
+                        ans_triage.strength,
+                        is_vip,
+                        ans_p_market,
+                        now,
+                        kappa,
+                        halflife,
+                    );
+                    let ans_p_after = belief::sigmoid(log_odds);
+                    let _ = self.db.update_answer_belief(&market.id, &ans.id, log_odds, ans_p_market, updated_at);
+
+                    let record = SignalRecord {
+                        id: 0,
+                        market_id: market.id.clone(),
+                        answer_id: Some(ans.id.clone()),
+                        post_uri: post.uri.clone(),
+                        author_handle: post.handle.clone(),
+                        post_text: post.text.clone(),
+                        material: true,
+                        direction: ans_triage.direction,
+                        strength: ans_triage.strength,
+                        impulse: applied_impulse,
+                        p_after: ans_p_after,
+                        created_at: now,
+                    };
+                    let _ = self.db.insert_signal(&record);
+                }
+            }
+
+            self.emit(PipelineEvent::Signal {
+                market_id: market.id,
+                question: market.question,
+                post_uri: post.uri,
+                author_handle: post.handle,
+                author_did: post.did,
+                text: post.text,
+                direction: result.direction.unwrap_or(Direction::Neutral),
+                strength: result.strength,
+                rationale: result.rationale,
+                material,
+                impulse: 0.0,
+                p_before,
+                p_after: p_before,
+                p_market,
+                is_vip,
+                created_at: now,
+            });
+            return;
+        }
+
+        let direction = result.direction.unwrap_or(Direction::Neutral);
         let mut impulse = 0.0;
         let mut p_after = p_before;
 
@@ -560,7 +626,7 @@ impl Pipeline {
             let applied_impulse = belief::apply_post(
                 &mut log_odds,
                 &mut updated_at,
-                result.direction,
+                direction,
                 result.strength,
                 is_vip,
                 p_market,
@@ -592,11 +658,12 @@ impl Pipeline {
         let record = SignalRecord {
             id: 0,
             market_id: market.id.clone(),
+            answer_id: None,
             post_uri: post.uri.clone(),
             author_handle: post.handle.clone(),
             post_text: post.text.clone(),
             material,
-            direction: result.direction,
+            direction,
             strength: result.strength,
             impulse,
             p_after,
@@ -617,7 +684,7 @@ impl Pipeline {
             author_handle: post.handle,
             author_did: post.did,
             text: post.text,
-            direction: result.direction,
+            direction,
             strength: result.strength,
             rationale: result.rationale,
             material,
