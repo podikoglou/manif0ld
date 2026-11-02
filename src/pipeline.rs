@@ -3,7 +3,7 @@
 //! The pipeline connects ingestion to the belief engine:
 //!
 //! ```text
-//! ExtractedPost ──► Sieve match / VIP bypass ──► per-market bounded queue
+//! ExtractedPost ──► Sieve match ──► per-market bounded queue
 //!        ──► LLM triage ──► belief update ──► signal ledger ──► event stream
 //! ```
 //!
@@ -630,7 +630,6 @@ impl Pipeline {
             p_before,
             p_after,
             p_market,
-            is_vip,
             created_at: now,
         });
     }

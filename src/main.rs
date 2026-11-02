@@ -224,7 +224,6 @@ fn log_pipeline_event(event: &PipelineEvent) {
             p_before,
             p_after,
             p_market,
-            is_vip,
             created_at,
         } => {
             if *material {
@@ -242,7 +241,6 @@ fn log_pipeline_event(event: &PipelineEvent) {
                     p_before = *p_before,
                     p_after = *p_after,
                     p_market = *p_market,
-                    is_vip = *is_vip,
                     created_at = *created_at,
                     "signal"
                 );

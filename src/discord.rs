@@ -8,7 +8,7 @@
 //! # Scope
 //!
 //! This module implements the full control plane: the seven slash commands
-//! (`/track`, `/untrack`, `/budget`, `/status`, `/override`, `/vip`, `/panic`),
+//! (`/track`, `/untrack`, `/budget`, `/status`, `/override`, `/panic`),
 //! the Pause / Liquidate action buttons on the ONBOARDED embed, autocomplete,
 //! and the signal/trade/error consumers. [`status`] and the consumers were the
 //! foundation; everything else here is the mutating half of the plane.
@@ -31,7 +31,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use serenity::all::*;
 use serenity::http::Http;
 use tokio::sync::{broadcast, mpsc};
@@ -44,7 +43,7 @@ use crate::onboarding::{OnboardingDraft, OnboardingService, SieveAttempt};
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
 use crate::trade::{TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
-use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedMarket, VipEntry};
+use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedMarket};
 
 /// Maximum number of autocomplete choices Discord accepts.
 const MAX_AUTOCOMPLETE_CHOICES: usize = 25;
@@ -180,7 +179,6 @@ impl EventHandler for Handler {
                     "untrack" => untrack(&self.state, &ctx, &interaction).await,
                     "budget" => budget(&self.state, &ctx, &interaction).await,
                     "override" => override_belief(&self.state, &ctx, &interaction).await,
-                    "vip" => vip(&self.state, &ctx, &interaction).await,
                     "panic" => panic_mode(&self.state, &ctx, &interaction).await,
                     name => {
                         tracing::debug!(command = %name, "unknown Discord command");
@@ -211,7 +209,7 @@ fn is_operator(state: &DiscordState, user_id: UserId) -> bool {
 // Command definitions
 // -----------------------------------------------------------------------------
 
-/// The seven guild commands from the specification.
+/// The six guild commands from the specification.
 ///
 /// Every command is guild-only and carries its full parameter list so the
 /// Discord client performs type and range validation before the handler runs.
@@ -283,18 +281,6 @@ fn command_definitions() -> Vec<CreateCommand> {
                 .required(true)
                 .min_int_value(1)
                 .max_int_value(99),
-            ),
-        CreateCommand::new("vip")
-            .description("Add a Bluesky author as a VIP for a market.")
-            .dm_permission(false)
-            .add_option(market_option("Market to update", true))
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "handle",
-                    "Bluesky handle, for example alice.bsky.social",
-                )
-                .required(true),
             ),
         CreateCommand::new("panic")
             .description("Toggle the global buy kill switch.")
@@ -930,8 +916,8 @@ async fn untrack(state: &DiscordState, ctx: &Context, interaction: &CommandInter
 
 /// Tears down one market: optional liquidation, row + engine removal, archive.
 ///
-/// The registry is unregistered, then the VIP rows and the market row are
-/// deleted, then the cache entry is dropped and the thread archived.
+/// The registry is unregistered, then the market row is deleted, then the cache
+/// entry is dropped and the thread archived.
 async fn untrack_market(
     state: &DiscordState,
     ctx: &Context,
@@ -952,7 +938,6 @@ async fn untrack_market(
 
     state.registry.unregister(&market_id);
     state.db.delete_answers_for_market(&market_id)?;
-    state.db.delete_vips_for_market(&market_id)?;
     state.db.delete_market(&market_id)?;
     state.cache.remove(&market_id);
 
@@ -1092,101 +1077,6 @@ async fn override_belief(state: &DiscordState, ctx: &Context, interaction: &Comm
         "Failed to override the probability",
     )
     .await;
-}
-
-// -----------------------------------------------------------------------------
-// /vip
-// -----------------------------------------------------------------------------
-
-/// Runs `/vip`, resolving a Bluesky handle to a DID and adding it to a market.
-///
-/// The profile lookup is a network call, so the command defers first. An exact
-/// existing handle is answered without any network traffic.
-async fn vip(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
-    let Some(query) = string_option(interaction, "market")
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    else {
-        respond_ephemeral(ctx, interaction, "Missing the required `market` option.").await;
-        return;
-    };
-    let Some(handle) = string_option(interaction, "handle")
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    else {
-        respond_ephemeral(ctx, interaction, "Missing the required `handle` option.").await;
-        return;
-    };
-
-    let market = match resolve_single_market(state, &query) {
-        Ok(market) => market,
-        Err(error) => {
-            respond_ephemeral(ctx, interaction, &truncate_chars(&error.to_string(), 2000)).await;
-            return;
-        }
-    };
-    let market_id = market.id.clone();
-
-    match state.db.list_vips(&market_id) {
-        Ok(vips)
-            if vips
-                .iter()
-                .any(|vip| vip.handle.eq_ignore_ascii_case(&handle)) =>
-        {
-            respond_ephemeral(
-                ctx,
-                interaction,
-                &format!(
-                    "`{handle}` is already a VIP for **{}** (`{market_id}`).",
-                    market.question
-                ),
-            )
-            .await;
-            return;
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(
-            market_id = %market_id,
-            error = %error,
-            "failed to read existing VIPs; continuing"
-        ),
-    }
-
-    if let Err(error) = interaction.defer_ephemeral(&ctx.http).await {
-        tracing::error!(error = %error, "failed to defer /vip");
-        return;
-    }
-
-    match fetch_bsky_profile(&handle).await {
-        Ok(profile) => {
-            let result = (|| -> AppResult<String> {
-                state.db.add_vip(&market_id, &profile)?;
-                if let Some(reloaded) = state.db.get_market(&market_id)? {
-                    let vips = state.db.list_vips(&market_id)?;
-                    state.cache.upsert(reloaded, vips);
-                }
-                Ok(format!(
-                    "Added `@{}` (`{}`) as a VIP for **{}** (`{market_id}`).",
-                    profile.handle, profile.did, market.question
-                ))
-            })();
-            match result {
-                Ok(message) => send_followup(ctx, interaction, &message).await,
-                Err(error) => {
-                    send_followup(ctx, interaction, &format!("Failed to add the VIP: {error}"))
-                        .await;
-                }
-            }
-        }
-        Err(error) => {
-            send_followup(
-                ctx,
-                interaction,
-                &format!("Failed to resolve `{handle}`: {error}"),
-            )
-            .await;
-        }
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1664,7 +1554,6 @@ async fn consume_pipeline_events(
                 p_before,
                 p_after,
                 p_market,
-                is_vip,
                 ..
             }) => {
                 let channel = channel_for_market(&db, &config, Some(&market_id));
@@ -1691,8 +1580,7 @@ async fn consume_pipeline_events(
                         false,
                     )
                     .field("P_internal", format!("{p_before:.3} → {p_after:.3}"), true)
-                    .field("P_market", format!("{p_market:.3}"), true)
-                    .field("VIP", if is_vip { "yes" } else { "no" }, true);
+                    .field("P_market", format!("{p_market:.3}"), true);
 
                 match bsky_post_url(&post_uri) {
                     Some(url) => {
@@ -1867,71 +1755,12 @@ fn resolve_single_market(state: &DiscordState, query: &str) -> AppResult<Tracked
     Ok(market.clone())
 }
 
-/// Resolves a Bluesky handle to its profile via the public AppView.
-///
-/// The handle in the profile is what gets stored, so the canonical spelling
-/// (including a custom domain) wins over whatever the operator typed.
-async fn fetch_bsky_profile(handle: &str) -> AppResult<VipEntry> {
-    let url = "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile";
-    let response = reqwest::Client::new()
-        .get(url)
-        .query(&[("actor", handle)])
-        .send()
-        .await
-        .context("fetching the Bluesky profile")?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("reading the Bluesky profile response")?;
-
-    if !status.is_success() {
-        bail!(
-            "Bluesky profile lookup failed with HTTP {status}: {}",
-            truncate_chars(&body, 200)
-        );
-    }
-
-    let profile: BskyProfile = serde_json::from_str(&body).with_context(|| {
-        format!(
-            "parsing the Bluesky profile response: {}",
-            truncate_chars(&body, 200)
-        )
-    })?;
-    if profile.did.trim().is_empty() || profile.handle.trim().is_empty() {
-        bail!("Bluesky profile for {handle} is missing a DID or handle");
-    }
-
-    Ok(VipEntry {
-        did: profile.did,
-        handle: profile.handle,
-    })
-}
-
-/// Response shape of `app.bsky.actor.getProfile`; only the stable fields are read.
-#[derive(Debug, Deserialize)]
-struct BskyProfile {
-    did: String,
-    handle: String,
-}
-
 /// Builds the `[ONBOARDED]` embed posted into a new market's thread.
 ///
 /// The Sieve source is split into bounded fields exactly like the `/status`
 /// market view, so an arbitrarily long rule cannot fail embed validation.
 fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
     let market = &draft.market;
-
-    let vip_handles = if draft.vips.is_empty() {
-        "(none)".to_owned()
-    } else {
-        draft
-            .vips
-            .iter()
-            .map(|vip| vip.handle.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
 
     let mut embed = CreateEmbed::new()
         .title(truncate_chars(
@@ -1948,11 +1777,6 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
             "Initial P_market",
             format!("{:.3}", market.p_market_last),
             true,
-        )
-        .field(
-            "VIP handles",
-            truncate_chars(&vip_handles, MAX_FIELD_CHARS),
-            false,
         );
 
     let chunks = chunk_chars(&draft.sieve_source, SIEVE_CHUNK_CHARS);
@@ -2300,18 +2124,7 @@ mod tests {
         market.p_market_last = 0.6;
         let draft = OnboardingDraft {
             market,
-            vips: vec![
-                VipEntry {
-                    did: "did:plc:a".to_owned(),
-                    handle: "alice.test".to_owned(),
-                },
-                VipEntry {
-                    did: "did:plc:b".to_owned(),
-                    handle: "bob.test".to_owned(),
-                },
-            ],
             sieve_source: "match Market_M1 { \"rain\" }".to_owned(),
-            warnings: Vec::new(),
             answers: Vec::new(),
         };
 
@@ -2328,7 +2141,7 @@ mod tests {
             .filter_map(|field| field["name"].as_str())
             .collect();
         assert!(names.contains(&"Sieve source #1"), "{names:?}");
-        assert!(names.contains(&"VIP handles"), "{names:?}");
+        assert!(!names.contains(&"VIP handles"), "{names:?}");
 
         let sieve_field = fields
             .iter()
