@@ -199,7 +199,13 @@ impl ManifoldClient {
     /// `limitProb` is placed far beyond the current price so the order behaves
     /// like a market buy: `0.99` for YES and `0.01` for NO. Manifold interprets
     /// the limit as a probability of YES, so a NO buy needs the low limit.
-    pub async fn buy(&self, market_id: &str, outcome: &str, amount: f64) -> AppResult<BetResult> {
+    pub async fn buy(
+        &self,
+        market_id: &str,
+        outcome: &str,
+        amount: f64,
+        answer_id: Option<&str>,
+    ) -> AppResult<BetResult> {
         let outcome = validate_outcome(outcome)?;
         if !amount.is_finite() || amount <= 0.0 {
             bail!("buy amount must be a positive finite mana value, got {amount}");
@@ -209,12 +215,15 @@ impl ManifoldClient {
             "YES" => YES_LIMIT_PROB,
             _ => NO_LIMIT_PROB,
         };
-        let body = json!({
+        let mut body = json!({
             "contractId": market_id,
             "amount": amount,
             "outcome": outcome,
             "limitProb": limit_prob,
         });
+        if let Some(aid) = answer_id {
+            body["answerId"] = json!(aid);
+        }
         let request = self
             .http
             .post(self.url("/v0/bet"))
@@ -225,13 +234,22 @@ impl ManifoldClient {
     }
 
     /// Sells `shares` of `outcome`.
-    pub async fn sell(&self, market_id: &str, outcome: &str, shares: f64) -> AppResult<BetResult> {
+    pub async fn sell(
+        &self,
+        market_id: &str,
+        outcome: &str,
+        shares: f64,
+        answer_id: Option<&str>,
+    ) -> AppResult<BetResult> {
         let outcome = validate_outcome(outcome)?;
         if !shares.is_finite() || shares <= 0.0 {
             bail!("sell shares must be a positive finite number, got {shares}");
         }
 
-        let body = json!({ "outcome": outcome, "shares": shares });
+        let mut body = json!({ "outcome": outcome, "shares": shares });
+        if let Some(aid) = answer_id {
+            body["answerId"] = json!(aid);
+        }
         let path = format!("/v0/market/{}/sell", market_id);
         let request = self
             .http
@@ -345,6 +363,16 @@ pub struct MarketSnapshot {
     pub close_time_ms: Option<i64>,
     #[serde(rename = "textDescription", default)]
     pub text_description: String,
+    #[serde(default)]
+    pub answers: Option<Vec<MarketAnswerSnapshot>>,
+}
+
+/// One answer from a multiple choice market snapshot.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketAnswerSnapshot {
+    pub id: String,
+    pub text: String,
+    pub probability: Option<f64>,
 }
 
 /// The bot's current position in one market.
@@ -438,11 +466,18 @@ impl BetResult {
 /// Parses the `GET /v0/market/{id}/positions` payload for one user.
 ///
 /// The endpoint returns an array of `ContractMetric`, one entry per bettor. The
-/// entry whose `userId` matches `bot_user_id` is used; when the server filtered
-/// by user and returned exactly one entry, that entry is used even if its
-/// `userId` is absent. Anything else (missing array, absent entry) is a zero
-/// position. Both `positions`-wrapped and bare-array payloads are accepted.
+/// entry whose `userId` matches `bot_user_id` and (if specified) `answerId` is used.
+/// For binary or root market positions, entries with `answerId: null` or absent are selected.
 pub(crate) fn parse_position(value: &Value, bot_user_id: &str) -> PositionSnapshot {
+    parse_answer_position(value, bot_user_id, None)
+}
+
+/// Parses the position for a specific answer (or the root contract if `target_answer_id` is None).
+pub(crate) fn parse_answer_position(
+    value: &Value,
+    bot_user_id: &str,
+    target_answer_id: Option<&str>,
+) -> PositionSnapshot {
     let entries: &[Value] = match value {
         Value::Array(items) => items.as_slice(),
         Value::Object(map) => map
@@ -453,16 +488,25 @@ pub(crate) fn parse_position(value: &Value, bot_user_id: &str) -> PositionSnapsh
         _ => &[],
     };
 
-    let selected = entries
-        .iter()
-        .find(|entry| entry.get("userId").and_then(Value::as_str) == Some(bot_user_id))
-        .or_else(|| {
-            if entries.len() == 1 {
-                entries.first()
-            } else {
-                None
-            }
-        });
+    let selected = entries.iter().find(|entry| {
+        let user_matches = entry.get("userId").and_then(Value::as_str) == Some(bot_user_id)
+            || (entries.len() == 1 && entry.get("userId").is_none());
+        if !user_matches {
+            return false;
+        }
+        let answer_id = entry.get("answerId").and_then(Value::as_str);
+        match target_answer_id {
+            Some(target) => answer_id == Some(target),
+            None => answer_id.is_none(),
+        }
+    }).or_else(|| {
+        // Fallback for single-entry responses without answerId
+        if target_answer_id.is_none() && entries.len() == 1 {
+            entries.first()
+        } else {
+            None
+        }
+    });
 
     let Some(entry) = selected else {
         return PositionSnapshot::default();
@@ -581,6 +625,7 @@ pub fn decide_trade(
             action: TradeAction::SellYes,
             amount_mana: 0.0,
             shares: Some(market.yes_shares),
+            answer_id: None,
         });
     }
 
@@ -589,6 +634,7 @@ pub fn decide_trade(
             action: TradeAction::SellNo,
             amount_mana: 0.0,
             shares: Some(market.no_shares),
+            answer_id: None,
         });
     }
 
@@ -607,12 +653,71 @@ pub fn decide_trade(
             action: TradeAction::BuyYes,
             amount_mana: target,
             shares: None,
+            answer_id: None,
         })
     } else if edge < -params.entry_edge_threshold {
         Some(TradeDecision {
             action: TradeAction::BuyNo,
             amount_mana: target,
             shares: None,
+            answer_id: None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Chooses at most one trade for a specific answer in a multiple-choice market.
+pub fn decide_trade_for_answer(
+    answer: &crate::types::TrackedAnswer,
+    p_internal: f64,
+    p_market: f64,
+    available_budget: f64,
+    params: TradeParams,
+) -> Option<TradeDecision> {
+    let edge = p_internal - p_market;
+
+    if answer.yes_shares > 0.0 && edge < params.exit_edge_threshold {
+        return Some(TradeDecision {
+            action: TradeAction::SellYes,
+            amount_mana: 0.0,
+            shares: Some(answer.yes_shares),
+            answer_id: Some(answer.id.clone()),
+        });
+    }
+
+    if answer.no_shares > 0.0 && edge > -params.exit_edge_threshold {
+        return Some(TradeDecision {
+            action: TradeAction::SellNo,
+            amount_mana: 0.0,
+            shares: Some(answer.no_shares),
+            answer_id: Some(answer.id.clone()),
+        });
+    }
+
+    // A position that did not exit stays open. No scale-in.
+    if answer.yes_shares > 0.0 || answer.no_shares > 0.0 {
+        return None;
+    }
+
+    let target = kelly_target_mana(edge, p_market, available_budget, params);
+    if target < params.min_trade_size {
+        return None;
+    }
+
+    if edge > params.entry_edge_threshold {
+        Some(TradeDecision {
+            action: TradeAction::BuyYes,
+            amount_mana: target,
+            shares: None,
+            answer_id: Some(answer.id.clone()),
+        })
+    } else if edge < -params.entry_edge_threshold {
+        Some(TradeDecision {
+            action: TradeAction::BuyNo,
+            amount_mana: target,
+            shares: None,
+            answer_id: Some(answer.id.clone()),
         })
     } else {
         None
@@ -977,6 +1082,7 @@ impl TradeExecutor {
                 action,
                 amount_mana: 0.0,
                 shares: Some(held),
+                answer_id: None,
             };
             let record = self
                 .execute_sell(&mut market, &decision, p_internal, p_market, None, now)
@@ -1128,7 +1234,7 @@ impl TradeExecutor {
         let outcome = decision.action.outcome();
         let result = self
             .client
-            .buy(&market.id, outcome, amount)
+            .buy(&market.id, outcome, amount, decision.answer_id.as_deref())
             .await
             .with_context(|| format!("buying {outcome} on Manifold market {}", market.id))?;
         ensure_filled(&result, &market.id)?;
@@ -1146,6 +1252,7 @@ impl TradeExecutor {
         let record = TradeRecord {
             id: 0,
             market_id: market.id.clone(),
+            answer_id: decision.answer_id.clone(),
             action: decision.action,
             mana_amount: cost,
             shares_delta: result.shares,
@@ -1178,7 +1285,7 @@ impl TradeExecutor {
         let outcome = decision.action.outcome();
         let result = self
             .client
-            .sell(&market.id, outcome, requested)
+            .sell(&market.id, outcome, requested, decision.answer_id.as_deref())
             .await
             .with_context(|| format!("selling {outcome} on Manifold market {}", market.id))?;
         ensure_filled(&result, &market.id)?;
@@ -1196,6 +1303,7 @@ impl TradeExecutor {
         let record = TradeRecord {
             id: 0,
             market_id: market.id.clone(),
+            answer_id: decision.answer_id.clone(),
             action: decision.action,
             mana_amount: proceeds,
             shares_delta: -sold,
@@ -1762,6 +1870,18 @@ mod tests {
         assert_close(position.no_shares, 7.0);
         assert_close(position.invested, 4.0);
 
+        // Can also parse for a specific answerId
+        let multi_raw = json!([
+            {"userId": "bot-1", "answerId": "ans-a", "totalShares": {"YES": 15.0}, "invested": 10.0},
+            {"userId": "bot-1", "answerId": "ans-b", "totalShares": {"NO": 8.0}, "invested": 5.0}
+        ]);
+        let pos_a = parse_answer_position(&multi_raw, "bot-1", Some("ans-a"));
+        assert_close(pos_a.yes_shares, 15.0);
+        assert_close(pos_a.invested, 10.0);
+        let pos_b = parse_answer_position(&multi_raw, "bot-1", Some("ans-b"));
+        assert_close(pos_b.no_shares, 8.0);
+        assert_close(pos_b.invested, 5.0);
+
         // The server filters by userId; a single anonymous entry is still ours.
         let single = json!([{"totalShares": {"YES": 2.0}, "invested": 1.0}]);
         let position = parse_position(&single, "bot-1");
@@ -1806,6 +1926,7 @@ mod tests {
         let record = TradeRecord {
             id: 7,
             market_id: market.id.clone(),
+            answer_id: None,
             action: TradeAction::SellYes,
             mana_amount: 12.0,
             shares_delta: -20.0,
