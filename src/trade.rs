@@ -324,11 +324,19 @@ fn validate_outcome(outcome: &str) -> AppResult<&str> {
 ///
 /// `close_time_ms` is in Unix milliseconds; convert with [`millis_to_seconds`]
 /// before storing it.
+///
+/// `probability` is absent on non-binary outcome types. All tracked markets are
+/// validated as `BINARY` at onboarding, so `None` here would indicate an
+/// unexpected API change; the trading layer falls back to the last cached
+/// probability in that case.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketSnapshot {
     pub id: String,
     pub question: String,
-    pub probability: f64,
+    /// `None` on non-BINARY markets (e.g. `MULTIPLE_CHOICE`). Tracked markets
+    /// are always BINARY, but the field is optional for API robustness.
+    #[serde(default)]
+    pub probability: Option<f64>,
     #[serde(rename = "outcomeType")]
     pub outcome_type: String,
     #[serde(rename = "isResolved")]
@@ -795,6 +803,7 @@ impl TradeExecutor {
 
         let p_market = snapshot
             .probability
+            .unwrap_or(market.p_market_last)
             .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
         let position = self
             .client
@@ -885,6 +894,7 @@ impl TradeExecutor {
         reconcile_position(&mut market, &position, market_id);
         market.p_market_last = snapshot
             .probability
+            .unwrap_or(market.p_market_last)
             .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
         self.persist_market(&market)?;
         Ok(market)
@@ -940,6 +950,7 @@ impl TradeExecutor {
         reconcile_position(&mut market, &position, market_id);
         let p_market = snapshot
             .probability
+            .unwrap_or(market.p_market_last)
             .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
         market.p_market_last = p_market;
 
@@ -1603,7 +1614,7 @@ mod tests {
 
         assert_eq!(snapshot.id, "abc123");
         assert_eq!(snapshot.question, "Will the thing happen?");
-        assert_close(snapshot.probability, 0.63);
+        assert_close(snapshot.probability.unwrap(), 0.63);
         assert_eq!(snapshot.outcome_type, "BINARY");
         assert!(!snapshot.is_resolved);
         assert_eq!(snapshot.close_time_ms, Some(1_700_000_000_000));
@@ -1615,6 +1626,22 @@ mod tests {
             snapshot.text_description,
             "Resolves YES if the thing happens."
         );
+    }
+
+    #[test]
+    fn market_snapshot_probability_is_none_when_absent() {
+        // MULTIPLE_CHOICE and other non-binary markets omit the probability
+        // field. The snapshot must still deserialize successfully.
+        let raw = json!({
+            "id": "mc-market",
+            "question": "Who wins?",
+            "outcomeType": "MULTIPLE_CHOICE",
+            "isResolved": false
+        });
+        let snapshot: MarketSnapshot =
+            serde_json::from_value(raw).expect("MC market should deserialize without probability");
+
+        assert_eq!(snapshot.probability, None);
     }
 
     #[test]

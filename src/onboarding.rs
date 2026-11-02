@@ -111,6 +111,11 @@ modifier    = "+" | "~" | "*" | "!" ;
 /// Manifold returns many more fields; only the onboarding inputs are read.
 /// `closeTime` is milliseconds since the Unix epoch, unlike every timestamp this
 /// crate stores, which is seconds.
+///
+/// `probability` is absent for non-binary outcome types (e.g. `MULTIPLE_CHOICE`),
+/// so it is deserialized as `Option<f64>`. `validate_market` rejects any market
+/// whose `outcomeType` is not `BINARY` before the probability is accessed, so a
+/// `None` here always accompanies an already-invalid market.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManifoldSlugMarket {
     pub id: String,
@@ -121,7 +126,10 @@ pub struct ManifoldSlugMarket {
     pub resolution_criteria: Option<String>,
     #[serde(rename = "closeTime", default)]
     pub close_time_ms: Option<i64>,
-    pub probability: f64,
+    /// Present only on `BINARY` markets; absent on `MULTIPLE_CHOICE` and other
+    /// outcome types. Always `Some` after `validate_market` succeeds.
+    #[serde(default)]
+    pub probability: Option<f64>,
     #[serde(rename = "outcomeType")]
     pub outcome_type: String,
     #[serde(rename = "isResolved")]
@@ -425,10 +433,15 @@ pub fn parse_slug(url: &str) -> AppResult<String> {
 }
 
 /// Rejects markets that cannot be traded as a simple binary contract.
+///
+/// Checks are ordered so the most descriptive error appears first: outcome type
+/// is validated before probability so a `MULTIPLE_CHOICE` market produces
+/// "not a binary market" rather than a missing-field parse error.
 pub fn validate_market(market: &ManifoldSlugMarket) -> AppResult<()> {
     if market.outcome_type != "BINARY" {
         bail!(
-            "market {} is not a binary market (outcomeType {})",
+            "market {} is not a binary market (outcomeType {}); \
+             only BINARY markets can be traded",
             market.id,
             market.outcome_type
         );
@@ -436,11 +449,17 @@ pub fn validate_market(market: &ManifoldSlugMarket) -> AppResult<()> {
     if market.is_resolved {
         bail!("market {} is already resolved", market.id);
     }
-    if !(market.probability > 0.0 && market.probability < 1.0) {
+    let probability = market.probability.ok_or_else(|| {
+        anyhow!(
+            "market {} is missing a probability (unexpected for a BINARY market)",
+            market.id
+        )
+    })?;
+    if !(probability > 0.0 && probability < 1.0) {
         bail!(
             "market {} probability {} must be strictly between 0 and 1",
             market.id,
-            market.probability
+            probability
         );
     }
     Ok(())
@@ -553,6 +572,9 @@ fn is_custom_domain(candidate: &VipCandidate) -> bool {
 }
 
 /// Builds the tracked-market row for a validated market.
+///
+/// `market` must have already passed `validate_market`, so `probability` is
+/// guaranteed to be `Some` with a value in `(0, 1)`.
 fn build_market(
     market: &ManifoldSlugMarket,
     slug: &str,
@@ -561,9 +583,11 @@ fn build_market(
     sieve_source: String,
 ) -> TrackedMarket {
     let now = Utc::now().timestamp();
+    // Safe: validate_market ensures probability is Some and in (0, 1).
+    let market_prob = market.probability.unwrap_or(0.5);
     let p_internal = match initial_prob {
         Some(probability) => belief::logit(f64::from(probability.clamp(1, 99)) / 100.0),
-        None => belief::logit(market.probability),
+        None => belief::logit(market_prob),
     };
 
     TrackedMarket {
@@ -583,7 +607,7 @@ fn build_market(
         yes_shares: 0.0,
         no_shares: 0.0,
         p_internal_log_odds: p_internal,
-        p_market_last: market.probability.clamp(0.01, 0.99),
+        p_market_last: market_prob.clamp(0.01, 0.99),
         belief_updated_at: now,
         sieve_source,
         discord_thread_id: String::new(),
@@ -667,7 +691,7 @@ mod tests {
             text_description: "A market about the Bitcoin ETF approval.".to_owned(),
             resolution_criteria: Some("Resolves YES if a spot ETF launches.".to_owned()),
             close_time_ms: Some(1_700_000_000_000),
-            probability: 0.63,
+            probability: Some(0.63),
             outcome_type: "BINARY".to_owned(),
             is_resolved: false,
         }
@@ -775,12 +799,18 @@ mod tests {
         assert!(validate_market(&resolved).is_err());
 
         let mut zero = sample_market();
-        zero.probability = 0.0;
+        zero.probability = Some(0.0);
         assert!(validate_market(&zero).is_err());
 
         let mut one = sample_market();
-        one.probability = 1.0;
+        one.probability = Some(1.0);
         assert!(validate_market(&one).is_err());
+
+        // A market missing probability (as returned by MULTIPLE_CHOICE markets)
+        // with a BINARY outcomeType is caught by the probability None check.
+        let mut no_prob = sample_market();
+        no_prob.probability = None;
+        assert!(validate_market(&no_prob).is_err());
     }
 
     #[test]
