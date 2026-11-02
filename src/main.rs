@@ -10,6 +10,8 @@
 mod config;
 mod db;
 mod error;
+mod extract;
+mod ingest;
 mod types;
 
 use crate::config::Config;
