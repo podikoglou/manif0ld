@@ -36,13 +36,12 @@ reference and API contracts.
 ## Build and check
 
 ```sh
-cargo build --release   # target dir is configured to /tmp (saves disk)
+cargo build --release
 cargo test
 cargo clippy -p bsky-manifold-arb --all-targets --no-deps -- -D warnings
 ```
 
-All three must stay clean. Do not run `cargo build` before checking disk space
-(`df -h /tmp`) if a build seems about to fail with "No space left on device".
+All three must stay clean.
 
 ## Conventions
 

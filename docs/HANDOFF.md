@@ -51,8 +51,7 @@ Key dependency versions (in `Cargo.toml`): `tokio`, `tokio-tungstenite 0.30`,
 
 1. Copy `.env.example` to `.env` and fill every value. See `src/config.rs`
    for the parser and defaults.
-2. Build: `cargo build --release`. The `.cargo/config.toml` sends the build
-   target dir to `/tmp/opencode/bsky-manifold-arb-target` to save disk.
+2. Build: `cargo build --release`.
 3. Run: `cargo run --release`. Default `RUST_LOG` level is `info`.
 4. Stop: Ctrl-C aborts all spawned tasks.
 
