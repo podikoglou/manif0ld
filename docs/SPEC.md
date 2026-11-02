@@ -447,8 +447,13 @@ Triggered by `/track url:<url> budget:<mana>`:
 
 **Action buttons** on the ONBOARDED embed:
 
-- `⏸ Pause / Resume` — toggles `status` between `ACTIVE`/`PAUSED`.
-- `💰 Liquidate & Close` — sells all shares, marks `CLOSED`, unregisters Sieve engine.
+- `⏸ Pause / Resume` — toggles `status` between `ACTIVE`/`PAUSED`. A `CLOSED`
+  market cannot be resumed; the button reports that and changes nothing.
+- `💰 Liquidate & Close` — sells all shares, marks `CLOSED`, unregisters Sieve
+  engine, archives the thread, then disables both buttons on the embed. The
+  action is validated and idempotent: a market that is already `CLOSED` or no
+  longer tracked is reported without any sale, and a market that Manifold has
+  resolved is not sold because its positions settle automatically.
 
 ## 7. Sieve DSL Reference (for onboarding LLM)
 
