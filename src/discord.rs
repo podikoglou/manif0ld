@@ -1872,10 +1872,10 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
         ))
         .field(
             "Market",
-            if draft.url.trim().is_empty() {
+            if market.market_url.trim().is_empty() {
                 format!("https://manifold.markets/{}", market.slug)
             } else {
-                draft.url.clone()
+                market.market_url.clone()
             },
             true,
         )
@@ -2039,6 +2039,7 @@ mod tests {
         TrackedMarket {
             id: id.to_owned(),
             slug: slug.to_owned(),
+            market_url: String::new(),
             question: question.to_owned(),
             description: String::new(),
             resolution_criteria: String::new(),
@@ -2261,11 +2262,11 @@ mod tests {
         let mut market = market("M1", "Will it rain?", "will-it-rain");
         market.budget_mana = 25.0;
         market.p_market_last = 0.6;
+        market.market_url = "https://manifold.markets/Alice/will-it-rain".to_owned();
         let draft = OnboardingDraft {
             market,
             sieve_source: "match Market_M1 { \"rain\" }".to_owned(),
             answers: Vec::new(),
-            url: "https://manifold.markets/will-it-rain".to_owned(),
         };
 
         let embed = onboarded_embed(&draft);
@@ -2302,7 +2303,7 @@ mod tests {
             .expect("market field");
         assert_eq!(
             market_field["value"],
-            "https://manifold.markets/will-it-rain"
+            "https://manifold.markets/Alice/will-it-rain"
         );
     }
 

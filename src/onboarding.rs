@@ -209,8 +209,6 @@ pub struct OnboardingDraft {
     pub market: TrackedMarket,
     pub sieve_source: String,
     pub answers: Vec<crate::types::TrackedAnswer>,
-    /// Canonical Manifold page URL for the market.
-    pub url: String,
 }
 
 /// Fetches, synthesizes, and activates tracked markets.
@@ -311,7 +309,6 @@ impl OnboardingService {
             market: tracked,
             sieve_source,
             answers,
-            url: market.url,
         })
     }
 
@@ -622,6 +619,7 @@ fn build_market(
     TrackedMarket {
         id: market.id.clone(),
         slug: slug.to_owned(),
+        market_url: market.url.clone(),
         question: market.question.clone(),
         description: market.text_description.clone(),
         resolution_criteria: market
@@ -701,6 +699,7 @@ mod tests {
         let market = TrackedMarket {
             id: id.to_owned(),
             slug: "will-btc-launch".to_owned(),
+            market_url: "https://manifold.markets/Alice/will-btc-launch".to_owned(),
             question: "Will BTC launch?".to_owned(),
             description: "A market about BTC.".to_owned(),
             resolution_criteria: "Resolves YES if BTC launches.".to_owned(),
@@ -722,7 +721,6 @@ mod tests {
             market,
             sieve_source: GOOD_SIEVE.to_owned(),
             answers: Vec::new(),
-            url: format!("https://manifold.markets/{}", id),
         }
     }
 
