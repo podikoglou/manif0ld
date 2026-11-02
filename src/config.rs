@@ -158,7 +158,8 @@ impl ModelProvider {
 /// Supported prefixes:
 /// - `cloudflare/` -> Cloudflare AI Gateway
 /// - `openrouter/` -> OpenRouter
-/// - (none) -> defaults to Cloudflare AI Gateway (e.g. `@cf/...`)
+///
+/// Models without a recognized provider prefix are rejected.
 pub fn parse_model_spec(model: &str) -> AppResult<(ModelProvider, &str)> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
@@ -189,7 +190,7 @@ pub fn parse_model_spec(model: &str) -> AppResult<(ModelProvider, &str)> {
         }
         Ok((ModelProvider::Cloudflare, rest))
     } else {
-        Ok((ModelProvider::Cloudflare, trimmed))
+        bail!("model '{trimmed}' must begin with 'cloudflare/' or 'openrouter/' prefix");
     }
 }
 
@@ -258,8 +259,8 @@ mod tests {
     fn required_vars() -> Vec<(&'static str, &'static str)> {
         vec![
             ("CLOUDFLARE_ACCOUNT_ID", "test-account"),
-            ("TRIAGE_MODEL", "@cf/google/gemini-test"),
-            ("ONBOARDING_MODEL", "@cf/deepseek/test"),
+            ("TRIAGE_MODEL", "cloudflare/@cf/google/gemini-test"),
+            ("ONBOARDING_MODEL", "cloudflare/@cf/deepseek/test"),
             ("MANIFOLD_API_KEY", "manifold-key"),
             ("DISCORD_BOT_TOKEN", "discord-token"),
             ("DISCORD_GUILD_ID", "123456789012345678"),
@@ -372,8 +373,8 @@ mod tests {
         let config = config_from(&required_vars()).expect("config should load");
 
         assert_eq!(config.cloudflare_account_id.as_deref(), Some("test-account"));
-        assert_eq!(config.triage_model, "@cf/google/gemini-test");
-        assert_eq!(config.onboarding_model, "@cf/deepseek/test");
+        assert_eq!(config.triage_model, "cloudflare/@cf/google/gemini-test");
+        assert_eq!(config.onboarding_model, "cloudflare/@cf/deepseek/test");
     }
 
     #[test]
@@ -412,10 +413,9 @@ mod tests {
         assert_eq!(p, ModelProvider::Cloudflare);
         assert_eq!(m, "@cf/meta/llama");
 
-        let (p, m) = parse_model_spec("@cf/meta/llama").unwrap();
-        assert_eq!(p, ModelProvider::Cloudflare);
-        assert_eq!(m, "@cf/meta/llama");
-
+        // Models without a prefix must error
+        assert!(parse_model_spec("@cf/meta/llama").is_err());
+        assert!(parse_model_spec("gpt-4o").is_err());
         assert!(parse_model_spec("openrouter/").is_err());
         assert!(parse_model_spec("cloudflare/").is_err());
         assert!(parse_model_spec("").is_err());
