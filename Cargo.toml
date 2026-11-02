@@ -1,2 +1,31 @@
+[package]
+name = "bsky-manifold-arb"
+version = "0.1.0"
+edition = "2021"
+description = "Bluesky to Manifold auto-trader driven by Sieve filtering"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serenity = { version = "0.12", features = ["rustls_backend"] }
+sieve = { path = "sieve" }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
 [workspace]
-members = []
+members = ["sieve"]
+
+# Keep debug artifacts small; this project is large enough to fill a disk.
+[profile.dev]
+debug = 0

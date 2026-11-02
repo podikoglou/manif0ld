@@ -1,1 +1,6 @@
 /target
+/.env
+/sieve/target
+/sieve/Cargo.lock
+/data
+/.cargo
