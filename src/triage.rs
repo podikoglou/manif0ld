@@ -128,14 +128,76 @@ impl TriageClient {
     pub async fn evaluate(
         &self,
         market: &TrackedMarket,
+        answers: &[crate::types::TrackedAnswer],
         post: &ExtractedPost,
         followers: Option<u64>,
         p_market: f64,
     ) -> AppResult<TriageResult> {
-        let (system, user) = build_prompt(market, post, followers, p_market);
+        let (system, user) = if answers.is_empty() {
+            build_prompt(market, post, followers, p_market)
+        } else {
+            build_multiple_choice_prompt(market, answers, post, followers)
+        };
         let text = self.ai.complete(&self.model, &system, &user).await?;
         parse_triage_response(&text)
     }
+}
+
+/// Builds the prompt for multiple-choice triage.
+pub fn build_multiple_choice_prompt(
+    market: &TrackedMarket,
+    answers: &[crate::types::TrackedAnswer],
+    post: &ExtractedPost,
+    followers: Option<u64>,
+) -> (String, String) {
+    let close_time = format_timestamp(market.close_time);
+    let posted = format_timestamp(Some(post.created_at));
+    let followers = followers
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    let mut answers_block = String::new();
+    for ans in answers {
+        answers_block.push_str(&format!("- [{}] \"{}\" (market prob: {:.2})\n", ans.id, ans.text, ans.p_market_last));
+    }
+
+    let user = format!(
+        r#"Market question: {question}
+Market description: {description}
+Resolution criteria: {resolution_criteria}
+Market close time: {close_time}
+
+Possible Answers:
+{answers_block}
+Bluesky post:
+Author: @{handle} ({followers} followers)
+Posted: {posted}
+Text: {text}
+
+Evaluate this post against the possible answers. Respond as JSON only:
+{{
+  "material": true if the post contains genuine evidence, news, or insider commentary relevant to one or more answers; false if noise,
+  "affected_answers": [
+    {{
+      "answer_id": "...",
+      "direction": "strong_yes" | "yes" | "neutral" | "no" | "strong_no",
+      "strength": integer 0-3 where 0=noise, 1=weak circumstantial, 2=strong secondary evidence, 3=definitive proof,
+      "rationale": "one sentence"
+    }}
+  ]
+}}"#,
+        question = market.question,
+        description = market.description,
+        resolution_criteria = market.resolution_criteria,
+        close_time = close_time,
+        answers_block = answers_block,
+        handle = post.handle,
+        followers = followers,
+        posted = posted,
+        text = post.text,
+    );
+
+    (SYSTEM_PROMPT.to_owned(), user)
 }
 
 /// Builds the `(system, user)` messages for one triage call.
@@ -206,7 +268,16 @@ pub fn parse_triage_response(raw: &str) -> AppResult<TriageResult> {
             result.strength
         );
     }
-    if result.rationale.trim().is_empty() {
+    for ans in &result.affected_answers {
+        if ans.strength > MAX_STRENGTH {
+            bail!(
+                "triage answer {} strength {} is out of range 0-{MAX_STRENGTH}",
+                ans.answer_id,
+                ans.strength
+            );
+        }
+    }
+    if result.rationale.trim().is_empty() && result.affected_answers.is_empty() {
         bail!("triage response rationale must not be empty");
     }
 
@@ -218,7 +289,16 @@ pub fn parse_triage_response(raw: &str) -> AppResult<TriageResult> {
 /// A post moves belief only when the model marked it material, chose a
 /// non-neutral direction, and assigned at least weak evidence strength.
 pub fn is_material(result: &TriageResult) -> bool {
-    result.material && result.direction != Direction::Neutral && result.strength >= 1
+    if !result.material {
+        return false;
+    }
+    if !result.affected_answers.is_empty() {
+        return result
+            .affected_answers
+            .iter()
+            .any(|a| a.direction != Direction::Neutral && a.strength >= 1);
+    }
+    result.direction.is_some_and(|d| d != Direction::Neutral) && result.strength >= 1
 }
 
 /// Extracts the first JSON object from an LLM answer.
@@ -380,9 +460,10 @@ mod tests {
             result,
             TriageResult {
                 material: true,
-                direction: Direction::Yes,
+                direction: Some(Direction::Yes),
                 strength: 2,
                 rationale: "A named source confirms the schedule.".to_owned(),
+                affected_answers: Vec::new(),
             }
         );
     }
@@ -391,7 +472,7 @@ mod tests {
     fn parses_fenced_json() {
         let raw = format!("```json\n{}\n```", valid_json());
         let result = parse_triage_response(&raw).expect("fenced JSON should parse");
-        assert_eq!(result.direction, Direction::Yes);
+        assert_eq!(result.direction, Some(Direction::Yes));
     }
 
     #[test]
@@ -403,9 +484,9 @@ mod tests {
 
     #[test]
     fn missing_required_field_is_an_error() {
-        let raw = r#"{"material": true, "strength": 2, "rationale": "ok"}"#;
-        let error = parse_triage_response(raw).expect_err("missing direction should fail");
-        assert!(error.to_string().contains("direction"), "{error}");
+        let raw = r#"{"material": true, "strength": 2, "rationale": ""}"#;
+        let error = parse_triage_response(raw).expect_err("blank rationale and no answers should fail");
+        assert!(error.to_string().contains("rationale"), "{error}");
     }
 
     #[test]
@@ -442,9 +523,10 @@ mod tests {
     fn is_material_requires_all_three_conditions() {
         let material = |material, direction, strength| TriageResult {
             material,
-            direction,
+            direction: Some(direction),
             strength,
             rationale: "because".to_owned(),
+            affected_answers: Vec::new(),
         };
 
         assert!(is_material(&material(true, Direction::Yes, 1)));
