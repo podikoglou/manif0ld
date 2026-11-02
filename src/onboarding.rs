@@ -171,6 +171,29 @@ pub struct SieveAttempt {
     pub error: Option<String>,
 }
 
+/// A live status update for the `/track` progress message.
+///
+/// Onboarding emits these as it advances, so the operator sees what is running
+/// now instead of one frozen line until the whole flow finishes. The caller
+/// replaces the previous message content with every update.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnboardUpdate {
+    /// A coarse phase message shown while a slow step runs.
+    Phase(String),
+    /// One completed Sieve synthesis attempt: the program and, on failure, its
+    /// validation error.
+    Sieve(SieveAttempt),
+}
+
+impl OnboardUpdate {
+    /// The update to show while waiting for the model's next Sieve answer.
+    fn asking_for_rule(attempt: usize) -> Self {
+        Self::Phase(format!(
+            "Attempt {attempt}/{MAX_SIEVE_ATTEMPTS} — asking the model for a Sieve rule…"
+        ))
+    }
+}
+
 /// A fully resolved market that has not been persisted yet.
 ///
 /// The Discord layer creates a thread for `market`, then calls
@@ -215,15 +238,16 @@ impl OnboardingService {
     /// operator override in whole percent; it is clamped to `1..=99`. Without
     /// an override the internal belief starts at the market probability.
     ///
-    /// Each Sieve generation is reported on `attempts` as the current
-    /// [`SieveAttempt`] (program plus validation error, or the compiled program);
-    /// the caller renders it live and replaces the previous one.
+    /// Each Sieve generation is reported on `updates` as it happens: a phase
+    /// message while a slow step runs, then the attempt itself (program plus
+    /// validation error, or the compiled program). The caller renders each
+    /// update immediately and replaces the previous one.
     pub async fn prepare(
         &self,
         url: &str,
         budget: f64,
         initial_prob: Option<u8>,
-        attempts: &mpsc::Sender<SieveAttempt>,
+        updates: &mpsc::Sender<OnboardUpdate>,
     ) -> AppResult<OnboardingDraft> {
         if !budget.is_finite() || budget <= 0.0 {
             bail!("market budget must be a positive finite mana value, got {budget}");
@@ -235,6 +259,11 @@ impl OnboardingService {
             .build()
             .context("building onboarding HTTP client")?;
 
+        let _ = updates
+            .send(OnboardUpdate::Phase(format!(
+                "Fetching Manifold market `{slug}`…"
+            )))
+            .await;
         let market = self.fetch_market(&http, &slug).await?;
         validate_market(&market)?;
 
@@ -244,7 +273,7 @@ impl OnboardingService {
             }
         }
 
-        let synthesis = self.synthesize(&market, attempts).await?;
+        let synthesis = self.synthesize(&market, updates).await?;
 
         let sieve_source = synthesis.sieve_program;
         let tracked = build_market(&market, &slug, budget, initial_prob, sieve_source.clone());
@@ -346,13 +375,14 @@ impl OnboardingService {
     /// judged: matching behavior has no ground truth at onboarding time, so no
     /// synthetic example is ever asserted against.
     ///
-    /// Every generation is reported on `attempts` so the operator sees the
-    /// current script and, when it failed, the error; the report is replaced on
-    /// the next turn and a successful attempt still shows the final script.
+    /// Every generation is reported on `updates` the moment it is validated, so
+    /// the operator sees the current script and, when it failed, the error, as
+    /// each attempt completes rather than after the last one gives up. A phase
+    /// message marks the wait for the model in between.
     async fn synthesize(
         &self,
         market: &ManifoldSlugMarket,
-        attempts: &mpsc::Sender<SieveAttempt>,
+        updates: &mpsc::Sender<OnboardUpdate>,
     ) -> AppResult<SieveSynthesis> {
         let mut turns: Vec<Arc<Message>> =
             vec![Arc::new(Message::user(build_sieve_user_prompt(market)))];
@@ -360,6 +390,7 @@ impl OnboardingService {
         let mut last_error = String::new();
 
         for attempt in 1..=MAX_SIEVE_ATTEMPTS {
+            let _ = updates.send(OnboardUpdate::asking_for_rule(attempt)).await;
             let raw = self
                 .ai
                 .complete_chat(&self.model, SIEVE_SYSTEM_PROMPT, &turns)
@@ -377,26 +408,26 @@ impl OnboardingService {
             // compiled program is a terminal report with no error.
             let (script, error) = match validate_synthesis(&raw) {
                 Validation::Compiled(synthesis) => {
-                    let _ = attempts
-                        .send(SieveAttempt {
+                    let _ = updates
+                        .send(OnboardUpdate::Sieve(SieveAttempt {
                             attempt,
                             max_attempts: MAX_SIEVE_ATTEMPTS,
                             script: synthesis.sieve_program.clone(),
                             error: None,
-                        })
+                        }))
                         .await;
                     return Ok(synthesis);
                 }
                 Validation::Failed { script, error } => (script, error),
             };
             last_error = error.clone();
-            let _ = attempts
-                .send(SieveAttempt {
+            let _ = updates
+                .send(OnboardUpdate::Sieve(SieveAttempt {
                     attempt,
                     max_attempts: MAX_SIEVE_ATTEMPTS,
                     script,
                     error: Some(error),
-                })
+                }))
                 .await;
 
             // The conversation remembers this answer and the report on it, so
@@ -721,6 +752,16 @@ mod tests {
         assert!(parse_slug("https://manifold.markets/").is_err());
         assert!(parse_slug("ftp://manifold.markets/Alice/market").is_err());
         assert!(parse_slug("not a url").is_err());
+    }
+
+    #[test]
+    fn asking_for_rule_phase_names_the_attempt_and_total() {
+        assert_eq!(
+            OnboardUpdate::asking_for_rule(2),
+            OnboardUpdate::Phase(
+                "Attempt 2/5 — asking the model for a Sieve rule…".to_owned()
+            )
+        );
     }
 
     #[test]
