@@ -76,9 +76,12 @@ Key dependencies: `tokio`, `tokio-tungstenite`, `serde`, `serde_json`, `reqwest`
 # Bluesky Jetstream
 JETSTREAM_URL=wss://jetstream2.us-east.bsky.network/subscribe
 
-# Cloudflare AI Gateway
-CF_AI_GATEWAY_URL=https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_name}
-CF_AI_GATEWAY_TOKEN=...
+# Cloudflare AI Gateway / Workers AI
+# The gateway URL ends with the account ID. The gateway ID is sent in the
+# cf-aig-gateway-id header.
+CF_AI_GATEWAY_URL=https://gateway.ai.cloudflare.com/v1/{account_id}
+CF_AI_GATEWAY_ID=manif0ld
+CF_API_KEY=...
 TRIAGE_MODEL=@cf/google/gemini-3.5-flash-lite          # verify exact identifier
 ONBOARDING_MODEL=@cf/deepseek/deepseek-v4.1-flash-1017 # verify exact identifier
 
@@ -107,7 +110,23 @@ BELIEF_HALFLIFE_HOURS=4.0
 DB_PATH=./data/arb.db
 ```
 
-**Note on model identifiers:** Confirm the exact strings CF AI Gateway accepts for `deepseek-v4.1-flash-1017` and `gemini-3.5-flash-lite`. If they route through the gateway's `/compat/chat/completions` (OpenAI-compatible) rather than Workers AI, adjust `reqwest` calls accordingly.
+**Note on the Cloudflare call.** The triage client uses the Workers AI REST
+endpoint with the AI Gateway header:
+
+```
+POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run
+Authorization: Bearer {CF_API_KEY}
+cf-aig-gateway-id: {CF_AI_GATEWAY_ID}
+Content-Type: application/json
+
+{"model": "{TRIAGE_MODEL}", "input": {"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]}}
+```
+
+The account ID is the last path segment of `CF_AI_GATEWAY_URL`. Confirm the
+exact model strings that the account accepts before going live. If a model is
+only available through the OpenAI-compatible route
+(`/ai/v1/chat/completions`), change the client to that route and use the
+OpenAI chat-completions body shape.
 
 ## 5. Data Model (SQLite)
 

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::error::{anyhow, AppResult, Context};
+use crate::error::{anyhow, bail, AppResult, Context};
 
 const DEFAULT_JETSTREAM_URL: &str = "wss://jetstream2.us-east.bsky.network/subscribe";
 const DEFAULT_DB_PATH: &str = "./data/arb.db";
@@ -27,7 +27,8 @@ const DEFAULT_BELIEF_HALFLIFE_HOURS: f64 = 4.0;
 pub struct Config {
     pub jetstream_url: String,
     pub cf_ai_gateway_url: String,
-    pub cf_ai_gateway_token: String,
+    pub cf_ai_gateway_id: String,
+    pub cf_api_key: String,
     pub triage_model: String,
     pub onboarding_model: String,
     pub manifold_api_key: String,
@@ -65,7 +66,8 @@ impl Config {
             optional(&get, "JETSTREAM_URL").unwrap_or_else(|| DEFAULT_JETSTREAM_URL.to_owned());
 
         let cf_ai_gateway_url = required(&get, "CF_AI_GATEWAY_URL")?;
-        let cf_ai_gateway_token = required(&get, "CF_AI_GATEWAY_TOKEN")?;
+        let cf_ai_gateway_id = required(&get, "CF_AI_GATEWAY_ID")?;
+        let cf_api_key = required(&get, "CF_API_KEY")?;
         let triage_model = required(&get, "TRIAGE_MODEL")?;
         let onboarding_model = required(&get, "ONBOARDING_MODEL")?;
         let manifold_api_key = required(&get, "MANIFOLD_API_KEY")?;
@@ -89,10 +91,11 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
 
-        Ok(Self {
+        let config = Self {
             jetstream_url,
             cf_ai_gateway_url,
-            cf_ai_gateway_token,
+            cf_ai_gateway_id,
+            cf_api_key,
             triage_model,
             onboarding_model,
             manifold_api_key,
@@ -109,7 +112,49 @@ impl Config {
             belief_kappa,
             belief_halflife_hours,
             db_path,
-        })
+        };
+
+        // Fail at startup, not on the first LLM call, if the gateway URL is
+        // still the placeholder from .env.example.
+        config.cf_account_id()?;
+        Ok(config)
+    }
+
+    /// Extracts the Cloudflare account ID from the gateway URL.
+    ///
+    /// `CF_AI_GATEWAY_URL` has the shape
+    /// `https://gateway.ai.cloudflare.com/v1/{account_id}`, so the last path
+    /// segment is the account ID. A literal `{account_id}` placeholder is
+    /// rejected with a clear error.
+    pub fn cf_account_id(&self) -> AppResult<String> {
+        let account_id = self
+            .cf_ai_gateway_url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .trim();
+
+        if account_id.is_empty() || account_id.starts_with('{') {
+            bail!(
+                "CF_AI_GATEWAY_URL must end with the Cloudflare account id; \
+                 see .env.example"
+            );
+        }
+
+        Ok(account_id.to_owned())
+    }
+
+    /// Builds the Workers AI `/ai/run` endpoint.
+    ///
+    /// The request also needs `Authorization: Bearer <CF_API_KEY>` and
+    /// `cf-aig-gateway-id: <CF_AI_GATEWAY_ID>` headers. The triage client adds
+    /// those headers; they are not part of the URL.
+    pub fn cf_ai_run_url(&self) -> AppResult<String> {
+        Ok(format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/ai/run",
+            self.cf_account_id()?
+        ))
     }
 }
 
@@ -156,8 +201,9 @@ mod tests {
     /// are intentionally omitted so defaults can be asserted.
     fn required_vars() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("CF_AI_GATEWAY_URL", "https://gateway.example/v1/a/g"),
-            ("CF_AI_GATEWAY_TOKEN", "cf-token"),
+            ("CF_AI_GATEWAY_URL", "https://gateway.example/v1/a"),
+            ("CF_AI_GATEWAY_ID", "test-gateway"),
+            ("CF_API_KEY", "cf-token"),
             ("TRIAGE_MODEL", "@cf/google/gemini-test"),
             ("ONBOARDING_MODEL", "@cf/deepseek/test"),
             ("MANIFOLD_API_KEY", "manifold-key"),
@@ -266,6 +312,36 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("KELLY_FRACTION"), "{message}");
         assert!(!message.contains("a quarter"), "{message}");
+    }
+
+    #[test]
+    fn extracts_cloudflare_account_id_and_run_url() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| *name != "CF_AI_GATEWAY_URL");
+        vars.push((
+            "CF_AI_GATEWAY_URL",
+            "https://gateway.ai.cloudflare.com/v1/0123456789abcdef/",
+        ));
+
+        let config = config_from(&vars).expect("config should load");
+        assert_eq!(config.cf_account_id().unwrap(), "0123456789abcdef");
+        assert_eq!(
+            config.cf_ai_run_url().unwrap(),
+            "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef/ai/run"
+        );
+    }
+
+    #[test]
+    fn rejects_placeholder_account_id() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| *name != "CF_AI_GATEWAY_URL");
+        vars.push((
+            "CF_AI_GATEWAY_URL",
+            "https://gateway.ai.cloudflare.com/v1/{account_id}",
+        ));
+
+        let error = config_from(&vars).expect_err("placeholder should fail");
+        assert!(error.to_string().contains("CF_AI_GATEWAY_URL"));
     }
 
     #[test]
