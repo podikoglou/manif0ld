@@ -752,7 +752,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             .await;
         }
         Ok(Err(error)) => {
-            tracing::warn!(error = %error, "/track failed");
+            tracing::warn!(error = ?error, "/track failed");
             // When synthesis itself failed, the last attempt already carries
             // the script and the error; report it in one block instead of the
             // plain error text. Other failures keep the current message. The
@@ -774,12 +774,22 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
                 .await;
                 return;
             }
-            send_followup(
-                ctx,
-                interaction,
-                &format!("Failed to track the market: {error}"),
-            )
-            .await;
+            // No attempt was ever reported: the model request itself failed
+            // before any program was written, or a pre-synthesis step failed.
+            // Either way the operator needs the whole error chain, which the
+            // legacy `{}` render hid behind the outermost context label.
+            let synthesis_failed = error
+                .chain()
+                .any(|cause| cause.to_string().contains("synthesizing a Sieve rule"));
+            let content = if synthesis_failed {
+                format!(
+                    "Failed to track the market: the model request failed before any \
+                     Sieve program was written.\n{error:#}"
+                )
+            } else {
+                format!("Failed to track the market: {error:#}")
+            };
+            send_followup(ctx, interaction, &content).await;
         }
         Ok(Ok(summary)) => send_followup(ctx, interaction, &summary).await,
     }

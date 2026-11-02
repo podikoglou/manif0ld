@@ -405,7 +405,10 @@ impl OnboardingService {
                 .complete_chat(&self.model, SIEVE_SYSTEM_PROMPT, &turns)
                 .await
                 .with_context(|| {
-                    format!("synthesizing a Sieve rule (attempt {attempt} of {MAX_SIEVE_ATTEMPTS})")
+                    format!(
+                        "synthesizing a Sieve rule with model {} (attempt {attempt} of {MAX_SIEVE_ATTEMPTS})",
+                        self.model
+                    )
                 })?;
             last_output = raw.clone();
 
