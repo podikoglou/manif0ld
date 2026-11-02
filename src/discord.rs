@@ -42,7 +42,7 @@ use crate::error::{bail, AppResult, Context as AnyhowContext};
 use crate::onboarding::{OnboardingDraft, OnboardingService, SieveAttempt};
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
-use crate::trade::{TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
+use crate::trade::{LiquidationOutcome, TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
 use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedMarket};
 
 /// Maximum number of autocomplete choices Discord accepts.
@@ -1402,7 +1402,15 @@ async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: Comp
 }
 
 /// Liquidates, closes, unregisters, and archives one market from its embed.
-async fn liquidate_button(state: &DiscordState, ctx: &Context, interaction: ComponentInteraction) {
+///
+/// The market is validated before anything is sold. A closed or untracked
+/// market is reported and the embed buttons are disabled, so a second press
+/// cannot repeat the action.
+async fn liquidate_button(
+    state: &DiscordState,
+    ctx: &Context,
+    mut interaction: ComponentInteraction,
+) {
     let Some((_, market_id)) = parse_button_custom_id(&interaction.data.custom_id) else {
         respond_component_ephemeral(ctx, &interaction, "Unknown button.").await;
         return;
@@ -1413,7 +1421,12 @@ async fn liquidate_button(state: &DiscordState, ctx: &Context, interaction: Comp
     }
 
     match liquidate_market(state, ctx, &market_id).await {
-        Ok(summary) => respond_component_followup(ctx, &interaction, &summary).await,
+        Ok(summary) => {
+            // The market is closed or gone, so this embed is stale. Disable the
+            // buttons before the followup so a second press does nothing.
+            disable_action_buttons(ctx, &mut interaction.message, &market_id).await;
+            respond_component_followup(ctx, &interaction, &summary).await
+        }
         Err(error) => {
             tracing::warn!(error = %error, "liquidate button failed");
             respond_component_followup(
@@ -1428,23 +1441,40 @@ async fn liquidate_button(state: &DiscordState, ctx: &Context, interaction: Comp
 
 /// Sells out, closes, unregisters, and archives one tracked market.
 ///
-/// Cleanup proceeds even when a step fails; each failure is logged so the
-/// operator can see what remained unfinished. Only an unknown market ID is a
-/// hard error, because there is nothing left to close then.
+/// The market status is checked first: a closed market and an untracked market
+/// return a report without selling anything. Cleanup proceeds even when a sell
+/// fails; each failure is logged so the operator can see what remained
+/// unfinished.
 async fn liquidate_market(
     state: &DiscordState,
     ctx: &Context,
     market_id: &str,
 ) -> AppResult<String> {
     let Some(market) = state.db.get_market(market_id)? else {
-        bail!("market {market_id} is not tracked");
+        return Ok(format!(
+            "Market `{market_id}` is no longer tracked. Nothing was liquidated."
+        ));
     };
     let question = market.question.clone();
     let thread_id = market.discord_thread_id.clone();
 
-    let liquidated = state.executor.liquidate(market_id).await;
-    if let Err(error) = &liquidated {
+    if market.status == MarketStatus::Closed {
+        return Ok(format!(
+            "**{question}** (`{market_id}`) is already closed. Nothing was liquidated."
+        ));
+    }
+
+    let outcome = state.executor.liquidate(market_id).await;
+    if let Err(error) = &outcome {
         tracing::error!(market_id = %market_id, error = %error, "liquidation failed");
+    }
+    if matches!(outcome, Ok(LiquidationOutcome::AlreadyClosed)) {
+        // Another action closed the market while this one waited for the
+        // execution lock. Do not repeat the cleanup or the archiving.
+        return Ok(format!(
+            "**{question}** (`{market_id}`) was already closed by another action. Nothing was \
+             liquidated."
+        ));
     }
 
     // Closing the market, unregistering the engine, dropping the cache entry,
@@ -1468,14 +1498,45 @@ async fn liquidate_market(
         }
     }
 
-    match liquidated {
-        Ok(()) => Ok(format!(
+    match outcome {
+        Ok(LiquidationOutcome::Sold) => Ok(format!(
             "**{question}** (`{market_id}`) liquidated, closed, and archived."
+        )),
+        Ok(LiquidationOutcome::AlreadyResolved) => Ok(format!(
+            "**{question}** (`{market_id}`) is resolved on Manifold, so its positions settled \
+             automatically. The market is now closed and archived."
+        )),
+        Ok(LiquidationOutcome::NoPosition) => Ok(format!(
+            "**{question}** (`{market_id}`) had no open position. The market is now closed and \
+             archived."
+        )),
+        Ok(LiquidationOutcome::AlreadyClosed) => Ok(format!(
+            "**{question}** (`{market_id}`) is already closed. Nothing was liquidated."
         )),
         Err(error) => Ok(format!(
             "**{question}** (`{market_id}`) was closed and archived, but liquidation had \
              errors: {error}"
         )),
+    }
+}
+
+/// Replaces the ONBOARDED action row with disabled buttons.
+///
+/// This is the final guard against a repeated destructive press on an embed
+/// whose market is already closed.
+async fn disable_action_buttons(ctx: &Context, message: &mut Message, market_id: &str) {
+    let buttons = onboarded_buttons(market_id)
+        .into_iter()
+        .map(|button| button.disabled(true))
+        .collect();
+    if let Err(error) = message
+        .edit(
+            &ctx.http,
+            EditMessage::new().components(vec![CreateActionRow::Buttons(buttons)]),
+        )
+        .await
+    {
+        tracing::warn!(market_id = %market_id, error = %error, "failed to disable the action buttons");
     }
 }
 
