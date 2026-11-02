@@ -183,10 +183,12 @@ compilation; `matches` is read-only. This is the one `unsafe` in the codebase.
 - Onboarding Sieve synthesis runs as a multi-turn compile loop (up to 5
   attempts), feeding each compiler error back as the next message so the model
   auto-corrects its rule; final failure includes the last LLM output. The
-  `/track` progress message is edited on every attempt to show the current
-  script with its validation error below it in one code block; a compiled rule
-  still shows the final script, and a failed synthesis resends the last report
-  as the final message.
+  `/track` progress message is edited on every step as it happens: phase lines
+  ("Fetching Manifold market…", "Attempt N/5 — asking the model…") while a slow
+  step runs, then each attempt's program in a `sieve` code block with its
+  validation error in a second code block below it. A compiled rule keeps the
+  final script, and a failed synthesis leaves the last attempt on screen under
+  "Failed after 5 attempts." — it does not wait for every try before reporting.
 
 ---
 
