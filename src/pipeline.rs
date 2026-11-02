@@ -276,6 +276,12 @@ impl QueueDepth {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
+    /// A post matched a market's filter (Sieve or VIP) and is being sent to LLM triage.
+    PostMatched {
+        market_id: MarketId,
+        post_uri: String,
+        author_handle: String,
+    },
     /// A post was triaged for a market. Emitted for non-material posts too, so
     /// the signal ledger and future Discord embeds stay complete.
     Signal {
@@ -526,6 +532,12 @@ impl Pipeline {
         // have been enqueued before the first one finished, and their snapshots
         // would otherwise overwrite each other's belief updates.
         let market = self.cache.get(&market.id).unwrap_or(market);
+
+        self.emit(PipelineEvent::PostMatched {
+            market_id: market.id.clone(),
+            post_uri: post.uri.clone(),
+            author_handle: post.handle.clone(),
+        });
 
         let now = Utc::now().timestamp();
         let p_market = market.p_market_last;

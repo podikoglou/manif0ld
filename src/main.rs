@@ -197,6 +197,18 @@ fn init_tracing() {
 /// channel without changing the pipeline.
 fn log_pipeline_event(event: &PipelineEvent) {
     match event {
+        PipelineEvent::PostMatched {
+            market_id,
+            post_uri,
+            author_handle,
+        } => {
+            tracing::info!(
+                market_id = %market_id,
+                author_handle = %author_handle,
+                post_uri = %post_uri,
+                "post matched filter, sending to LLM triage"
+            );
+        }
         PipelineEvent::Signal {
             market_id,
             question,

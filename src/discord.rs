@@ -1640,6 +1640,16 @@ async fn consume_pipeline_events(
 ) {
     loop {
         match events.recv().await {
+            Ok(PipelineEvent::PostMatched {
+                market_id,
+                post_uri,
+                author_handle,
+            }) => {
+                let channel = channel_for_market(&db, &config, Some(&market_id));
+                let url = bsky_post_url_with_handle(&post_uri, Some(&author_handle))
+                    .unwrap_or_else(|| post_uri.clone());
+                send_text_message(&http, channel, &url).await;
+            }
             Ok(PipelineEvent::Signal {
                 material: true,
                 market_id,
@@ -1827,6 +1837,23 @@ async fn send_embed(http: &Http, channel: ChannelId, embed: CreateEmbed) {
     }
 }
 
+/// Sends a text message, logging failures instead of propagating them.
+async fn send_text_message(http: &Http, channel: ChannelId, content: &str) {
+    if content.trim().is_empty() {
+        return;
+    }
+    if let Err(error) = channel
+        .send_message(http, CreateMessage::new().content(content))
+        .await
+    {
+        tracing::error!(
+            channel_id = channel.get(),
+            error = %error,
+            "failed to send a Discord message"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Pure helpers
 // -----------------------------------------------------------------------------
@@ -1966,6 +1993,11 @@ fn onboarded_buttons(market_id: &str) -> Vec<CreateButton> {
 /// Only `at://{did}/app.bsky.feed.post/{rkey}` is accepted. The DID and record
 /// key must be non-empty and no extra path segments may be present.
 pub(crate) fn bsky_post_url(uri: &str) -> Option<String> {
+    bsky_post_url_with_handle(uri, None)
+}
+
+/// Converts a Bluesky AT URI into a public post URL, preferring a human-readable handle when provided.
+pub(crate) fn bsky_post_url_with_handle(uri: &str, handle: Option<&str>) -> Option<String> {
     let rest = uri.strip_prefix("at://")?;
     let mut parts = rest.split('/');
     let did = parts.next().filter(|part| !part.is_empty())?;
@@ -1976,7 +2008,12 @@ pub(crate) fn bsky_post_url(uri: &str) -> Option<String> {
         return None;
     }
 
-    Some(format!("https://bsky.app/profile/{did}/post/{rkey}"))
+    let profile = match handle {
+        Some(h) if !h.trim().is_empty() && !h.starts_with("did:") => h.trim(),
+        _ => did,
+    };
+
+    Some(format!("https://bsky.app/profile/{profile}/post/{rkey}"))
 }
 
 /// Truncates to at most `max` characters, appending `…` when content is lost.
@@ -2096,6 +2133,20 @@ mod tests {
     fn builds_a_bluesky_post_url_from_an_at_uri() {
         assert_eq!(
             bsky_post_url("at://did:plc:abc123/app.bsky.feed.post/3kxyz"),
+            Some("https://bsky.app/profile/did:plc:abc123/post/3kxyz".to_owned())
+        );
+        assert_eq!(
+            bsky_post_url_with_handle(
+                "at://did:plc:abc123/app.bsky.feed.post/3kxyz",
+                Some("alice.bsky.social")
+            ),
+            Some("https://bsky.app/profile/alice.bsky.social/post/3kxyz".to_owned())
+        );
+        assert_eq!(
+            bsky_post_url_with_handle(
+                "at://did:plc:abc123/app.bsky.feed.post/3kxyz",
+                Some("did:plc:abc123")
+            ),
             Some("https://bsky.app/profile/did:plc:abc123/post/3kxyz".to_owned())
         );
     }
