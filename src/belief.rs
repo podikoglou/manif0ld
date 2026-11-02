@@ -1,9 +1,9 @@
 //! Log-odds belief state with exponential decay toward the market price.
 //!
 //! The bot keeps its own probability for each market in log-odds space. Each
-//! triaged post adds a signed impulse, scaled by the direction, evidence
-//! strength, and whether the author is a VIP. Between updates the belief decays
-//! toward the current market price, so stale opinions do not trade forever.
+//! triaged post adds a signed impulse, scaled by the direction and evidence
+//! strength. Between updates the belief decays toward the current market price,
+//! so stale opinions do not trade forever.
 //!
 //! Everything in this module is pure: callers own the persisted state
 //! (`p_internal_log_odds`, `belief_updated_at`) and pass it in. `now` and
@@ -106,12 +106,10 @@ pub fn current_p_internal(
 
 /// Nominal log-odds impulse for one post, before clamping.
 ///
-/// `strength` is clamped to `3`; a neutral direction yields zero. VIP authors
-/// receive a 1.5× multiplier.
-pub fn nominal_impulse(direction: Direction, strength: u8, is_vip: bool, kappa: f64) -> f64 {
+/// `strength` is clamped to `3`; a neutral direction yields zero.
+pub fn nominal_impulse(direction: Direction, strength: u8, kappa: f64) -> f64 {
     let strength = f64::from(strength.min(3)) / 3.0;
-    let vip_multiplier = if is_vip { 1.5 } else { 1.0 };
-    kappa * direction.polarity() * strength * vip_multiplier
+    kappa * direction.polarity() * strength
 }
 
 /// Applies one post to the belief state.
@@ -129,7 +127,6 @@ pub fn apply_post(
     belief_updated_at: &mut i64,
     direction: Direction,
     strength: u8,
-    is_vip: bool,
     p_market_now: f64,
     now: i64,
     kappa: f64,
@@ -142,7 +139,7 @@ pub fn apply_post(
         now,
         halflife_hours,
     );
-    let impulse = nominal_impulse(direction, strength, is_vip, kappa);
+    let impulse = nominal_impulse(direction, strength, kappa);
     let new_l = (decayed + impulse).clamp(-LOG_ODDS_CLAMP, LOG_ODDS_CLAMP);
 
     *l_stored = new_l;
@@ -158,7 +155,6 @@ pub fn apply_post_with_params(
     belief_updated_at: &mut i64,
     direction: Direction,
     strength: u8,
-    is_vip: bool,
     p_market_now: f64,
     now: i64,
     params: BeliefParams,
@@ -168,7 +164,6 @@ pub fn apply_post_with_params(
         belief_updated_at,
         direction,
         strength,
-        is_vip,
         p_market_now,
         now,
         params.kappa,
@@ -240,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn strong_yes_impulse_scales_with_vip_status() {
+    fn strong_yes_impulse_uses_full_strength() {
         let mut l = 0.0;
         let mut updated = 0;
         let delta = apply_post(
@@ -248,7 +243,6 @@ mod tests {
             &mut updated,
             Direction::StrongYes,
             3,
-            false,
             0.5,
             0,
             1.1,
@@ -256,22 +250,6 @@ mod tests {
         );
         assert!((delta - 1.1).abs() < EPS);
         assert!((l - 1.1).abs() < EPS);
-
-        let mut vip_l = 0.0;
-        let mut vip_updated = 0;
-        let vip_delta = apply_post(
-            &mut vip_l,
-            &mut vip_updated,
-            Direction::StrongYes,
-            3,
-            true,
-            0.5,
-            0,
-            1.1,
-            4.0,
-        );
-        assert!((vip_delta - 1.65).abs() < EPS);
-        assert!((vip_l - 1.65).abs() < EPS);
     }
 
     #[test]
@@ -283,7 +261,6 @@ mod tests {
             &mut updated,
             Direction::No,
             3,
-            false,
             0.5,
             0,
             1.1,
@@ -298,7 +275,6 @@ mod tests {
             &mut strong_no_updated,
             Direction::StrongNo,
             3,
-            false,
             0.5,
             0,
             1.1,
@@ -313,7 +289,6 @@ mod tests {
             &mut neutral_updated,
             Direction::Neutral,
             3,
-            false,
             0.5,
             0,
             1.1,
@@ -327,7 +302,6 @@ mod tests {
             &mut neutral_updated,
             Direction::StrongYes,
             0,
-            false,
             0.5,
             0,
             1.1,
@@ -338,7 +312,7 @@ mod tests {
 
     #[test]
     fn strength_above_three_is_clamped() {
-        assert!((nominal_impulse(Direction::StrongYes, 9, false, 1.1) - 1.1).abs() < EPS);
+        assert!((nominal_impulse(Direction::StrongYes, 9, 1.1) - 1.1).abs() < EPS);
     }
 
     #[test]
@@ -352,7 +326,6 @@ mod tests {
                 &mut updated,
                 Direction::StrongYes,
                 3,
-                false,
                 0.5,
                 0,
                 1.1,
@@ -374,7 +347,6 @@ mod tests {
             &mut updated,
             Direction::StrongYes,
             3,
-            false,
             0.5,
             0,
             1.1,
@@ -396,7 +368,6 @@ mod tests {
             &mut updated,
             Direction::Neutral,
             0,
-            false,
             0.5,
             4 * HOUR,
             1.1,
@@ -433,7 +404,6 @@ mod tests {
             &mut updated,
             Direction::StrongYes,
             3,
-            false,
             0.5,
             0,
             params,
