@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use rig::completion::Message;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -48,7 +49,7 @@ const MAX_VIP_QUERIES: usize = 10;
 const VIP_SEARCH_LIMIT: u64 = 5;
 
 /// LLM attempts allowed for one Sieve program.
-const MAX_SIEVE_ATTEMPTS: usize = 3;
+const MAX_SIEVE_ATTEMPTS: usize = 5;
 
 /// Minimum follower count that makes an actor a preferred VIP candidate.
 const PREFERRED_VIP_FOLLOWERS: u64 = 500;
@@ -339,43 +340,47 @@ impl OnboardingService {
 
     /// Asks the onboarding model for a compileable Sieve rule.
     ///
-    /// A parse or compile failure is fed back into the next user prompt. After
-    /// [`MAX_SIEVE_ATTEMPTS`] failures the error includes the last compiler (or
-    /// parser) message and the raw LLM output so the operator can see what the
-    /// model produced.
+    /// This is an agentic compile loop, not a single generation: the
+    /// conversation grows turn by turn, each model answer followed by a
+    /// validation report (the compiler error, or nothing if it compiled) as
+    /// the next user message. A parse or compile failure costs one attempt.
+    /// After [`MAX_SIEVE_ATTEMPTS`] failures the error includes the last
+    /// compiler (or parser) message and the raw LLM output so the operator can
+    /// see what the model produced. Only parse and compile correctness is
+    /// judged: matching behavior has no ground truth at onboarding time, so no
+    /// synthetic example is ever asserted against.
     async fn synthesize(&self, market: &ManifoldSlugMarket) -> AppResult<SieveSynthesis> {
-        let mut user_prompt = build_sieve_user_prompt(market);
+        let mut turns: Vec<Arc<Message>> =
+            vec![Arc::new(Message::user(build_sieve_user_prompt(market)))];
         let mut last_output = String::new();
         let mut last_error = String::new();
 
         for attempt in 1..=MAX_SIEVE_ATTEMPTS {
             let raw = self
                 .ai
-                .complete(&self.model, SIEVE_SYSTEM_PROMPT, &user_prompt)
+                .complete_chat(&self.model, SIEVE_SYSTEM_PROMPT, &turns)
                 .await
                 .with_context(|| {
                     format!("synthesizing a Sieve rule (attempt {attempt} of {MAX_SIEVE_ATTEMPTS})")
                 })?;
             last_output = raw.clone();
 
-            let outcome = match parse_sieve_synthesis(&raw) {
-                Ok(synthesis) => match sieve::compile(&synthesis.sieve_program) {
-                    Ok(_) => Ok(synthesis),
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
-            };
+            let outcome = parse_sieve_synthesis(&raw).and_then(|synthesis| {
+                sieve::compile(&synthesis.sieve_program).map(|_| synthesis)
+            });
 
             match outcome {
                 Ok(synthesis) => return Ok(synthesis),
                 Err(error) => {
                     last_error = error.to_string();
-                    user_prompt.push_str(&format!(
-                        "\n\nYour previous answer failed validation.\n\
+                    // The conversation remembers this answer and the report on
+                    // it, so the next prompt only needs the fix request.
+                    turns.push(Arc::new(Message::assistant(raw)));
+                    turns.push(Arc::new(Message::user(format!(
+                        "Your previous answer failed validation.\n\
                          Error: {last_error}\n\
-                         Previous answer:\n{raw}\n\
                          Respond with corrected JSON only."
-                    ));
+                    ))));
                 }
             }
         }

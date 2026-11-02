@@ -429,7 +429,7 @@ Triggered by `/track url:<url> budget:<mana>`:
      "vip_actor_queries": ["@handle_or_name", ...]
    }
    ```
-4. **Compile:** `CompiledSieve::compile(&sieve_program)`. On failure, retry the LLM up to 2 more times with the compile errors appended. If still failing after 3 attempts, abort and post the error + last LLM output to the Discord channel.
+4. **Compile with agentic self-correction:** `CompiledSieve::compile(&sieve_program)`. The call is a multi-turn loop, not a single generation: each LLM answer is followed by a validation report (the compiler error, or nothing if it compiled) as the next message, so the model corrects its own rule. Judgment stops at parse + compile correctness — matching behavior has no ground truth at onboarding time. If it still fails to compile after 5 attempts, abort and post the error + last LLM output to the Discord channel.
 5. **Resolve VIPs:** For each `vip_actor_queries[i]`, call `GET https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors?q={query}&limit=5`. Pick the best match — prefer custom-domain handle (not ending in `.bsky.social`) or `followersCount >= 500`. Store `did` + `handle` in `market_vip_dids`. Log failures but don't abort onboarding.
 6. **Persist** market row (initial `p_internal_log_odds = logit(market.probability)`), register `CompiledSieve` in `EngineRegistry`, create Discord thread, post the `[ONBOARDED]` embed.
 

@@ -172,8 +172,9 @@ compilation; `matches` is read-only. This is the one `unsafe` in the codebase.
 - Prices/times: Manifold uses ms; the DB stores seconds. Convert at the
   boundary (`trade.rs` `millis_to_seconds`).
 - Thread names truncate the question to 50 chars.
-- Onboarding Sieve synthesis retries up to 3 times, appending compiler
-  errors; final failure includes the last LLM output.
+- Onboarding Sieve synthesis runs as a multi-turn compile loop (up to 5
+  attempts), feeding each compiler error back as the next message so the model
+  auto-corrects its rule; final failure includes the last LLM output.
 
 ---
 
