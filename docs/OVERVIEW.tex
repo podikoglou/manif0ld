@@ -36,8 +36,8 @@
 \section{Big picture}\label{sec:big}
 
 The bot streams the Bluesky \textbf{Jetstream} firehose, cheaply filters every
-post through one compiled \textbf{Sieve} rule per tracked market (plus a VIP
-author bypass), and only for survivors calls \emph{one small LLM} via Cloudflare
+post through one compiled \textbf{Sieve} rule per tracked market, and only for
+survivors calls \emph{one small LLM} via Cloudflare
 Workers AI. A material post nudges a per-market log-odds belief; the belief is
 compared to the live Manifold price, and a fractional-Kelly trade is placed only
 when the gap is wide. Each market has an isolated mana budget.
@@ -96,8 +96,7 @@ works.
     posts only; concatenate body $+$ image alt-texts $+$ quoted body, verbatim.
     Handle falls back to the author DID.
   \item \textbf{Match} (\texttt{sieve.rs}): \texttt{EngineRegistry} runs one
-    compiled Sieve per market (read-lock only). An author on a market's VIP
-    list bypasses its rule.
+    compiled Sieve per market (read-lock only).
   \item \textbf{Queue} (\texttt{pipeline.rs}): each market has its own bounded
     triage queue (capacity 30) and one sequential worker, so belief updates
     stay in post order; saturation drops the oldest job.
@@ -130,7 +129,7 @@ L_{\mathrm{dec}} = \logit(\pmkt) + \bigl(L_{\mathrm{old}} - \logit(\pmkt)\bigr)\
 \]
 \[
 \text{impulse} = \kappa \cdot \underbrace{\text{polarity}(d)}_{\text{strong\_yes}=1,\ \text{yes}=.5,\ \text{neutral}=0,\ \text{no}=-.5,\ \text{strong\_no}=-1}
-\cdot \frac{\text{strength}}{3} \cdot \underbrace{\text{vip? }1.5 : 1}_{\text{VIP multiplier}},
+\cdot \frac{\text{strength}}{3},
 \qquad \kappa = 1.1 .
 \]
 
@@ -167,12 +166,11 @@ market gets a thread hosting its embeds.
 \toprule
 \textbf{Command} & \textbf{Behavior} \\
 \midrule
-\texttt{/track url budget?} & Onboard: fetch market, LLM synthesizes a Sieve rule + VIP queries, compile (retry $\le$3), resolve VIP DIDs, create thread, post $[ONBOARDED]$ with buttons (Pause / Liquidate). \\
+\texttt{/track url budget?} & Onboard: fetch market, LLM synthesizes a Sieve rule, compile (retry $\le$3), create thread, post $[ONBOARDED]$ with buttons (Pause / Liquidate). \\
 \texttt{/untrack market} & Remove engine; optionally liquidate all shares; archive thread. \\
 \texttt{/budget market n} & Update \texttt{budget\_mana}. \\
 \texttt{/status market?} & Overview table, or per-market detail incl.\ Sieve source \& last 10 signals. \\
 \texttt{/override market p} & Set internal probability; triggers one trade check. \\
-\texttt{/vip market handle} & Add an author to the VIP bypass list. \\
 \texttt{/panic liquidate\_all?} & Set the kill switch; optionally flatten everything. \\
 \bottomrule
 \end{tabular}
@@ -182,9 +180,7 @@ market gets a thread hosting its embeds.
 URL, \texttt{GET /v0/slug/\{slug\}}, require a binary, unresolved market; ask
 \texttt{ONBOARDING\_MODEL} for a ``\texttt{match Market\_<id> \{ ... \}}'' Sieve
 program (topic filter only --- direction is never encoded in the rule; a
-\texttt{- @noise} exception is required); compile, resolving VIPs through
-Bluesky \texttt{searchActors}, preferring custom-domain handles or
-\texttt{followers >= 500}. ``If it compiles, it's live'' --- the operator
+\texttt{- @noise} exception is required); compile. ``If it compiles, it's live'' --- the operator
 reviews the rule in the thread embed and can \texttt{/untrack} at any time.
 
 \section*{Key constants}\label{sec:consts}
