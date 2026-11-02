@@ -40,9 +40,9 @@ use crate::types::MarketStatus;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    // Serenity compiles with the rustls `ring` provider while rig's reqwest
-    // stack adds `aws-lc-rs`, so rustls cannot pick one automatically. Pin
-    // `ring` here, before any TLS handshake.
+    // Every TLS stack in this binary (serenity, reqwest, tokio-tungstenite)
+    // uses the rustls `ring` provider. Pin it here, before any handshake, so a
+    // second rustls default cannot be chosen at runtime.
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|error| anyhow!("installing the default rustls crypto provider: {error:?}"))?;
