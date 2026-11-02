@@ -690,6 +690,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             return;
         }
     };
+    let progress_id = progress.id;
 
     // Each Sieve generation replaces the previous report on the progress
     // message; only the current attempt is ever shown. `last_attempt` keeps the
@@ -790,7 +791,12 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             };
             send_followup(ctx, interaction, &content).await;
         }
-        Ok(Ok(summary)) => send_followup(ctx, interaction, &summary).await,
+        Ok(Ok(summary)) => {
+            if let Err(error) = interaction.delete_followup(&ctx.http, progress_id).await {
+                tracing::debug!(error = %error, "failed to delete progress followup message");
+            }
+            send_followup(ctx, interaction, &summary).await;
+        }
     }
 }
 
