@@ -135,6 +135,22 @@ impl MarketCache {
         self.write().insert(id, CachedMarket::new(market, vips));
     }
 
+    /// Replaces one cached market while preserving its VIP list.
+    ///
+    /// Used by the trading layer after it persists position, probability, or
+    /// status changes. A market that is not in the cache yet is inserted with an
+    /// empty VIP list; callers adding a new market should use
+    /// [`MarketCache::upsert`] so the VIPs arrive with it.
+    pub fn update_market(&self, market: TrackedMarket) {
+        let mut markets = self.write();
+        match markets.get_mut(&market.id) {
+            Some(cached) => cached.market = market,
+            None => {
+                markets.insert(market.id.clone(), CachedMarket::new(market, Vec::new()));
+            }
+        }
+    }
+
     /// Removes one market from the cache. Missing IDs are ignored.
     pub fn remove(&self, id: &str) {
         self.write().remove(id);
@@ -747,6 +763,36 @@ mod tests {
         assert!(cache.get("m3").is_none());
         assert!(!cache.is_vip("m3", "did:plc:new"));
         assert!(!cache.vip_lookup().contains_key("m3"));
+    }
+
+    #[test]
+    fn update_market_replaces_state_and_keeps_vips() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let cache = MarketCache::load(&db).expect("load cache");
+        cache.upsert(
+            sample_market("m1", MarketStatus::Active, 1),
+            vec![sample_vip("did:plc:vip", "vip.test")],
+        );
+        cache.upsert(sample_market("m2", MarketStatus::Active, 2), Vec::new());
+
+        let mut updated = cache.get("m1").expect("cached m1");
+        updated.yes_shares = 12.5;
+        updated.invested_mana = 8.0;
+        updated.p_market_last = 0.61;
+        cache.update_market(updated);
+
+        let cached = cache.get("m1").expect("updated m1");
+        assert_eq!(cached.yes_shares, 12.5);
+        assert_eq!(cached.invested_mana, 8.0);
+        assert_eq!(cached.p_market_last, 0.61);
+        assert!(cache.is_vip("m1", "did:plc:vip"), "VIP list must survive");
+
+        // Updating an unknown market inserts it with no VIPs.
+        let mut fresh = sample_market("m3", MarketStatus::Paused, 3);
+        fresh.no_shares = 4.0;
+        cache.update_market(fresh);
+        assert_eq!(cache.get("m3").expect("inserted m3").no_shares, 4.0);
+        assert!(!cache.is_vip("m3", "did:plc:vip"));
     }
 
     #[test]
