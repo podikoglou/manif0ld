@@ -263,8 +263,10 @@ impl OnboardingService {
         let market = self.fetch_market(&http, &slug).await?;
         validate_market(&market)?;
 
-        if self.db.get_market(&market.id)?.is_some() {
-            bail!("market {} ({slug}) is already tracked", market.id);
+        if let Some(existing) = self.db.get_market(&market.id)? {
+            if existing.status != MarketStatus::Closed {
+                bail!("market {} ({slug}) is already tracked", market.id);
+            }
         }
 
         let synthesis = self.synthesize(&market, attempts).await?;
@@ -329,6 +331,13 @@ impl OnboardingService {
         } = draft;
 
         market.discord_thread_id = thread_id.to_owned();
+        if let Some(existing) = self.db.get_market(&market.id)? {
+            if existing.status == MarketStatus::Closed {
+                let _ = self.db.delete_answers_for_market(&market.id);
+                let _ = self.db.delete_vips_for_market(&market.id);
+                let _ = self.db.delete_market(&market.id);
+            }
+        }
         self.db.insert_market(&market)?;
 
         let rollback = |market_id: &str| {
@@ -1147,6 +1156,34 @@ mod tests {
         assert_eq!(stored.discord_thread_id, "");
         let vips = db.list_vips("Market_test").expect("list VIPs");
         assert_eq!(vips, vec![sample_vip("did:plc:old", "old.test")]);
+    }
+
+    #[test]
+    fn activate_replaces_previously_closed_market() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let mut existing = sample_draft("Market_test");
+        existing.market.status = MarketStatus::Closed;
+        db.insert_market(&existing.market).expect("insert existing");
+        db.add_vip("Market_test", &sample_vip("did:plc:old", "old.test"))
+            .expect("add existing VIP");
+
+        let registry = Arc::new(EngineRegistry::new());
+        let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
+        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&cache));
+
+        let activated = service
+            .activate(sample_draft("Market_test"), "thread-reopened")
+            .expect("re-activating closed market should succeed");
+        assert_eq!(activated.discord_thread_id, "thread-reopened");
+        assert_eq!(activated.status, MarketStatus::Active);
+
+        let stored = db
+            .get_market("Market_test")
+            .expect("read market")
+            .expect("market row");
+        assert_eq!(stored.discord_thread_id, "thread-reopened");
+        assert_eq!(stored.status, MarketStatus::Active);
+        assert!(registry.contains("Market_test"));
     }
 
     #[test]

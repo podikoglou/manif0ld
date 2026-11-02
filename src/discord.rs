@@ -358,7 +358,12 @@ async fn autocomplete(state: &DiscordState, ctx: &Context, interaction: &Command
 /// because callers concatenate the cache and database snapshots. Each choice
 /// name has the form `"{question} ({id})"` and is truncated to Discord's limit.
 pub(crate) fn market_choices(markets: &[TrackedMarket], query: &str) -> Vec<(String, String)> {
-    let needle = query.trim().to_lowercase();
+    let trimmed = query.trim();
+    let needle = trimmed.to_lowercase();
+    let url_slug = crate::onboarding::parse_slug(trimmed)
+        .or_else(|_| crate::onboarding::parse_slug(&format!("https://{trimmed}")))
+        .ok()
+        .map(|s| s.to_lowercase());
     let mut seen = HashSet::new();
     let mut choices = Vec::new();
 
@@ -369,7 +374,11 @@ pub(crate) fn market_choices(markets: &[TrackedMarket], query: &str) -> Vec<(Str
         if !needle.is_empty() {
             let matches = market.question.to_lowercase().contains(&needle)
                 || market.id.to_lowercase().contains(&needle)
-                || market.slug.to_lowercase().contains(&needle);
+                || market.slug.to_lowercase().contains(&needle)
+                || url_slug.as_deref().is_some_and(|slug| {
+                    market.slug.to_lowercase().contains(slug)
+                        || market.id.to_lowercase().contains(slug)
+                });
             if !matches {
                 continue;
             }
@@ -595,14 +604,26 @@ pub(crate) fn resolve_market<'a>(
     markets: &'a [TrackedMarket],
     query: &str,
 ) -> Option<&'a TrackedMarket> {
-    let needle = query.trim().to_lowercase();
-    if needle.is_empty() {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
         return None;
     }
+    let needle = trimmed.to_lowercase();
+    let url_slug = crate::onboarding::parse_slug(trimmed)
+        .or_else(|_| crate::onboarding::parse_slug(&format!("https://{trimmed}")))
+        .ok()
+        .map(|s| s.to_lowercase());
 
     let exact: Vec<&TrackedMarket> = markets
         .iter()
-        .filter(|market| market.id.to_lowercase() == needle || market.slug.to_lowercase() == needle)
+        .filter(|market| {
+            let id = market.id.to_lowercase();
+            let slug = market.slug.to_lowercase();
+            id == needle
+                || slug == needle
+                || url_slug.as_deref() == Some(&slug)
+                || url_slug.as_deref() == Some(&id)
+        })
         .collect();
     if exact.len() == 1 {
         return exact.first().copied();
@@ -613,7 +634,13 @@ pub(crate) fn resolve_market<'a>(
 
     let prefixes: Vec<&TrackedMarket> = markets
         .iter()
-        .filter(|market| market.slug.to_lowercase().starts_with(&needle))
+        .filter(|market| {
+            let slug = market.slug.to_lowercase();
+            slug.starts_with(&needle)
+                || url_slug
+                    .as_deref()
+                    .is_some_and(|url_s| slug.starts_with(url_s))
+        })
         .collect();
     if prefixes.len() == 1 {
         return prefixes.first().copied();
@@ -816,11 +843,13 @@ async fn onboard(
 ) -> AppResult<String> {
     let draft = state.onboarding.prepare(url, budget, initial_prob, &attempts).await?;
 
-    if state.db.get_market(&draft.market.id)?.is_some() {
-        bail!(
-            "market {} is already tracked (see /status or /untrack)",
-            draft.market.id
-        );
+    if let Some(existing) = state.db.get_market(&draft.market.id)? {
+        if existing.status != MarketStatus::Closed {
+            bail!(
+                "market {} is already tracked (see /status or /untrack)",
+                draft.market.id
+            );
+        }
     }
 
     let thread_name = format!(
@@ -911,7 +940,7 @@ async fn untrack_market(
     let market_id = market.id.clone();
     let thread_id = market.discord_thread_id.clone();
 
-    if liquidate {
+    if liquidate && market.status != MarketStatus::Closed {
         state
             .executor
             .liquidate(&market_id)
@@ -920,6 +949,7 @@ async fn untrack_market(
     }
 
     state.registry.unregister(&market_id);
+    state.db.delete_answers_for_market(&market_id)?;
     state.db.delete_vips_for_market(&market_id)?;
     state.db.delete_market(&market_id)?;
     state.cache.remove(&market_id);
@@ -933,14 +963,16 @@ async fn untrack_market(
         }
     }
 
+    let positions_msg = if liquidate && market.status != MarketStatus::Closed {
+        " Positions were liquidated."
+    } else if market.status != MarketStatus::Closed {
+        " Positions were left untouched."
+    } else {
+        ""
+    };
     Ok(format!(
-        "Untracked **{}** (`{market_id}`).{} Thread archived.",
+        "Untracked **{}** (`{market_id}`).{positions_msg} Thread archived.",
         market.question,
-        if liquidate {
-            " Positions were liquidated."
-        } else {
-            " Positions were left untouched."
-        }
     ))
 }
 
@@ -2330,6 +2362,35 @@ mod tests {
         );
         assert_eq!(
             resolve_market(&markets, "second").map(|market| market.id.as_str()),
+            Some("DeF456")
+        );
+        assert_eq!(
+            resolve_market(
+                &markets,
+                "https://manifold.markets/Alice/second-question"
+            )
+            .map(|market| market.id.as_str()),
+            Some("DeF456")
+        );
+        assert_eq!(
+            resolve_market(
+                &markets,
+                "https://manifold.markets/Alice/second-question/"
+            )
+            .map(|market| market.id.as_str()),
+            Some("DeF456")
+        );
+        assert_eq!(
+            resolve_market(
+                &markets,
+                "http://manifold.markets/Alice/second-question?ref=me"
+            )
+            .map(|market| market.id.as_str()),
+            Some("DeF456")
+        );
+        assert_eq!(
+            resolve_market(&markets, "manifold.markets/Alice/second-question")
+                .map(|market| market.id.as_str()),
             Some("DeF456")
         );
         assert!(resolve_market(&markets, "missing").is_none());
