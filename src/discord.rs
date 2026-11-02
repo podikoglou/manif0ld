@@ -7,12 +7,11 @@
 //!
 //! # Scope
 //!
-//! This module is the foundation from the control-plane milestone. Command
-//! registration, operator gating, autocomplete plumbing, `/status`, and the
-//! signal/trade/error consumers are complete. The remaining mutating commands
-//! and the action buttons answer with an explicit "Not implemented yet"
-//! response rather than being silently ignored, so an operator never mistakes a
-//! missing feature for a successful action.
+//! This module implements the full control plane: the seven slash commands
+//! (`/track`, `/untrack`, `/budget`, `/status`, `/override`, `/vip`, `/panic`),
+//! the Pause / Liquidate action buttons on the ONBOARDED embed, autocomplete,
+//! and the signal/trade/error consumers. [`status`] and the consumers were the
+//! foundation; everything else here is the mutating half of the plane.
 //!
 //! # Authorization
 //!
@@ -29,8 +28,10 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serenity::all::*;
 use serenity::http::Http;
 use tokio::sync::broadcast;
@@ -39,11 +40,11 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{bail, AppResult, Context as AnyhowContext};
-use crate::onboarding::OnboardingService;
+use crate::onboarding::{OnboardingDraft, OnboardingService};
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
-use crate::trade::{TradeEvent, TradeExecutor};
-use crate::types::{available_budget, SignalRecord, TrackedMarket};
+use crate::trade::{TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
+use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedMarket, VipEntry};
 
 /// Maximum number of autocomplete choices Discord accepts.
 const MAX_AUTOCOMPLETE_CHOICES: usize = 25;
@@ -74,6 +75,13 @@ const MAX_SIEVE_CHUNKS: usize = 3;
 
 /// Number of recent signals shown for one market.
 const MAX_SIGNAL_LINES: usize = 10;
+
+/// Timeout for one `/track` onboarding run.
+///
+/// Onboarding performs Manifold, LLM, and Bluesky lookups with up to three
+/// synthesis attempts, which easily exceeds the 3-second interaction deadline;
+/// the command defers first and reports a timeout followup when hit.
+const ONBOARD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Runtime dependencies shared by the gateway handler and event consumers.
 ///
@@ -165,14 +173,16 @@ impl EventHandler for Handler {
 
                 match interaction.data.name.as_str() {
                     "status" => status(&self.state, &ctx, &interaction).await,
+                    "track" => track(&self.state, &ctx, &interaction).await,
+                    "untrack" => untrack(&self.state, &ctx, &interaction).await,
+                    "budget" => budget(&self.state, &ctx, &interaction).await,
+                    "override" => override_belief(&self.state, &ctx, &interaction).await,
+                    "vip" => vip(&self.state, &ctx, &interaction).await,
+                    "panic" => panic_mode(&self.state, &ctx, &interaction).await,
                     name => {
-                        tracing::debug!(command = %name, "command is not implemented yet");
-                        respond_ephemeral(
-                            &ctx,
-                            &interaction,
-                            &format!("/{name} is not implemented yet."),
-                        )
-                        .await;
+                        tracing::debug!(command = %name, "unknown Discord command");
+                        respond_ephemeral(&ctx, &interaction, &format!("Unknown command /{name}."))
+                            .await;
                     }
                 }
             }
@@ -182,9 +192,7 @@ impl EventHandler for Handler {
                     return;
                 }
 
-                let custom_id = interaction.data.custom_id.as_str();
-                tracing::info!(custom_id = %custom_id, "component interaction");
-                respond_component_ephemeral(&ctx, &interaction, "Not implemented yet.").await;
+                component_action(&self.state, &ctx, interaction).await;
             }
             _ => {}
         }
@@ -630,21 +638,571 @@ fn discord_timestamp(timestamp: i64) -> String {
 }
 
 // -----------------------------------------------------------------------------
+// /track
+// -----------------------------------------------------------------------------
+
+/// Runs `/track`, the onboarding flow.
+///
+/// The heavy Manifold + LLM + Bluesky lookups are wrapped in
+/// [`ONBOARD_TIMEOUT`]. A progress message is posted after deferral so the
+/// operator knows the command is running while the lookups complete.
+async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
+    let Some(url) = string_option(interaction, "url") else {
+        respond_ephemeral(ctx, interaction, "Missing the required `url` option.").await;
+        return;
+    };
+    let budget = number_option(interaction, "budget").unwrap_or(state.config.default_market_budget);
+    if !budget.is_finite() || budget <= 0.0 {
+        respond_ephemeral(
+            ctx,
+            interaction,
+            &format!("The market budget must be a positive number, got {budget}."),
+        )
+        .await;
+        return;
+    }
+    let initial_prob =
+        integer_option(interaction, "initial_prob").map(|prob| prob.clamp(1, 99) as u8);
+
+    if let Err(error) = interaction.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = %error, "failed to defer /track");
+        return;
+    }
+    if let Err(error) = interaction
+        .create_followup(
+            &ctx.http,
+            CreateInteractionResponseFollowup::new()
+                .content("Fetching market and writing the Sieve rule…")
+                .ephemeral(true),
+        )
+        .await
+    {
+        tracing::error!(error = %error, "failed to send the /track progress message");
+        return;
+    }
+
+    let result = tokio::time::timeout(
+        ONBOARD_TIMEOUT,
+        onboard(state, ctx, &url, budget, initial_prob),
+    )
+    .await;
+
+    match result {
+        Err(_) => {
+            send_followup(
+                ctx,
+                interaction,
+                "Market onboarding timed out after 120 seconds.",
+            )
+            .await;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "/track failed");
+            // The error already carries the last compiler or LLM output, so the
+            // operator sees exactly what the model produced.
+            send_followup(
+                ctx,
+                interaction,
+                &format!("Failed to track the market: {error}"),
+            )
+            .await;
+        }
+        Ok(Ok(summary)) => send_followup(ctx, interaction, &summary).await,
+    }
+}
+
+/// Prepares, threads, and activates one market draft.
+///
+/// The thread is created under the control channel before activation so no
+/// market goes live without a thread. If activation fails anyway, the created
+/// thread is archived again so the operator does not see an empty thread
+/// announcing a market that never went live.
+async fn onboard(
+    state: &DiscordState,
+    ctx: &Context,
+    url: &str,
+    budget: f64,
+    initial_prob: Option<u8>,
+) -> AppResult<String> {
+    let draft = state.onboarding.prepare(url, budget, initial_prob).await?;
+
+    if state.db.get_market(&draft.market.id)?.is_some() {
+        bail!(
+            "market {} is already tracked (see /status or /untrack)",
+            draft.market.id
+        );
+    }
+
+    let thread_name = format!(
+        "📈 [M{budget}] {}",
+        shorten_question(&draft.market.question, 50)
+    );
+    let thread = ChannelId::new(state.config.discord_control_channel_id)
+        .create_thread(
+            &ctx.http,
+            CreateThread::new(thread_name).kind(ChannelType::PublicThread),
+        )
+        .await
+        .context("creating the market thread under the control channel")?;
+    let thread_id = thread.id.get();
+
+    if let Err(error) = state
+        .onboarding
+        .activate(draft.clone(), &thread_id.to_string())
+    {
+        let _ = ChannelId::new(thread_id)
+            .edit_thread(&ctx.http, EditThread::new().archived(true))
+            .await;
+        return Err(error).context("activating the prepared draft");
+    }
+
+    let mut message = CreateMessage::new().embed(onboarded_embed(&draft));
+    for button in onboarded_buttons(&draft.market.id) {
+        message = message.button(button);
+    }
+    if let Err(error) = ChannelId::new(thread_id)
+        .send_message(&ctx.http, message)
+        .await
+    {
+        tracing::error!(thread_id, error = %error, "failed to post the [ONBOARDED] embed");
+    }
+
+    Ok(format!("Market onboarded: <#{thread_id}>"))
+}
+
+// -----------------------------------------------------------------------------
+// /untrack
+// -----------------------------------------------------------------------------
+
+/// Runs `/untrack`, removing a market and optionally liquidating its position.
+///
+/// Deferral happens before the (potentially slow) liquidation. The default
+/// behavior is to sell all shares, matching the specification.
+async fn untrack(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
+    let Some(query) = string_option(interaction, "market")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        respond_ephemeral(ctx, interaction, "Missing the required `market` option.").await;
+        return;
+    };
+    let liquidate = bool_option(interaction, "liquidate").unwrap_or(true);
+
+    if let Err(error) = interaction.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = %error, "failed to defer /untrack");
+        return;
+    }
+
+    match untrack_market(state, ctx, &query, liquidate).await {
+        Ok(summary) => send_followup(ctx, interaction, &summary).await,
+        Err(error) => {
+            tracing::warn!(error = %error, "/untrack failed");
+            send_followup(
+                ctx,
+                interaction,
+                &format!("Failed to untrack the market: {error}"),
+            )
+            .await;
+        }
+    }
+}
+
+/// Tears down one market: optional liquidation, row + engine removal, archive.
+///
+/// The registry is unregistered, then the VIP rows and the market row are
+/// deleted, then the cache entry is dropped and the thread archived.
+async fn untrack_market(
+    state: &DiscordState,
+    ctx: &Context,
+    query: &str,
+    liquidate: bool,
+) -> AppResult<String> {
+    let market = resolve_single_market(state, query)?;
+    let market_id = market.id.clone();
+    let thread_id = market.discord_thread_id.clone();
+
+    if liquidate {
+        state
+            .executor
+            .liquidate(&market_id)
+            .await
+            .with_context(|| format!("liquidating market {market_id}"))?;
+    }
+
+    state.registry.unregister(&market_id);
+    state.db.delete_vips_for_market(&market_id)?;
+    state.db.delete_market(&market_id)?;
+    state.cache.remove(&market_id);
+
+    if let Ok(channel_id) = thread_id.trim().parse::<u64>() {
+        if let Err(error) = ChannelId::new(channel_id)
+            .edit_thread(&ctx.http, EditThread::new().archived(true))
+            .await
+        {
+            tracing::warn!(thread_id = channel_id, error = %error, "failed to archive the thread");
+        }
+    }
+
+    Ok(format!(
+        "Untracked **{}** (`{market_id}`).{} Thread archived.",
+        market.question,
+        if liquidate {
+            " Positions were liquidated."
+        } else {
+            " Positions were left untouched."
+        }
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// /budget
+// -----------------------------------------------------------------------------
+
+/// Runs `/budget`, changing a market's mana budget.
+async fn budget(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
+    let Some(query) = string_option(interaction, "market")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        respond_ephemeral(ctx, interaction, "Missing the required `market` option.").await;
+        return;
+    };
+    let Some(new_budget) = number_option(interaction, "new_budget") else {
+        respond_ephemeral(
+            ctx,
+            interaction,
+            "Missing the required `new_budget` option.",
+        )
+        .await;
+        return;
+    };
+    if !new_budget.is_finite() || new_budget <= 0.0 {
+        respond_ephemeral(
+            ctx,
+            interaction,
+            &format!("The new budget must be a positive number, got {new_budget}."),
+        )
+        .await;
+        return;
+    }
+
+    let result = (|| -> AppResult<String> {
+        let market = resolve_single_market(state, &query)?;
+        let before = market.budget_mana;
+        state.db.update_budget(&market.id, new_budget)?;
+        if let Some(reloaded) = state.db.get_market(&market.id)? {
+            state.cache.update_market(reloaded);
+        }
+        Ok(format!(
+            "Budget for **{}** (`{}`): {before:.2} mana → {new_budget:.2} mana.",
+            market.question, market.id
+        ))
+    })();
+
+    finish_sync(ctx, interaction, result, "Failed to change the budget").await;
+}
+
+// -----------------------------------------------------------------------------
+// /override
+// -----------------------------------------------------------------------------
+
+/// Runs `/override`, forcing a market's internal probability.
+async fn override_belief(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
+    let Some(query) = string_option(interaction, "market")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        respond_ephemeral(ctx, interaction, "Missing the required `market` option.").await;
+        return;
+    };
+    let Some(probability) = integer_option(interaction, "probability") else {
+        respond_ephemeral(
+            ctx,
+            interaction,
+            "Missing the required `probability` option.",
+        )
+        .await;
+        return;
+    };
+    let probability = probability.clamp(1, 99) as f64 / 100.0;
+
+    let result = (|| -> AppResult<String> {
+        let market = resolve_single_market(state, &query)?;
+        let (log_odds, clamped_p) = belief::override_probability(probability);
+        let now = Utc::now().timestamp();
+        // Keep the stored probability consistent with the belief timestamp: the
+        // market price observed at override time stays in `p_market_last`, so
+        // future decay does not start from a stale pair.
+        state
+            .db
+            .update_belief(&market.id, log_odds, market.p_market_last, now)?;
+        if let Some(reloaded) = state.db.get_market(&market.id)? {
+            state.cache.update_market(reloaded);
+        }
+
+        // Trigger one trade check off the interaction path: it makes network
+        // calls and must not block the response.
+        let executor = Arc::clone(&state.executor);
+        let checked_id = market.id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = executor.evaluate_market(&checked_id, None).await {
+                tracing::error!(
+                    market_id = %checked_id,
+                    error = %error,
+                    "trade check after /override failed"
+                );
+            }
+        });
+
+        Ok(format!(
+            "**{}** (`{}`) internal probability set to {clamped_p:.3} (log-odds {log_odds:.4}). \
+             One trade check was triggered.",
+            market.question, market.id
+        ))
+    })();
+
+    finish_sync(
+        ctx,
+        interaction,
+        result,
+        "Failed to override the probability",
+    )
+    .await;
+}
+
+// -----------------------------------------------------------------------------
+// /vip
+// -----------------------------------------------------------------------------
+
+/// Runs `/vip`, resolving a Bluesky handle to a DID and adding it to a market.
+///
+/// The profile lookup is a network call, so the command defers first. An exact
+/// existing handle is answered without any network traffic.
+async fn vip(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
+    let Some(query) = string_option(interaction, "market")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        respond_ephemeral(ctx, interaction, "Missing the required `market` option.").await;
+        return;
+    };
+    let Some(handle) = string_option(interaction, "handle")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        respond_ephemeral(ctx, interaction, "Missing the required `handle` option.").await;
+        return;
+    };
+
+    let market = match resolve_single_market(state, &query) {
+        Ok(market) => market,
+        Err(error) => {
+            respond_ephemeral(ctx, interaction, &truncate_chars(&error.to_string(), 2000)).await;
+            return;
+        }
+    };
+    let market_id = market.id.clone();
+
+    match state.db.list_vips(&market_id) {
+        Ok(vips)
+            if vips
+                .iter()
+                .any(|vip| vip.handle.eq_ignore_ascii_case(&handle)) =>
+        {
+            respond_ephemeral(
+                ctx,
+                interaction,
+                &format!(
+                    "`{handle}` is already a VIP for **{}** (`{market_id}`).",
+                    market.question
+                ),
+            )
+            .await;
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            market_id = %market_id,
+            error = %error,
+            "failed to read existing VIPs; continuing"
+        ),
+    }
+
+    if let Err(error) = interaction.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = %error, "failed to defer /vip");
+        return;
+    }
+
+    match fetch_bsky_profile(&handle).await {
+        Ok(profile) => {
+            let result = (|| -> AppResult<String> {
+                state.db.add_vip(&market_id, &profile)?;
+                if let Some(reloaded) = state.db.get_market(&market_id)? {
+                    let vips = state.db.list_vips(&market_id)?;
+                    state.cache.upsert(reloaded, vips);
+                }
+                Ok(format!(
+                    "Added `@{}` (`{}`) as a VIP for **{}** (`{market_id}`).",
+                    profile.handle, profile.did, market.question
+                ))
+            })();
+            match result {
+                Ok(message) => send_followup(ctx, interaction, &message).await,
+                Err(error) => {
+                    send_followup(ctx, interaction, &format!("Failed to add the VIP: {error}"))
+                        .await;
+                }
+            }
+        }
+        Err(error) => {
+            send_followup(
+                ctx,
+                interaction,
+                &format!("Failed to resolve `{handle}`: {error}"),
+            )
+            .await;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// /panic
+// -----------------------------------------------------------------------------
+
+/// Runs `/panic`, enabling the global buy kill switch.
+///
+/// There is deliberately no un-panic command: the switch is cleared by editing
+/// the `global_kill_switch` kv entry directly, or by an operator hand-off that
+/// writes the same value. Enabling it twice is therefore harmless. Sells are
+/// never blocked by the switch.
+async fn panic_mode(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
+    let liquidate_all = bool_option(interaction, "liquidate_all").unwrap_or(false);
+
+    if let Err(error) = interaction.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = %error, "failed to defer /panic");
+        return;
+    }
+
+    let result = (async || -> AppResult<String> {
+        state
+            .db
+            .set_kv(KILL_SWITCH_KEY, "true")
+            .context("setting the global kill switch")?;
+
+        let mut summary = String::from(
+            "⚠️ Global kill switch is **ON**. Future buys are blocked; sells remain allowed.\n\
+             To disable it, edit the `global_kill_switch` kv entry (or hand off to an operator); \
+             there is no un-panic command.",
+        );
+
+        if liquidate_all {
+            let errors = state.executor.liquidate_all().await;
+            let attempted = state
+                .db
+                .list_markets()?
+                .iter()
+                .filter(|market| market.status != MarketStatus::Closed)
+                .count();
+            let liquidated = attempted.saturating_sub(errors.len());
+            summary.push_str(&format!(
+                "\n\nLiquidate-all: {liquidated}/{attempted} market(s) liquidated."
+            ));
+            for (market_id, error) in &errors {
+                summary.push_str(&format!(
+                    "\n- `{market_id}`: {}",
+                    truncate_chars(&error.to_string(), 400)
+                ));
+            }
+        }
+
+        Ok(summary)
+    })()
+    .await;
+
+    match result {
+        Ok(summary) => send_followup(ctx, interaction, &summary).await,
+        Err(error) => {
+            send_followup(
+                ctx,
+                interaction,
+                &format!("Failed to enable the kill switch: {error}"),
+            )
+            .await;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Interaction responses
 // -----------------------------------------------------------------------------
 
-/// Reads a string option by name, accepting normal and autocomplete values.
-fn string_option(interaction: &CommandInteraction, name: &str) -> Option<String> {
+/// Returns the value of a named command option, if present.
+///
+/// A missing optional option yields `None` rather than an error, so handlers
+/// can apply their own defaults.
+fn option_value<'a>(
+    interaction: &'a CommandInteraction,
+    name: &str,
+) -> Option<&'a CommandDataOptionValue> {
     interaction
         .data
         .options
         .iter()
         .find(|option| option.name == name)
-        .and_then(|option| match &option.value {
-            CommandDataOptionValue::String(value)
-            | CommandDataOptionValue::Autocomplete { value, .. } => Some(value.clone()),
-            _ => None,
-        })
+        .map(|option| &option.value)
+}
+
+/// Reads a string option by name, accepting normal and autocomplete values.
+pub(crate) fn string_option(interaction: &CommandInteraction, name: &str) -> Option<String> {
+    option_value(interaction, name).and_then(string_value)
+}
+
+/// Reads a floating-point option by name.
+pub(crate) fn number_option(interaction: &CommandInteraction, name: &str) -> Option<f64> {
+    option_value(interaction, name).and_then(number_value)
+}
+
+/// Reads an integer option by name.
+pub(crate) fn integer_option(interaction: &CommandInteraction, name: &str) -> Option<i64> {
+    option_value(interaction, name).and_then(integer_value)
+}
+
+/// Reads a boolean option by name.
+pub(crate) fn bool_option(interaction: &CommandInteraction, name: &str) -> Option<bool> {
+    option_value(interaction, name).and_then(boolean_value)
+}
+
+/// Extracts a string from one option value.
+fn string_value(value: &CommandDataOptionValue) -> Option<String> {
+    match value {
+        CommandDataOptionValue::String(value)
+        | CommandDataOptionValue::Autocomplete { value, .. } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Extracts a float from one option value.
+fn number_value(value: &CommandDataOptionValue) -> Option<f64> {
+    match value {
+        CommandDataOptionValue::Number(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Extracts an integer from one option value.
+fn integer_value(value: &CommandDataOptionValue) -> Option<i64> {
+    match value {
+        CommandDataOptionValue::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Extracts a boolean from one option value.
+fn boolean_value(value: &CommandDataOptionValue) -> Option<bool> {
+    match value {
+        CommandDataOptionValue::Boolean(value) => Some(*value),
+        _ => None,
+    }
 }
 
 /// Sends an ephemeral response for a command interaction.
@@ -672,6 +1230,230 @@ async fn respond_component_ephemeral(
     );
     if let Err(error) = interaction.create_response(&ctx.http, response).await {
         tracing::error!(error = %error, "failed to send an ephemeral component response");
+    }
+}
+
+/// Sends an ephemeral followup (after the interaction was deferred).
+///
+/// Content is truncated to Discord's 2000-character message limit.
+async fn send_followup(ctx: &Context, interaction: &CommandInteraction, content: &str) {
+    let response = CreateInteractionResponseFollowup::new()
+        .content(truncate_chars(content, 2000))
+        .ephemeral(true);
+    if let Err(error) = interaction.create_followup(&ctx.http, response).await {
+        tracing::error!(error = %error, "failed to send an ephemeral followup");
+    }
+}
+
+/// Responds to a synchronous command with its success message or truncated error.
+///
+/// These commands are pure local state changes, so they respond directly
+/// instead of deferring and posting a followup.
+async fn finish_sync(
+    ctx: &Context,
+    interaction: &CommandInteraction,
+    result: AppResult<String>,
+    error_prefix: &str,
+) {
+    match result {
+        Ok(message) => respond_ephemeral(ctx, interaction, &message).await,
+        Err(error) => {
+            tracing::warn!(error = %error, "{error_prefix}");
+            respond_ephemeral(
+                ctx,
+                interaction,
+                &truncate_chars(&format!("{error_prefix}: {error}"), 2000),
+            )
+            .await;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Action buttons
+// -----------------------------------------------------------------------------
+
+/// Dispatches a button press to its action handler.
+///
+/// The interaction is consumed here so the handler can edit the source message
+/// through the owned [`ComponentInteraction`].
+async fn component_action(state: &DiscordState, ctx: &Context, interaction: ComponentInteraction) {
+    let Some((action, market_id)) = parse_button_custom_id(&interaction.data.custom_id) else {
+        respond_component_ephemeral(ctx, &interaction, "Unknown button.").await;
+        return;
+    };
+    tracing::debug!(action = %action, market_id = %market_id, "component action");
+
+    match action.as_str() {
+        "pause" => pause_button(state, ctx, interaction).await,
+        "liquidate" => liquidate_button(state, ctx, interaction).await,
+        _ => respond_component_ephemeral(ctx, &interaction, "Unknown button.").await,
+    }
+}
+
+/// Toggles one market between ACTIVE and PAUSED from its ONBOARDED embed.
+///
+/// The Pause button label is swapped to Resume (and back) by editing the source
+/// message; the Liquidate button is left untouched.
+async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: ComponentInteraction) {
+    let Some((_, market_id)) = parse_button_custom_id(&interaction.data.custom_id) else {
+        respond_component_ephemeral(ctx, &interaction, "Unknown button.").await;
+        return;
+    };
+    if let Err(error) = interaction.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = %error, "failed to defer the pause button");
+        return;
+    }
+
+    let result = (|| -> AppResult<MarketStatus> {
+        let Some(market) = state.db.get_market(&market_id)? else {
+            bail!("market {market_id} is not tracked");
+        };
+        if market.status == MarketStatus::Closed {
+            bail!("market {market_id} is closed and cannot be resumed");
+        }
+        let new_status = match market.status {
+            MarketStatus::Active => MarketStatus::Paused,
+            MarketStatus::Paused => MarketStatus::Active,
+            MarketStatus::Closed => bail!("market {market_id} is closed and cannot be resumed"),
+        };
+        state.db.update_market_status(&market_id, new_status)?;
+        if let Some(reloaded) = state.db.get_market(&market_id)? {
+            state.cache.update_market(reloaded);
+        }
+        Ok(new_status)
+    })();
+
+    match result {
+        Ok(new_status) => {
+            let paused = new_status == MarketStatus::Paused;
+            let buttons = vec![
+                CreateButton::new(button_custom_id("pause", &market_id))
+                    .label(if paused { "▶ Resume" } else { "⏸ Pause" })
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new(button_custom_id("liquidate", &market_id))
+                    .label("💰 Liquidate & Close")
+                    .style(ButtonStyle::Secondary),
+            ];
+            // Only the buttons are replaced; the embed is preserved.
+            if let Err(error) = interaction
+                .message
+                .edit(
+                    &ctx.http,
+                    EditMessage::new().components(vec![CreateActionRow::Buttons(buttons)]),
+                )
+                .await
+            {
+                tracing::error!(error = %error, "failed to update the pause button label");
+            }
+            respond_component_followup(
+                ctx,
+                &interaction,
+                &format!("Market is now {}.", new_status.as_str()),
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "pause button failed");
+            respond_component_followup(
+                ctx,
+                &interaction,
+                &truncate_chars(&format!("Failed to toggle the market: {error}"), 2000),
+            )
+            .await;
+        }
+    }
+}
+
+/// Liquidates, closes, unregisters, and archives one market from its embed.
+async fn liquidate_button(state: &DiscordState, ctx: &Context, interaction: ComponentInteraction) {
+    let Some((_, market_id)) = parse_button_custom_id(&interaction.data.custom_id) else {
+        respond_component_ephemeral(ctx, &interaction, "Unknown button.").await;
+        return;
+    };
+    if let Err(error) = interaction.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = %error, "failed to defer the liquidate button");
+        return;
+    }
+
+    match liquidate_market(state, ctx, &market_id).await {
+        Ok(summary) => respond_component_followup(ctx, &interaction, &summary).await,
+        Err(error) => {
+            tracing::warn!(error = %error, "liquidate button failed");
+            respond_component_followup(
+                ctx,
+                &interaction,
+                &truncate_chars(&format!("Liquidation failed: {error}"), 2000),
+            )
+            .await;
+        }
+    }
+}
+
+/// Sells out, closes, unregisters, and archives one tracked market.
+///
+/// Cleanup proceeds even when a step fails; each failure is logged so the
+/// operator can see what remained unfinished. Only an unknown market ID is a
+/// hard error, because there is nothing left to close then.
+async fn liquidate_market(
+    state: &DiscordState,
+    ctx: &Context,
+    market_id: &str,
+) -> AppResult<String> {
+    let Some(market) = state.db.get_market(market_id)? else {
+        bail!("market {market_id} is not tracked");
+    };
+    let question = market.question.clone();
+    let thread_id = market.discord_thread_id.clone();
+
+    let liquidated = state.executor.liquidate(market_id).await;
+    if let Err(error) = &liquidated {
+        tracing::error!(market_id = %market_id, error = %error, "liquidation failed");
+    }
+
+    // Closing the market, unregistering the engine, dropping the cache entry,
+    // and archiving the thread are best-effort cleanup of a market the operator
+    // asked to remove. Their failures do not abort the sequence.
+    if let Err(error) = state
+        .db
+        .update_market_status(market_id, MarketStatus::Closed)
+    {
+        tracing::error!(market_id = %market_id, error = %error, "failed to close the market");
+    }
+    state.registry.unregister(market_id);
+    state.cache.remove(market_id);
+
+    if let Ok(channel_id) = thread_id.trim().parse::<u64>() {
+        if let Err(error) = ChannelId::new(channel_id)
+            .edit_thread(&ctx.http, EditThread::new().archived(true))
+            .await
+        {
+            tracing::warn!(thread_id = channel_id, error = %error, "failed to archive the thread");
+        }
+    }
+
+    match liquidated {
+        Ok(()) => Ok(format!(
+            "**{question}** (`{market_id}`) liquidated, closed, and archived."
+        )),
+        Err(error) => Ok(format!(
+            "**{question}** (`{market_id}`) was closed and archived, but liquidation had \
+             errors: {error}"
+        )),
+    }
+}
+
+/// Sends an ephemeral followup for a component interaction.
+async fn respond_component_followup(
+    ctx: &Context,
+    interaction: &ComponentInteraction,
+    content: &str,
+) {
+    let response = CreateInteractionResponseFollowup::new()
+        .content(truncate_chars(content, 2000))
+        .ephemeral(true);
+    if let Err(error) = interaction.create_followup(&ctx.http, response).await {
+        tracing::error!(error = %error, "failed to send a component followup");
     }
 }
 
@@ -903,6 +1685,136 @@ async fn send_embed(http: &Http, channel: ChannelId, embed: CreateEmbed) {
 // Pure helpers
 // -----------------------------------------------------------------------------
 
+/// Resolves an operator market reference (ID or unique slug) to an owned row.
+fn resolve_single_market(state: &DiscordState, query: &str) -> AppResult<TrackedMarket> {
+    let markets = state.db.list_markets()?;
+    let Some(market) = resolve_market(&markets, query) else {
+        bail!("no unique tracked market matches {query:?}");
+    };
+    Ok(market.clone())
+}
+
+/// Resolves a Bluesky handle to its profile via the public AppView.
+///
+/// The handle in the profile is what gets stored, so the canonical spelling
+/// (including a custom domain) wins over whatever the operator typed.
+async fn fetch_bsky_profile(handle: &str) -> AppResult<VipEntry> {
+    let url = "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile";
+    let response = reqwest::Client::new()
+        .get(url)
+        .query(&[("actor", handle)])
+        .send()
+        .await
+        .context("fetching the Bluesky profile")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("reading the Bluesky profile response")?;
+
+    if !status.is_success() {
+        bail!(
+            "Bluesky profile lookup failed with HTTP {status}: {}",
+            truncate_chars(&body, 200)
+        );
+    }
+
+    let profile: BskyProfile = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "parsing the Bluesky profile response: {}",
+            truncate_chars(&body, 200)
+        )
+    })?;
+    if profile.did.trim().is_empty() || profile.handle.trim().is_empty() {
+        bail!("Bluesky profile for {handle} is missing a DID or handle");
+    }
+
+    Ok(VipEntry {
+        did: profile.did,
+        handle: profile.handle,
+    })
+}
+
+/// Response shape of `app.bsky.actor.getProfile`; only the stable fields are read.
+#[derive(Debug, Deserialize)]
+struct BskyProfile {
+    did: String,
+    handle: String,
+}
+
+/// Builds the `[ONBOARDED]` embed posted into a new market's thread.
+///
+/// The Sieve source is split into bounded fields exactly like the `/status`
+/// market view, so an arbitrarily long rule cannot fail embed validation.
+fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
+    let market = &draft.market;
+
+    let vip_handles = if draft.vips.is_empty() {
+        "(none)".to_owned()
+    } else {
+        draft
+            .vips
+            .iter()
+            .map(|vip| vip.handle.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut embed = CreateEmbed::new()
+        .title(truncate_chars(
+            &format!("✅ [ONBOARDED] {}", market.question),
+            MAX_TITLE_CHARS,
+        ))
+        .field(
+            "Market",
+            format!("https://manifold.markets/{}", market.slug),
+            true,
+        )
+        .field("Budget", format!("{:.2}", market.budget_mana), true)
+        .field(
+            "Initial P_market",
+            format!("{:.3}", market.p_market_last),
+            true,
+        )
+        .field(
+            "VIP handles",
+            truncate_chars(&vip_handles, MAX_FIELD_CHARS),
+            false,
+        );
+
+    let chunks = chunk_chars(&draft.sieve_source, SIEVE_CHUNK_CHARS);
+    let shown = chunks.len().min(MAX_SIEVE_CHUNKS);
+    let omitted = chunks.len().saturating_sub(shown);
+    for (index, chunk) in chunks.iter().take(shown).enumerate() {
+        let mut value = chunk.clone();
+        if index + 1 == shown && omitted > 0 {
+            value.push_str(&format!(
+                "\n… {omitted} more field(s) truncated; see `/status` or the database for the \
+                 full rule."
+            ));
+        }
+        embed = embed.field(
+            format!("Sieve source #{}", index + 1),
+            truncate_chars(&value, MAX_FIELD_CHARS),
+            false,
+        );
+    }
+
+    embed
+}
+
+/// The action buttons attached to the ONBOARDED embed.
+fn onboarded_buttons(market_id: &str) -> Vec<CreateButton> {
+    vec![
+        CreateButton::new(button_custom_id("pause", market_id))
+            .label("⏸ Pause")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new(button_custom_id("liquidate", market_id))
+            .label("💰 Liquidate & Close")
+            .style(ButtonStyle::Secondary),
+    ]
+}
+
 /// Converts a Bluesky AT URI into a public post URL.
 ///
 /// Only `at://{did}/app.bsky.feed.post/{rkey}` is accepted. The DID and record
@@ -935,6 +1847,15 @@ pub(crate) fn truncate_chars(input: &str, max: usize) -> String {
     let mut truncated: String = input.chars().take(max - 1).collect();
     truncated.push('…');
     truncated
+}
+
+/// Shortens a market question for use in a thread name.
+///
+/// Surrounding whitespace is removed and the result is truncated to at most
+/// `max` characters without splitting a UTF-8 character, so thread names stay
+/// within Discord's 100-character limit.
+pub(crate) fn shorten_question(question: &str, max: usize) -> String {
+    truncate_chars(question.trim(), max)
 }
 
 /// Splits text into chunks of at most `size` characters.
@@ -1078,6 +1999,106 @@ mod tests {
 
         let unicode = chunk_chars("😀😀😀", 2);
         assert_eq!(unicode, vec!["😀😀", "😀"]);
+    }
+
+    // -- Thread-name shortening --------------------------------------------
+
+    #[test]
+    fn shorten_question_trims_whitespace_and_keeps_short_questions() {
+        assert_eq!(shorten_question("  Will it rain?  ", 50), "Will it rain?");
+        assert_eq!(shorten_question("Will it rain?", 50), "Will it rain?");
+    }
+
+    #[test]
+    fn shorten_question_is_char_safe_and_never_exceeds_the_limit() {
+        let shortened = shorten_question("Do we upgrade to 🚀 stellar engines tomorrow?", 10);
+        assert!(shortened.chars().count() <= 10);
+        assert!(shortened.ends_with('…'));
+    }
+
+    // -- Option parsing ----------------------------------------------------
+
+    #[test]
+    fn option_value_extraction_is_type_specific() {
+        let string = CommandDataOptionValue::String("s".to_owned());
+        assert_eq!(string_value(&string), Some("s".to_owned()));
+        assert_eq!(number_value(&string), None);
+        assert_eq!(integer_value(&string), None);
+        assert_eq!(boolean_value(&string), None);
+
+        let autocomplete = CommandDataOptionValue::Autocomplete {
+            kind: CommandOptionType::String,
+            value: "ac".to_owned(),
+        };
+        assert_eq!(string_value(&autocomplete), Some("ac".to_owned()));
+
+        assert_eq!(
+            number_value(&CommandDataOptionValue::Number(12.5)),
+            Some(12.5)
+        );
+        assert_eq!(
+            integer_value(&CommandDataOptionValue::Integer(-3)),
+            Some(-3)
+        );
+        assert_eq!(
+            boolean_value(&CommandDataOptionValue::Boolean(false)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn option_value_extraction_returns_none_for_wrong_variants() {
+        assert_eq!(number_value(&CommandDataOptionValue::Boolean(true)), None);
+        assert_eq!(integer_value(&CommandDataOptionValue::Number(1.0)), None);
+        assert_eq!(boolean_value(&CommandDataOptionValue::Integer(1)), None);
+    }
+
+    // -- ONBOARDED embed ---------------------------------------------------
+
+    #[test]
+    fn onboarded_embed_carries_market_fields_and_sieve_source_chunks() {
+        let mut market = market("M1", "Will it rain?", "will-it-rain");
+        market.budget_mana = 25.0;
+        market.p_market_last = 0.6;
+        let draft = OnboardingDraft {
+            market,
+            vips: vec![
+                VipEntry {
+                    did: "did:plc:a".to_owned(),
+                    handle: "alice.test".to_owned(),
+                },
+                VipEntry {
+                    did: "did:plc:b".to_owned(),
+                    handle: "bob.test".to_owned(),
+                },
+            ],
+            sieve_source: "match Market_M1 { \"rain\" }".to_owned(),
+            warnings: Vec::new(),
+        };
+
+        let embed = onboarded_embed(&draft);
+        // CreateEmbed keeps its fields private; inspect the serialized form.
+        let value = serde_json::to_value(&embed).expect("embed serializes");
+        let title = value["title"].as_str().unwrap_or_default();
+        assert!(title.contains("[ONBOARDED]"), "{title}");
+        assert!(title.contains("Will it rain?"), "{title}");
+
+        let fields = value["fields"].as_array().expect("embed fields");
+        let names: Vec<&str> = fields
+            .iter()
+            .filter_map(|field| field["name"].as_str())
+            .collect();
+        assert!(names.contains(&"Sieve source #1"), "{names:?}");
+        assert!(names.contains(&"VIP handles"), "{names:?}");
+
+        let market_field = fields
+            .iter()
+            .find(|field| field["name"] == "Market")
+            .expect("market field");
+        assert_eq!(
+            market_field["value"],
+            "https://manifold.markets/will-it-rain"
+        );
     }
 
     // -- Autocomplete -------------------------------------------------------
