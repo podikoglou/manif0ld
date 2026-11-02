@@ -152,13 +152,6 @@ pub struct TrackedMarket {
     pub created_at: i64,
 }
 
-/// A Bluesky account whose posts bypass Sieve matching for one market.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct VipEntry {
-    pub did: String,
-    pub handle: String,
-}
-
 /// A ledger action after a trade decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TradeAction {
