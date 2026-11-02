@@ -639,6 +639,7 @@ fn build_market(
         sieve_source,
         discord_thread_id: String::new(),
         created_at: now,
+        deleted_at: None,
     }
 }
 
@@ -716,6 +717,7 @@ mod tests {
             sieve_source: GOOD_SIEVE.to_owned(),
             discord_thread_id: String::new(),
             created_at: 1,
+            deleted_at: None,
         };
         OnboardingDraft {
             market,
@@ -948,6 +950,34 @@ mod tests {
             .expect("market row");
         assert_eq!(stored.discord_thread_id, "thread-reopened");
         assert_eq!(stored.status, MarketStatus::Active);
+        assert!(registry.contains("Market_test"));
+    }
+
+    #[test]
+    fn activate_replaces_a_previously_untracked_market() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let existing = sample_draft("Market_test");
+        db.insert_market(&existing.market).expect("insert existing");
+        db.soft_delete_market(&existing.market.id, 1_700_000_900)
+            .expect("soft delete existing");
+        assert!(db.get_market("Market_test").expect("read").is_some());
+
+        let registry = Arc::new(EngineRegistry::new());
+        let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
+        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&cache));
+
+        let activated = service
+            .activate(sample_draft("Market_test"), "thread-retracked")
+            .expect("re-tracking an untracked market should succeed");
+        assert_eq!(activated.discord_thread_id, "thread-retracked");
+        assert_eq!(activated.status, MarketStatus::Active);
+
+        let stored = db
+            .get_market("Market_test")
+            .expect("read market")
+            .expect("market row");
+        assert_eq!(stored.status, MarketStatus::Active);
+        assert_eq!(stored.deleted_at, None, "the soft-delete marker is cleared");
         assert!(registry.contains("Market_test"));
     }
 
