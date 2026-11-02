@@ -23,6 +23,7 @@ use reqwest::Client;
 use rig::completion::Message;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::belief;
 use crate::config::Config;
@@ -163,6 +164,36 @@ pub struct SieveSynthesis {
     pub vip_actor_queries: Vec<String>,
 }
 
+/// Validation result of one generated Sieve program.
+///
+/// The compiled engine is consumed before [`Validation`] is produced, so every
+/// variant holds plain `Send` data that may live across an `.await`.
+#[derive(Debug)]
+enum Validation {
+    /// The program parsed and compiled.
+    Compiled(SieveSynthesis),
+    /// Validation failed. `script` is the program, or the raw answer when it
+    /// did not parse; `error` is the parser or compiler message.
+    Failed { script: String, error: String },
+}
+
+/// One program produced by the Sieve synthesis loop and its validation result.
+///
+/// The synthesis loop sends one event per generation; the caller replaces its
+/// previous report with the current one. `error` is `None` when the program
+/// compiled, so a successful attempt still carries the final script.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SieveAttempt {
+    /// 1-based attempt number within the compile loop.
+    pub attempt: usize,
+    /// Total attempts allowed before synthesis gives up.
+    pub max_attempts: usize,
+    /// The program the model wrote, or the raw LLM output when it did not parse.
+    pub script: String,
+    /// The parser or compiler error, absent when the program compiled.
+    pub error: Option<String>,
+}
+
 /// A fully resolved market that has not been persisted yet.
 ///
 /// The Discord layer creates a thread for `market`, then calls
@@ -208,11 +239,16 @@ impl OnboardingService {
     /// `budget` must be a positive finite mana amount. `initial_prob` is an
     /// operator override in whole percent; it is clamped to `1..=99`. Without
     /// an override the internal belief starts at the market probability.
+    ///
+    /// Each Sieve generation is reported on `attempts` as the current
+    /// [`SieveAttempt`] (program plus validation error, or the compiled program);
+    /// the caller renders it live and replaces the previous one.
     pub async fn prepare(
         &self,
         url: &str,
         budget: f64,
         initial_prob: Option<u8>,
+        attempts: &mpsc::Sender<SieveAttempt>,
     ) -> AppResult<OnboardingDraft> {
         if !budget.is_finite() || budget <= 0.0 {
             bail!("market budget must be a positive finite mana value, got {budget}");
@@ -231,7 +267,7 @@ impl OnboardingService {
             bail!("market {} ({slug}) is already tracked", market.id);
         }
 
-        let synthesis = self.synthesize(&market).await?;
+        let synthesis = self.synthesize(&market, attempts).await?;
 
         let mut warnings = Vec::new();
         let mut queries = synthesis.vip_actor_queries;
@@ -349,7 +385,15 @@ impl OnboardingService {
     /// see what the model produced. Only parse and compile correctness is
     /// judged: matching behavior has no ground truth at onboarding time, so no
     /// synthetic example is ever asserted against.
-    async fn synthesize(&self, market: &ManifoldSlugMarket) -> AppResult<SieveSynthesis> {
+    ///
+    /// Every generation is reported on `attempts` so the operator sees the
+    /// current script and, when it failed, the error; the report is replaced on
+    /// the next turn and a successful attempt still shows the final script.
+    async fn synthesize(
+        &self,
+        market: &ManifoldSlugMarket,
+        attempts: &mpsc::Sender<SieveAttempt>,
+    ) -> AppResult<SieveSynthesis> {
         let mut turns: Vec<Arc<Message>> =
             vec![Arc::new(Message::user(build_sieve_user_prompt(market)))];
         let mut last_output = String::new();
@@ -365,24 +409,41 @@ impl OnboardingService {
                 })?;
             last_output = raw.clone();
 
-            let outcome = parse_sieve_synthesis(&raw).and_then(|synthesis| {
-                sieve::compile(&synthesis.sieve_program).map(|_| synthesis)
-            });
-
-            match outcome {
-                Ok(synthesis) => return Ok(synthesis),
-                Err(error) => {
-                    last_error = error.to_string();
-                    // The conversation remembers this answer and the report on
-                    // it, so the next prompt only needs the fix request.
-                    turns.push(Arc::new(Message::assistant(raw)));
-                    turns.push(Arc::new(Message::user(format!(
-                        "Your previous answer failed validation.\n\
-                         Error: {last_error}\n\
-                         Respond with corrected JSON only."
-                    ))));
+            // Report the current attempt: the extracted program when the answer
+            // parsed, otherwise the raw answer, plus its validation error. A
+            // compiled program is a terminal report with no error.
+            let (script, error) = match validate_synthesis(&raw) {
+                Validation::Compiled(synthesis) => {
+                    let _ = attempts
+                        .send(SieveAttempt {
+                            attempt,
+                            max_attempts: MAX_SIEVE_ATTEMPTS,
+                            script: synthesis.sieve_program.clone(),
+                            error: None,
+                        })
+                        .await;
+                    return Ok(synthesis);
                 }
-            }
+                Validation::Failed { script, error } => (script, error),
+            };
+            last_error = error.clone();
+            let _ = attempts
+                .send(SieveAttempt {
+                    attempt,
+                    max_attempts: MAX_SIEVE_ATTEMPTS,
+                    script,
+                    error: Some(error),
+                })
+                .await;
+
+            // The conversation remembers this answer and the report on it, so
+            // the next prompt only needs the fix request.
+            turns.push(Arc::new(Message::assistant(raw)));
+            turns.push(Arc::new(Message::user(format!(
+                "Your previous answer failed validation.\n\
+                 Error: {last_error}\n\
+                 Respond with corrected JSON only."
+            ))));
         }
 
         bail!(
@@ -579,6 +640,27 @@ pub fn parse_sieve_synthesis(raw: &str) -> AppResult<SieveSynthesis> {
     }
 
     Ok(synthesis)
+}
+
+/// Validates one generated program: parse, then compile.
+///
+/// The compiled engine is dropped before the result is returned, so
+/// [`Validation`] holds only plain `Send` data and its caller can report it
+/// across an `.await`.
+fn validate_synthesis(raw: &str) -> Validation {
+    match parse_sieve_synthesis(raw) {
+        Ok(synthesis) => match sieve::compile(&synthesis.sieve_program) {
+            Ok(_) => Validation::Compiled(synthesis),
+            Err(error) => Validation::Failed {
+                script: synthesis.sieve_program.clone(),
+                error: error.to_string(),
+            },
+        },
+        Err(error) => Validation::Failed {
+            script: raw.to_owned(),
+            error: error.to_string(),
+        },
+    }
 }
 
 /// Chooses the most useful VIP among the search results for one query.

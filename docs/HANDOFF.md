@@ -173,7 +173,11 @@ compilation; `matches` is read-only. This is the one `unsafe` in the codebase.
 - Thread names truncate the question to 50 chars.
 - Onboarding Sieve synthesis runs as a multi-turn compile loop (up to 5
   attempts), feeding each compiler error back as the next message so the model
-  auto-corrects its rule; final failure includes the last LLM output.
+  auto-corrects its rule; final failure includes the last LLM output. The
+  `/track` progress message is edited on every attempt to show the current
+  script with its validation error below it in one code block; a compiled rule
+  still shows the final script, and a failed synthesis resends the last report
+  as the final message.
 
 ---
 

@@ -27,20 +27,20 @@
 //! no lock is held across a Discord request.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serenity::all::*;
 use serenity::http::Http;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{bail, AppResult, Context as AnyhowContext};
-use crate::onboarding::{OnboardingDraft, OnboardingService};
+use crate::onboarding::{OnboardingDraft, OnboardingService, SieveAttempt};
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
 use crate::trade::{TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
@@ -60,6 +60,9 @@ const MAX_FIELD_CHARS: usize = 1024;
 
 /// Discord's limit for an embed description.
 const MAX_DESCRIPTION_CHARS: usize = 4096;
+
+/// Discord's character limit for a message's `content`.
+const DISCORD_CONTENT_LIMIT: usize = 2000;
 
 /// Maximum number of market fields in the overview embed.
 const MAX_STATUS_FIELDS: usize = 25;
@@ -645,7 +648,11 @@ fn discord_timestamp(timestamp: i64) -> String {
 ///
 /// The heavy Manifold + LLM + Bluesky lookups are wrapped in
 /// [`ONBOARD_TIMEOUT`]. A progress message is posted after deferral so the
-/// operator knows the command is running while the lookups complete.
+/// operator knows the command is running while the lookups complete; during
+/// Sieve synthesis that same message is edited on every attempt to show the
+/// current program and, when it failed to parse or compile, the error below it.
+/// A failed synthesis reports the last edited attempt again as the final
+/// message so the operator keeps a complete record.
 async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
     let Some(url) = string_option(interaction, "url") else {
         respond_ephemeral(ctx, interaction, "Missing the required `url` option.").await;
@@ -668,7 +675,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
         tracing::error!(error = %error, "failed to defer /track");
         return;
     }
-    if let Err(error) = interaction
+    let mut progress = match interaction
         .create_followup(
             &ctx.http,
             CreateInteractionResponseFollowup::new()
@@ -677,15 +684,63 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
         )
         .await
     {
-        tracing::error!(error = %error, "failed to send the /track progress message");
-        return;
-    }
+        Ok(progress) => progress,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to send the /track progress message");
+            return;
+        }
+    };
+
+    // Each Sieve generation replaces the previous report on the progress
+    // message; only the current attempt is ever shown. `last_attempt` keeps the
+    // terminal report so a failed synthesis can be re-sent as the final message.
+    let (attempts_tx, mut attempts_rx) = mpsc::channel::<SieveAttempt>(2);
+    let last_attempt = Arc::new(Mutex::new(None));
+    let update_ctx = ctx.clone();
+    let last_for_update = Arc::clone(&last_attempt);
+    let updater = tokio::spawn(async move {
+        while let Some(attempt) = attempts_rx.recv().await {
+            if let Ok(mut last) = last_for_update.lock() {
+                *last = Some(attempt.clone());
+            }
+            let header = match &attempt.error {
+                Some(_) => {
+                    format!(
+                        "Sieve rule attempt {}/{} — failed",
+                        attempt.attempt, attempt.max_attempts
+                    )
+                }
+                None => {
+                    format!(
+                        "Sieve rule attempt {}/{} — compiled",
+                        attempt.attempt, attempt.max_attempts
+                    )
+                }
+            };
+            let content = sieve_report(&header, &attempt.script, attempt.error.as_deref());
+            if let Err(error) = progress
+                .edit(&update_ctx.http, EditMessage::new().content(content))
+                .await
+            {
+                tracing::warn!(error = %error, "failed to update the /track sieve status message");
+                break;
+            }
+        }
+    });
 
     let result = tokio::time::timeout(
         ONBOARD_TIMEOUT,
-        onboard(state, ctx, &url, budget, initial_prob),
+        onboard(
+            state,
+            ctx,
+            &url,
+            budget,
+            initial_prob,
+            attempts_tx,
+        ),
     )
     .await;
+    let _ = updater.await;
 
     match result {
         Err(_) => {
@@ -698,8 +753,27 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
         }
         Ok(Err(error)) => {
             tracing::warn!(error = %error, "/track failed");
-            // The error already carries the last compiler or LLM output, so the
-            // operator sees exactly what the model produced.
+            // When synthesis itself failed, the last attempt already carries
+            // the script and the error; report it in one block instead of the
+            // plain error text. Other failures keep the current message. The
+            // attempt is extracted (and the guard released) before any await.
+            let failed = last_attempt
+                .lock()
+                .ok()
+                .and_then(|last| last.as_ref().filter(|a| a.error.is_some()).cloned());
+            if let Some(attempt) = failed {
+                let header = format!(
+                    "Sieve rule synthesis failed after {} attempts.",
+                    attempt.max_attempts
+                );
+                send_followup(
+                    ctx,
+                    interaction,
+                    &sieve_report(&header, &attempt.script, attempt.error.as_deref()),
+                )
+                .await;
+                return;
+            }
             send_followup(
                 ctx,
                 interaction,
@@ -723,8 +797,9 @@ async fn onboard(
     url: &str,
     budget: f64,
     initial_prob: Option<u8>,
+    attempts: mpsc::Sender<SieveAttempt>,
 ) -> AppResult<String> {
-    let draft = state.onboarding.prepare(url, budget, initial_prob).await?;
+    let draft = state.onboarding.prepare(url, budget, initial_prob, &attempts).await?;
 
     if state.db.get_market(&draft.market.id)?.is_some() {
         bail!(
@@ -1238,11 +1313,33 @@ async fn respond_component_ephemeral(
 /// Content is truncated to Discord's 2000-character message limit.
 async fn send_followup(ctx: &Context, interaction: &CommandInteraction, content: &str) {
     let response = CreateInteractionResponseFollowup::new()
-        .content(truncate_chars(content, 2000))
+        .content(truncate_chars(content, DISCORD_CONTENT_LIMIT))
         .ephemeral(true);
     if let Err(error) = interaction.create_followup(&ctx.http, response).await {
         tracing::error!(error = %error, "failed to send an ephemeral followup");
     }
+}
+
+/// Renders one Sieve synthesis report for a message's `content`.
+///
+/// The program the model wrote and, below it, its validation error appear
+/// inside one code block, so the error cannot be mistaken for prose. A report
+/// without an error is the compiled candidate. Content stays within Discord's
+/// character limit: when needed the script is truncated from the end so the
+/// error and the closing fence always survive.
+fn sieve_report(header: &str, script: &str, error: Option<&str>) -> String {
+    let opening = "```sieve\n";
+    let closing = "\n```";
+    let suffix = error
+        .map(|error| format!("\n\nError: {error}"))
+        .unwrap_or_default();
+    let overhead: usize = header.chars().count()
+        + 1
+        + opening.chars().count()
+        + closing.chars().count()
+        + suffix.chars().count();
+    let script = truncate_chars(script, DISCORD_CONTENT_LIMIT.saturating_sub(overhead));
+    format!("{header}\n{opening}{script}{suffix}{closing}")
 }
 
 /// Responds to a synchronous command with its success message or truncated error.
@@ -1990,6 +2087,47 @@ mod tests {
     #[test]
     fn truncate_zero_returns_empty() {
         assert_eq!(truncate_chars("anything", 0), "");
+    }
+
+    // -- Sieve synthesis report ---------------------------------------------
+
+    #[test]
+    fn sieve_report_shows_script_and_error_in_one_block() {
+        let report = sieve_report(
+            "Sieve rule attempt 2/5 — failed",
+            "match Market_x { \"unterminated }",
+            Some("unterminated string literal at 1:24"),
+        );
+        assert!(
+            report.starts_with("Sieve rule attempt 2/5 — failed\n```sieve\n"),
+            "report: {report}"
+        );
+        assert!(report.contains("match Market_x { \"unterminated }"));
+        assert!(report.contains("Error: unterminated string literal at 1:24"));
+        assert!(report.ends_with("\n```"), "report: {report}");
+        assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
+    }
+
+    #[test]
+    fn sieve_report_without_error_shows_only_the_script() {
+        let report = sieve_report(
+            "Sieve rule attempt 3/5 — compiled",
+            "match Market_x { \"launch\" }",
+            None,
+        );
+        assert!(report.ends_with("\n```"), "report: {report}");
+        assert!(report.contains("match Market_x { \"launch\" }"));
+        assert!(!report.contains("Error:"));
+        assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
+    }
+
+    #[test]
+    fn sieve_report_truncates_a_long_script_but_keeps_error_and_fence() {
+        let long_script: String = "x".repeat(3000);
+        let report = sieve_report("Sieve rule attempt 1/5 — failed", &long_script, Some("boom"));
+        assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
+        assert!(report.ends_with("Error: boom\n```"), "report: {report}");
+        assert!(report.contains('…'), "truncation marker missing in: {report}");
     }
 
     #[test]
