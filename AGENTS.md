@@ -7,12 +7,11 @@ via Cloudflare Workers AI, keeps a log-odds belief per market, and trades on
 Manifold only on strong edge. Discord is the only control plane.
 
 - **Full design spec, query contracts, and milestone history: `docs/SPEC.md`.**
-- **Operational handoff, verified decisions/deviations, run instructions,
-  pending live checks: `docs/HANDOFF.md`.**
+- **Rendered architecture overview: `docs/OVERVIEW.tex` / `OVERVIEW.pdf`.**
 
-Read `docs/HANDOFF.md` first when a task touches trading, Discord commands,
-Cloudflare LLM calls, or reconciliation. Read `docs/SPEC.md` for the DSL
-reference and API contracts.
+Read `docs/SPEC.md` when a task touches trading, Discord commands, Cloudflare
+LLM calls, or reconciliation. It is the source of truth for the DSL reference
+and API contracts.
 
 ## Invariants to respect
 
@@ -30,11 +29,11 @@ reference and API contracts.
   `/track` command.
 - **Cloudflare LLM calls use `/ai/run`** through the vendored `rig`
   Cloudflare provider with `cf-aig-gateway-id` and `CLOUDFLARE_API_TOKEN`,
-  not the legacy gateway/compat route (see `docs/HANDOFF.md` §5.1). Never
+  not the legacy gateway/compat route (see `docs/SPEC.md` §4 and §6.4). Never
   replace that provider with a hand-rolled client; patch the `rig/` vendor if
   the wire must change.
 - **Position truth = Manifold `/positions`**, and the bot user ID comes from
-  `/v0/me` — there is no bot-user env var (`docs/HANDOFF.md` §5.2–5.3).
+  `/v0/me` — there is no bot-user env var (`docs/SPEC.md` §4 and §6.6).
 
 ## Build and check
 
@@ -59,10 +58,10 @@ All three must stay clean.
 
 - Small tweak (a button label, a log line, a query change): edit the single
   module, run the gates above.
-- Feature/behavior change: read `docs/HANDOFF.md` first, then the affected
+- Feature/behavior change: read `docs/SPEC.md` first, then the affected
   module. Most cross-cutting work touches `src/pipeline.rs` (orchestration and
   `PipelineEvent`), `src/discord.rs` (embeds/commands/buttons), and
   `src/trade.rs` (`TradeExecutor`). Wire new long-running loops in
   `src/main.rs` and abort them on Ctrl-C.
-- Something confusing: the spec and handoff are the source of truth. Update
-  them only when an architectural decision actually changes.
+- Something confusing: the spec is the source of truth. Update it only when an
+  architectural decision actually changes.
