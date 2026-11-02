@@ -17,7 +17,7 @@
 ```
 Jetstream WS ──► post extractor ──► EngineRegistry (N markets, N CompiledSieve)
                                           │
-                                          ├─ per-market match OR VIP author bypass
+                                          ├─ per-market Sieve match
                                           ▼
                                     Triage queue (bounded per market)
                                           │  gemini-3.5-flash-lite via CF AI Gateway
@@ -61,7 +61,7 @@ bsky-manifold-arb/
     ├── triage.rs        # CF AI Gateway client, LLM triage call
     ├── belief.rs        # log-odds state, decay, impulse
     ├── trade.rs         # Manifold client, Kelly sizing, order manager
-    ├── onboarding.rs    # fetch market, prompt LLM, compile Sieve, resolve VIPs
+    ├── onboarding.rs    # fetch market, prompt LLM, compile Sieve
     ├── pipeline.rs      # extract → match → triage → belief → trade orchestration
     └── discord.rs       # bot, commands, embeds, thread management
 ```
@@ -150,14 +150,6 @@ CREATE TABLE tracked_markets (
   sieve_source         TEXT NOT NULL,
   discord_thread_id    TEXT NOT NULL,
   created_at           INTEGER NOT NULL
-);
-
-CREATE TABLE market_vip_dids (
-  market_id  TEXT NOT NULL,
-  did        TEXT NOT NULL,
-  handle     TEXT NOT NULL,
-  PRIMARY KEY (market_id, did),
-  FOREIGN KEY (market_id) REFERENCES tracked_markets(id)
 );
 
 CREATE TABLE signal_ledger (
@@ -276,8 +268,8 @@ pub struct EngineRegistry {
 impl EngineRegistry {
     pub fn register(&self, id: MarketId, engine: CompiledSieve);
     pub fn unregister(&self, id: MarketId);
-    /// Returns market IDs whose Sieve rule matched OR whose VIP list contains the author DID.
-    pub fn matching_markets(&self, text: &str, author_did: &str, vip_lookup: &VipLookup) -> Vec<MarketId>;
+    /// Returns market IDs whose Sieve rule matched.
+    pub fn matching_markets(&self, text: &str) -> Vec<MarketId>;
 }
 ```
 
@@ -322,7 +314,7 @@ Evaluate this post. Respond as JSON only:
 
 ### 6.5 Belief Engine (`belief.rs`)
 
-Log-odds with exponential decay toward market price. No credibility multipliers beyond VIP status, no claim clustering, no slow-path consolidation.
+Log-odds with exponential decay toward market price. No credibility multipliers, no claim clustering, no slow-path consolidation.
 
 ```rust
 // Persisted state: p_internal_log_odds (L_t), belief_updated_at
@@ -344,15 +336,13 @@ pub fn apply_post(
     belief_updated_at: &mut i64,
     direction: Direction,   // maps to ±1.0, ±0.5, 0.0
     strength: u8,           // 0..3
-    is_vip: bool,
     p_market_now: f64,
     now: i64,
 ) {
     let l_market = (p_market_now / (1.0 - p_market_now)).ln();
     // (implementation: decay l_stored toward l_market first using
     //  current_p_internal, then add impulse)
-    let credibility = if is_vip { 1.5 } else { 1.0 };
-    let impulse = BELIEF_KAPPA * direction.polarity() * (strength as f64 / 3.0) * credibility;
+    let impulse = BELIEF_KAPPA * direction.polarity() * (strength as f64 / 3.0);
     *l_stored = (l_stored.clamp(-4.595, 4.595) + impulse).clamp(-4.595, 4.595);
     *belief_updated_at = now;
 }
@@ -425,13 +415,11 @@ Triggered by `/track url:<url> budget:<mana>`:
 3. **LLM Sieve synthesis:** Call `ONBOARDING_MODEL` with `SIEVE_SYSTEM_PROMPT` + market context. Request JSON:
    ```json
    {
-     "sieve_program": "match Market_<id> { ... }",
-     "vip_actor_queries": ["@handle_or_name", ...]
+     "sieve_program": "match Market_<id> { ... }"
    }
    ```
 4. **Compile with agentic self-correction:** `CompiledSieve::compile(&sieve_program)`. The call is a multi-turn loop, not a single generation: each LLM answer is followed by a validation report (the compiler error, or nothing if it compiled) as the next message, so the model corrects its own rule. Judgment stops at parse + compile correctness — matching behavior has no ground truth at onboarding time. If it still fails to compile after 5 attempts, abort and post the error + last LLM output to the Discord channel.
-5. **Resolve VIPs:** For each `vip_actor_queries[i]`, call `GET https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors?q={query}&limit=5`. Pick the best match — prefer custom-domain handle (not ending in `.bsky.social`) or `followersCount >= 500`. Store `did` + `handle` in `market_vip_dids`. Log failures but don't abort onboarding.
-6. **Persist** market row (initial `p_internal_log_odds = logit(market.probability)`), register `CompiledSieve` in `EngineRegistry`, create Discord thread, post the `[ONBOARDED]` embed.
+5. **Persist** market row (initial `p_internal_log_odds = logit(market.probability)`), register `CompiledSieve` in `EngineRegistry`, create Discord thread, post the `[ONBOARDED]` embed.
 
 **No ring-buffer benchmarking, no pass-rate gate.** If it compiles, it's live. Operator is responsible for reviewing the script in the thread embed and using `/untrack` if it looks wrong.
 
@@ -446,14 +434,13 @@ Triggered by `/track url:<url> budget:<mana>`:
 | `/budget` | `market`, `new_budget` | Update `budget_mana`. |
 | `/status` | `market` (optional) | Without arg: table of all markets (budget, invested, PnL, P_int vs P_mkt, triage queue depth, last signal). With arg: that market's full state including Sieve source and top 10 recent signals. |
 | `/override` | `market`, `probability` (1–99) | Set `p_internal_log_odds`. Trigger trade check. |
-| `/vip` | `market`, `handle` | Resolve handle → DID → insert into `market_vip_dids`. |
 | `/panic` | `liquidate_all` (default false) | Set `global_kill_switch` in `kv`. If `liquidate_all`, sell all positions across markets. |
 
 **Threads:** One per tracked market, created under `DISCORD_CONTROL_CHANNEL_ID`, named `📈 [M{budget}] {short_title}`. All subsequent events for that market (signals, trades, errors) post into the thread.
 
 **Embeds emitted into threads:**
 
-1. `[ONBOARDED]` — market question, link, budget, initial `P_market`, VIP handles resolved, Sieve source block.
+1. `[ONBOARDED]` — market question, link, budget, initial `P_market`, Sieve source block.
 2. `[SIGNAL]` — author handle + followers, link to Bluesky post, direction, strength, rationale, `P_internal` before → after.
 3. `[TRADE]` — action (BUY_YES / SELL_YES / etc.), amount, shares delta, `P_internal` vs `P_market`, remaining available budget.
 4. `[ERROR]` — any trade rejection, Manifold API error, LLM call failure, or rate-limit breach.
@@ -543,7 +530,7 @@ modifier    = "+" | "~" | "*" | "!" ;
 **Phase 4 — Discord + Onboarding:**
 - Discord bot skeleton, slash command registration, thread creation.
 - `/track` (onboarding pipeline).
-- `/status`, `/untrack`, `/budget`, `/override`, `/vip`, `/panic`.
+- `/status`, `/untrack`, `/budget`, `/override`, `/panic`.
 - Signal / trade / error embeds.
 
 **Verification checklist:**
