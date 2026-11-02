@@ -935,19 +935,31 @@ async fn untrack(state: &DiscordState, ctx: &Context, interaction: &CommandInter
     }
 }
 
-/// Tears down one market: optional liquidation, row + engine removal, archive.
+/// Tears down one market: optional liquidation, soft delete, archive.
 ///
-/// The registry is unregistered, then the market row is deleted, then the cache
-/// entry is dropped and the thread archived.
+/// The market row is kept with `status = CLOSED` and a `deleted_at` timestamp,
+/// so its answers and ledger history stay auditable. It disappears from every
+/// listing, the Sieve engine is unregistered, the cache entry is dropped, and
+/// the thread is archived.
+///
+/// The call is validated and idempotent: an already-untracked market is
+/// reported without selling or archiving anything a second time.
 async fn untrack_market(
     state: &DiscordState,
     ctx: &Context,
     query: &str,
     liquidate: bool,
 ) -> AppResult<String> {
-    let market = resolve_single_market(state, query)?;
+    let market = resolve_any_market(state, query)?;
     let market_id = market.id.clone();
     let thread_id = market.discord_thread_id.clone();
+
+    if market.is_deleted() {
+        return Ok(format!(
+            "**{}** (`{market_id}`) is already untracked. Nothing was changed.",
+            market.question
+        ));
+    }
 
     if liquidate && market.status != MarketStatus::Closed {
         state
@@ -958,8 +970,9 @@ async fn untrack_market(
     }
 
     state.registry.unregister(&market_id);
-    state.db.delete_answers_for_market(&market_id)?;
-    state.db.delete_market(&market_id)?;
+    state
+        .db
+        .soft_delete_market(&market_id, Utc::now().timestamp())?;
     state.cache.remove(&market_id);
 
     if let Ok(channel_id) = thread_id.trim().parse::<u64>() {
@@ -976,10 +989,11 @@ async fn untrack_market(
     } else if market.status != MarketStatus::Closed {
         " Positions were left untouched."
     } else {
-        ""
+        " The position was already closed."
     };
     Ok(format!(
-        "Untracked **{}** (`{market_id}`).{positions_msg} Thread archived.",
+        "Untracked **{}** (`{market_id}`).{positions_msg} The row and its history were kept; the \
+         thread was archived.",
         market.question,
     ))
 }
@@ -1387,6 +1401,9 @@ async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: Comp
         let Some(market) = state.db.get_market(&market_id)? else {
             bail!("market {market_id} is not tracked");
         };
+        if market.is_deleted() {
+            bail!("market {market_id} was untracked and cannot be resumed");
+        }
         if market.status == MarketStatus::Closed {
             bail!("market {market_id} is closed and cannot be resumed");
         }
@@ -1500,6 +1517,12 @@ async fn liquidate_market(
     let question = market.question.clone();
     let thread_id = market.discord_thread_id.clone();
 
+    if market.is_deleted() {
+        return Ok(format!(
+            "**{}** (`{market_id}`) was untracked already. Nothing was liquidated.",
+            market.question
+        ));
+    }
     if market.status == MarketStatus::Closed {
         return Ok(format!(
             "**{question}** (`{market_id}`) is already closed. Nothing was liquidated."
@@ -1850,10 +1873,25 @@ async fn send_text_message(http: &Http, channel: ChannelId, content: &str) {
 // -----------------------------------------------------------------------------
 
 /// Resolves an operator market reference (ID or unique slug) to an owned row.
+///
+/// Soft-deleted markets are excluded, so commands such as `/status` and
+/// `/override` only see markets that are still tracked.
 fn resolve_single_market(state: &DiscordState, query: &str) -> AppResult<TrackedMarket> {
     let markets = state.db.list_markets()?;
     let Some(market) = resolve_market(&markets, query) else {
         bail!("no unique tracked market matches {query:?}");
+    };
+    Ok(market.clone())
+}
+
+/// Resolves a reference against every row, including soft-deleted markets.
+///
+/// `/untrack` needs this so a repeated call reports "already untracked"
+/// instead of claiming the market never existed.
+fn resolve_any_market(state: &DiscordState, query: &str) -> AppResult<TrackedMarket> {
+    let markets = state.db.list_markets_including_deleted()?;
+    let Some(market) = resolve_market(&markets, query) else {
+        bail!("no tracked or untracked market matches {query:?}");
     };
     Ok(market.clone())
 }
@@ -2056,6 +2094,7 @@ mod tests {
             sieve_source: String::new(),
             discord_thread_id: String::new(),
             created_at: 0,
+            deleted_at: None,
         }
     }
 
