@@ -18,6 +18,7 @@ mod db;
 mod error;
 mod extract;
 mod ingest;
+mod onboarding;
 mod pipeline;
 mod sieve;
 mod trade;
