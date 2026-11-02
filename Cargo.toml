@@ -11,8 +11,10 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-# rustls is pinned to the `ring` provider; main() installs it so every TLS
-# stack in the binary (serenity, reqwest, tokio-tungstenite) shares it.
+rig = { path = "rig", default-features = false, features = ["reqwest", "rustls"] }
+# Serenity's rustls backend enables the `ring` provider while rig's reqwest
+# stack enables `aws-lc-rs`; rustls then cannot auto-select at runtime. This
+# direct dependency lets main() install the `ring` provider explicitly.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +30,9 @@ url = "2"
 
 [workspace]
 members = ["sieve"]
+# `rig` is its own workspace (vendored); Cargo must treat it as an external
+# path dependency, not absorb it as a member of this workspace.
+exclude = ["rig"]
 
 # Keep debug artifacts small; this project is large enough to fill a disk.
 [profile.dev]

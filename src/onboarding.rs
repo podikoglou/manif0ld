@@ -12,8 +12,7 @@
 //!
 //! All Manifold and Bluesky HTTP calls use short timeouts and put the HTTP
 //! status plus a bounded body excerpt into errors. The Cloudflare credential
-//! lives in the Workers AI transport (`src/triage.rs`) and never appears in an
-//! error or log line.
+//! lives in the rig provider and never appears in an error or log line.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use rig::completion::Message;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -31,7 +31,7 @@ use crate::db::Db;
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::pipeline::MarketCache;
 use crate::sieve::{self, EngineRegistry};
-use crate::triage::{extract_json_object, snippet, LlmClient, LlmMessage};
+use crate::triage::{extract_json_object, snippet, LlmClient};
 use crate::types::{MarketStatus, TrackedMarket, VipEntry};
 
 /// Manifold slug lookup endpoint; the slug is appended as a path segment.
@@ -394,7 +394,8 @@ impl OnboardingService {
         market: &ManifoldSlugMarket,
         attempts: &mpsc::Sender<SieveAttempt>,
     ) -> AppResult<SieveSynthesis> {
-        let mut turns: Vec<LlmMessage> = vec![LlmMessage::user(build_sieve_user_prompt(market))];
+        let mut turns: Vec<Arc<Message>> =
+            vec![Arc::new(Message::user(build_sieve_user_prompt(market)))];
         let mut last_output = String::new();
         let mut last_error = String::new();
 
@@ -440,12 +441,12 @@ impl OnboardingService {
 
             // The conversation remembers this answer and the report on it, so
             // the next prompt only needs the fix request.
-            turns.push(LlmMessage::assistant(raw));
-            turns.push(LlmMessage::user(format!(
+            turns.push(Arc::new(Message::assistant(raw)));
+            turns.push(Arc::new(Message::user(format!(
                 "Your previous answer failed validation.\n\
                  Error: {last_error}\n\
                  Respond with corrected JSON only."
-            )));
+            ))));
         }
 
         bail!(

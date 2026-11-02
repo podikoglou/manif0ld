@@ -1,4 +1,4 @@
-//! LLM triage: one Cloudflare Workers AI call per matched post.
+//! LLM triage: one Cloudflare AI Gateway call per matched post.
 //!
 //! Triage asks a small model whether a Bluesky post is material evidence for a
 //! prediction market, and if so in which direction and how strongly. The model
@@ -6,54 +6,43 @@
 //! [`TriageResult`], and [`is_material`] applies the materiality threshold from
 //! the specification.
 //!
-//! # Transport: direct Workers AI `/ai/run`
+//! # Transport: the `rig` Cloudflare provider
 //!
-//! Every LLM call in this crate is one stateless JSON `POST` to Workers AI:
-//!
-//! ```text
-//! POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run
-//! Authorization: Bearer {token}
-//! cf-aig-gateway-id: {gateway_id}
-//! Content-Type: application/json
-//!
-//! {"model": "{model}", "input": {"messages": [{"role": ..., "content": ...}]}}
-//! ```
-//!
-//! No SDK is involved: [`LlmClient`] owns the `reqwest` transport and is shared
-//! with onboarding, which uses the same endpoint for Sieve-rule synthesis.
-//! The account id and token come from `CLOUDFLARE_ACCOUNT_ID` and
-//! `CLOUDFLARE_API_TOKEN`; the gateway id from `CLOUDFLARE_AI_GATEWAY_ID`
-//! (the legacy `CF_AI_GATEWAY_ID` name is accepted), defaulting to
-//! Cloudflare's `default` gateway. [`TriageClient`] adds only the triage
-//! prompt and model choice. The API key lives in the transport and never
-//! appears in an error or log line.
+//! Every LLM call in this crate goes through the vendored `rig` library's
+//! [`cloudflare`](rig::providers::cloudflare) provider, which speaks the OpenAI
+//! Chat Completions wire to `…/accounts/{account_id}/ai/v1/chat/completions`.
+//! The provider reads `CLOUDFLARE_API_TOKEN` (an `Authorization: Bearer`
+//! credential), `CLOUDFLARE_ACCOUNT_ID` (the URL's account segment, validated
+//! by [`crate::config::Config`] at startup), and `CLOUDFLARE_AI_GATEWAY_ID`
+//! (default `default`) from the process environment, and stamps
+//! `cf-aig-gateway-id` on every request. [`LlmClient`] wraps the rig client so
+//! triage and onboarding share one handle; [`TriageClient`] adds only the
+//! triage prompt and model choice.
 //!
 //! # JSON extraction
 //!
 //! Triage prompts the model for JSON and then parses it resiliently
 //! ([`extract_json_object`]: Markdown fences, leading prose, and trailing text
-//! are tolerated). Structured output is deliberately not used: it only works on
-//! models that honor it, and the triage parse is the risk filter for the whole
-//! program, so the crate does not want to depend on that capability across the
-//! `@cf/…` models Workers AI serves. The resilient parse keeps the exact
-//! reliability envelope this module was already tested against.
+//! are tolerated). rig's native structured output (`response_format:
+//! json_schema`) is deliberately not used: it only works on models that honor
+//! `response_format` on the chat-completions route, and the triage parse is
+//! the risk filter for the whole program, so the crate does not want to depend
+//! on that capability across the `@cf/…` models a Cloudflare gateway serves.
+//! The resilient parse keeps the exact reliability envelope this module was
+//! already tested against.
 //!
-//! Request timeout is 60 seconds; a non-2xx status or missing assistant text is
-//! an error that carries the endpoint, the HTTP status, and a bounded body
-//! excerpt (see [`snippet`]).
+//! Request timeouts are the bundled `rig` reqwest client's (reqwest's
+//! 30-second default); the API token is held by the rig provider and never
+//! appears in an error or log line.
 
-use std::time::Duration;
+use std::sync::Arc;
 
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use serde::Serialize;
-use serde_json::{json, Value};
+use rig::completion::{CompletionRequest, Message};
+use serde_json::Value;
 
 use crate::config::Config;
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::types::{Direction, ExtractedPost, TrackedMarket, TriageResult};
-
-/// Request timeout for one Workers AI `/ai/run` call.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Longest response excerpt included in an error message, in bytes.
 const ERROR_SNIPPET_BYTES: usize = 500;
@@ -64,102 +53,35 @@ const MAX_STRENGTH: u8 = 3;
 /// System message from the triage prompt in the specification.
 const SYSTEM_PROMPT: &str = "You evaluate Bluesky posts as signal for a prediction market.";
 
-/// Cloudflare API root under which every account-scoped endpoint sits.
-const BASE_URL: &str = "https://api.cloudflare.com/client/v4";
-
-/// One chat message in a Workers AI request.
-///
-/// The role is `system`, `user`, or `assistant`; content is the raw text (or
-/// JSON) of that turn. This is the crate's own tiny message type because the
-/// transport posts JSON directly instead of going through an SDK.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LlmMessage {
-    role: String,
-    content: String,
-}
-
-impl LlmMessage {
-    /// A system instruction, sent first in every request.
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".to_owned(),
-            content: content.into(),
-        }
-    }
-
-    /// A user turn.
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".to_owned(),
-            content: content.into(),
-        }
-    }
-
-    /// An assistant turn: a previous model answer replayed into the context.
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: "assistant".to_owned(),
-            content: content.into(),
-        }
-    }
-}
-
-/// Shared Workers AI `/ai/run` completion client.
+/// Shared Cloudflare AI Gateway completion client built on rig.
 ///
 /// Cloneable so triage and onboarding can each hold a handle; the underlying
-/// `reqwest::Client` pools connections across clones.
+/// rig client shares one connection pool.
 #[derive(Clone)]
 pub struct LlmClient {
-    client: reqwest::Client,
-    run_url: String,
-    api_key: String,
-    gateway_id: String,
+    client: rig::providers::openai::OpenAI,
 }
 
 impl LlmClient {
     /// Builds the client from the process environment.
     ///
-    /// `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are required; the
-    /// gateway id comes from `CLOUDFLARE_AI_GATEWAY_ID` (the legacy
-    /// `CF_AI_GATEWAY_ID` name is accepted), falling back to Cloudflare's
-    /// `default` gateway. Misconfiguration fails here (at startup) rather than
-    /// as an uninformative error on the first LLM call.
+    /// [`rig::providers::cloudflare::from_env`] reads `CLOUDFLARE_ACCOUNT_ID`
+    /// and `CLOUDFLARE_API_TOKEN` here, so a misconfigured environment fails
+    /// at construction (i.e. at startup) rather than on the first LLM call.
     pub fn new() -> AppResult<Self> {
-        let account_id = std::env::var("CLOUDFLARE_ACCOUNT_ID")
-            .map_err(|_| anyhow!("CLOUDFLARE_ACCOUNT_ID is not set; run `wrangler whoami` to find it"))?;
-        let account_id = account_id.trim();
-        if account_id.is_empty() || account_id.contains('/') || account_id.chars().any(char::is_whitespace)
-        {
-            bail!(
-                "CLOUDFLARE_ACCOUNT_ID must be a non-empty account id with no `/` or whitespace"
-            );
-        }
-        let api_key = std::env::var("CLOUDFLARE_API_TOKEN")
-            .map_err(|_| anyhow!("CLOUDFLARE_API_TOKEN is not set; run `wrangler auth token` to get it"))?;
-        let gateway_id = std::env::var("CLOUDFLARE_AI_GATEWAY_ID")
-            .or_else(|_| std::env::var("CF_AI_GATEWAY_ID"))
-            .unwrap_or_else(|_| "default".to_owned());
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("building the Workers AI HTTP client")?;
-
-        Ok(Self {
-            client,
-            run_url: format!("{BASE_URL}/accounts/{account_id}/ai/run"),
-            api_key,
-            gateway_id,
-        })
+        let client = rig::providers::cloudflare::from_env()
+            .map_err(|error| anyhow!("initializing the Cloudflare AI Gateway client: {error}"))?;
+        Ok(Self { client })
     }
 
     /// Sends one chat-completion request and returns the assistant text.
     ///
-    /// Workers AI wraps the answer in several possible envelope shapes; the
-    /// extraction logic accepts all of them. A JSON body the model returns is
-    /// left to the caller (see [`extract_json_object`]).
+    /// rig parses the standard OpenAI reply natively, so this wrapper strips
+    /// no response envelope. A JSON body the model returns is left to the
+    /// caller (see [`extract_json_object`]).
     pub async fn complete(&self, model: &str, system: &str, user: &str) -> AppResult<String> {
-        let messages = [LlmMessage::system(system), LlmMessage::user(user)];
-        self.complete_messages(model, &messages).await
+        let request = CompletionRequest::new(user).preamble(system);
+        self.send(model, request).await
     }
 
     /// Sends a multi-turn chat-completion request and returns the assistant text.
@@ -172,103 +94,38 @@ impl LlmClient {
         &self,
         model: &str,
         system: &str,
-        turns: &[LlmMessage],
+        turns: &[Arc<Message>],
     ) -> AppResult<String> {
-        let mut messages = Vec::with_capacity(turns.len() + 1);
-        messages.push(LlmMessage::system(system));
-        messages.extend(turns.iter().cloned());
-        self.complete_messages(model, &messages).await
+        let (prompt, prior) = match turns.split_last() {
+            Some((prompt, prior)) => (prompt.clone(), prior.to_vec()),
+            None => (Arc::new(Message::user("Continue.")), Vec::new()),
+        };
+        let request = CompletionRequest::new(prompt).preamble(system).messages(prior);
+        self.send(model, request).await
     }
 
-    /// Runs one Workers AI call and returns the assistant text.
-    ///
-    /// A non-2xx status or a response without assistant text is an error that
-    /// includes a short body excerpt. The API key never appears in an error or
-    /// log line.
-    async fn complete_messages(&self, model: &str, messages: &[LlmMessage]) -> AppResult<String> {
-        let body = json!({
-            "model": model,
-            "input": {
-                "messages": messages
-            }
-        });
-
+    /// Runs one completion request and returns the assistant text.
+    async fn send(&self, model: &str, request: CompletionRequest) -> AppResult<String> {
         let response = self
             .client
-            .post(&self.run_url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header("cf-aig-gateway-id", &self.gateway_id)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body.to_string())
-            .send()
+            .completion(model)
+            .call(request)
             .await
-            .context("sending request to Cloudflare Workers AI /ai/run")?;
-
-        let status = response.status();
-        let raw = response
-            .text()
-            .await
-            .context("reading Cloudflare Workers AI response body")?;
-
-        if !status.is_success() {
-            bail!(
-                "Cloudflare Workers AI request failed with HTTP {status}: {}",
-                snippet(&raw)
-            );
+            .context("calling the Cloudflare AI Gateway")?;
+        let text = response.text();
+        if text.trim().is_empty() {
+            bail!("the Cloudflare AI Gateway returned no assistant text");
         }
-
-        let payload: Value = serde_json::from_str(&raw).with_context(|| {
-            format!(
-                "parsing Cloudflare Workers AI response as JSON: {}",
-                snippet(&raw)
-            )
-        })?;
-
-        Self::extract_assistant_text(&payload).ok_or_else(|| {
-            anyhow!(
-                "Cloudflare Workers AI response contained no assistant text: {}",
-                snippet(&raw)
-            )
-        })
-    }
-
-    /// Extracts assistant text from the response shapes Workers AI may return.
-    ///
-    /// Accepted paths, in order:
-    ///
-    /// - `result.response`
-    /// - `response`
-    /// - `result.choices[0].message.content`
-    /// - `choices[0].message.content`
-    pub fn extract_assistant_text(value: &Value) -> Option<String> {
-        let direct = value
-            .pointer("/result/response")
-            .or_else(|| value.pointer("/response"))
-            .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .map(str::to_owned);
-        if direct.is_some() {
-            return direct;
-        }
-
-        value
-            .pointer("/result/choices/0/message/content")
-            .or_else(|| value.pointer("/choices/0/message/content"))
-            .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .map(str::to_owned)
+        Ok(text)
     }
 
     /// Builds a client with placeholder credentials for unit tests.
     ///
-    /// No test calls it, so the loopback URL is never contacted.
+    /// No test calls it, so the surrounding environment is never read.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            client: reqwest::Client::new(),
-            run_url: "http://127.0.0.1/ai/run".to_owned(),
-            api_key: "test-key".to_owned(),
-            gateway_id: "test-gateway".to_owned(),
+            client: rig::providers::cloudflare::new("test-key"),
         }
     }
 }
@@ -540,7 +397,6 @@ pub(crate) fn snippet(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::types::{MarketId, MarketStatus};
-    use serde_json::json;
 
     fn sample_market() -> TrackedMarket {
         TrackedMarket {
@@ -721,49 +577,5 @@ mod tests {
         let raw = format!("Here you go:\n```json\n{}\n```\nDone.", valid_json());
         let value = extract_json_object(&raw).expect("JSON object");
         assert_eq!(value["direction"], "yes");
-    }
-
-    #[test]
-    fn extract_assistant_text_accepts_all_workers_ai_shapes() {
-        let answer = "{\"material\":true}";
-        let shapes = [
-            json!({"result": {"response": answer}}),
-            json!({"response": answer}),
-            json!({"result": {"choices": [{"message": {"content": answer}}]}}),
-            json!({"choices": [{"message": {"content": answer}}]}),
-        ];
-
-        for shape in shapes {
-            assert_eq!(
-                LlmClient::extract_assistant_text(&shape).as_deref(),
-                Some(answer),
-                "shape: {shape}"
-            );
-            assert!(LlmClient::extract_assistant_text(&shape).is_some());
-        }
-
-        assert_eq!(LlmClient::extract_assistant_text(&json!({"result": {}})), None);
-    }
-
-    #[test]
-    fn llm_message_json_uses_the_workers_ai_envelope() {
-        let messages = [
-            LlmMessage::system("sys"),
-            LlmMessage::user("user"),
-            LlmMessage::assistant("assistant"),
-        ];
-        let body = json!({
-            "model": "@cf/test/model",
-            "input": { "messages": messages }
-        });
-        assert_eq!(body["model"], "@cf/test/model");
-        assert_eq!(body["input"]["messages"][0]["role"], "system");
-        assert_eq!(body["input"]["messages"][0]["content"], "sys");
-        assert_eq!(body["input"]["messages"][1]["role"], "user");
-        assert_eq!(body["input"]["messages"][1]["content"], "user");
-        assert_eq!(body["input"]["messages"][2]["role"], "assistant");
-        assert_eq!(body["input"]["messages"][2]["content"], "assistant");
-        assert!(body["input"].get("messages").is_some());
-        assert!(body.get("input").is_some(), "envelope must nest under `input`");
     }
 }

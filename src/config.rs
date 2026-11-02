@@ -62,10 +62,10 @@ impl Config {
         let jetstream_url =
             optional(&get, "JETSTREAM_URL").unwrap_or_else(|| DEFAULT_JETSTREAM_URL.to_owned());
 
-        // The Workers AI transport reads `CLOUDFLARE_API_TOKEN` and the gateway
-        // id from the process environment itself. This struct validates the
-        // account id here so a missing or placeholder value fails at startup,
-        // and owns the model names the LLM calls use.
+        // The rig cloudflare provider reads `CLOUDFLARE_API_TOKEN` and
+        // `CLOUDFLARE_AI_GATEWAY_ID` from the process environment itself. This
+        // struct validates the account id here so a missing or placeholder
+        // value fails at startup, and owns the model names the LLM calls use.
         let cloudflare_account_id = required(&get, "CLOUDFLARE_ACCOUNT_ID")?;
         validate_cloudflare_account_id(&cloudflare_account_id)?;
         let triage_model = required(&get, "TRIAGE_MODEL")?;
@@ -116,12 +116,12 @@ impl Config {
 
 /// Rejects an account id no URL can carry.
 ///
-/// `CLOUDFLARE_ACCOUNT_ID` is interpolated into the `/ai/run` endpoint URL by
-/// the Workers AI transport in `src/triage.rs` (`LlmClient`), which already
-/// refuses anything that could not live in a path segment. The extra guard
-/// catches the literal `{account_id}` placeholder from `.env.example`
-/// (previously `CF_AI_GATEWAY_URL` carried it) so a setup error fails at
-/// config load rather than as a confusing 404 on the first LLM call.
+/// `CLOUDFLARE_ACCOUNT_ID` is interpolated into the endpoint URL by the rig
+/// cloudflare provider, which already refuses anything that could not live in
+/// a path segment. The extra guard catches the literal `{account_id}`
+/// placeholder from `.env.example` (previously `CF_AI_GATEWAY_URL` carried it)
+/// so a setup error fails at config load rather than as a confusing 404 on the
+/// first LLM call.
 fn validate_cloudflare_account_id(account_id: &str) -> AppResult<()> {
     if account_id.starts_with('{')
         || account_id.contains('/')
