@@ -1015,7 +1015,7 @@ async fn budget(state: &DiscordState, ctx: &Context, interaction: &CommandIntera
         let before = market.budget_mana;
         state.db.update_budget(&market.id, new_budget)?;
         if let Some(reloaded) = state.db.get_market(&market.id)? {
-            state.cache.update_market(reloaded);
+            state.cache.upsert(reloaded);
         }
         Ok(format!(
             "Budget for **{}** (`{}`): {before:.2} mana → {new_budget:.2} mana.",
@@ -1061,7 +1061,7 @@ async fn override_belief(state: &DiscordState, ctx: &Context, interaction: &Comm
             .db
             .update_belief(&market.id, log_odds, market.p_market_last, now)?;
         if let Some(reloaded) = state.db.get_market(&market.id)? {
-            state.cache.update_market(reloaded);
+            state.cache.upsert(reloaded);
         }
 
         // Trigger one trade check off the interaction path: it makes network
@@ -1465,7 +1465,7 @@ async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: Comp
         };
         state.db.update_market_status(&market_id, new_status)?;
         if let Some(reloaded) = state.db.get_market(&market_id)? {
-            state.cache.update_market(reloaded);
+            state.cache.upsert(reloaded);
         }
         Ok(new_status)
     })();

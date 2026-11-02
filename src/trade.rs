@@ -1342,7 +1342,7 @@ impl TradeExecutor {
             market.p_market_last,
             market.belief_updated_at,
         )?;
-        self.cache.update_market(market.clone());
+        self.cache.upsert(market.clone());
         Ok(())
     }
 }

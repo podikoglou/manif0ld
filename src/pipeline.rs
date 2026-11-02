@@ -26,7 +26,7 @@
 //! Locks recover from poisoning because a panic in one task must not take the
 //! whole signal path down.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -38,10 +38,10 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::sieve::{EngineRegistry, VipLookup};
+use crate::sieve::EngineRegistry;
 use crate::triage::{self, TriageClient};
 use crate::types::{
-    Direction, ExtractedPost, MarketId, MarketStatus, SignalRecord, TrackedMarket, VipEntry,
+    Direction, ExtractedPost, MarketId, MarketStatus, SignalRecord, TrackedMarket,
 };
 
 /// Number of jobs one market's triage queue buffers before dropping the oldest.
@@ -53,37 +53,18 @@ const EVENT_CAPACITY: usize = 1024;
 /// Minimum gap between saturation warnings for one market.
 const QUEUE_LAG_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Snapshot of every tracked market and its VIP authors.
+/// Snapshot of every tracked market.
 ///
 /// The cache exists because the hot matching path needs market state without a
 /// SQLite query per post. It is shared as `Arc<MarketCache>` and refreshed with
 /// [`MarketCache::upsert`], [`MarketCache::remove`], or [`MarketCache::reload`]
 /// when control-plane commands change a market.
 pub struct MarketCache {
-    markets: RwLock<HashMap<MarketId, CachedMarket>>,
-}
-
-/// One cached market together with its VIP allow-list.
-#[derive(Debug, Clone)]
-struct CachedMarket {
-    market: TrackedMarket,
-    vips: Vec<VipEntry>,
-    vip_dids: HashSet<String>,
-}
-
-impl CachedMarket {
-    fn new(market: TrackedMarket, vips: Vec<VipEntry>) -> Self {
-        let vip_dids = vips.iter().map(|vip| vip.did.clone()).collect();
-        Self {
-            market,
-            vips,
-            vip_dids,
-        }
-    }
+    markets: RwLock<HashMap<MarketId, TrackedMarket>>,
 }
 
 impl MarketCache {
-    /// Loads every market and VIP row from the database.
+    /// Loads every market row from the database.
     pub fn load(db: &Db) -> AppResult<Self> {
         Ok(Self {
             markets: RwLock::new(Self::snapshot(db)?),
@@ -92,7 +73,7 @@ impl MarketCache {
 
     /// Returns a clone of one cached market.
     pub fn get(&self, id: &str) -> Option<TrackedMarket> {
-        self.read().get(id).map(|cached| cached.market.clone())
+        self.read().get(id).cloned()
     }
 
     /// Returns every active market, sorted by ID for deterministic callers.
@@ -100,55 +81,19 @@ impl MarketCache {
         let markets = self.read();
         let mut active: Vec<TrackedMarket> = markets
             .values()
-            .filter(|cached| cached.market.status == MarketStatus::Active)
-            .map(|cached| cached.market.clone())
+            .filter(|market| market.status == MarketStatus::Active)
+            .cloned()
             .collect();
         active.sort_by(|left, right| left.id.cmp(&right.id));
         active
     }
 
-    /// Whether `did` is a VIP author for `market_id`.
-    pub fn is_vip(&self, market_id: &str, did: &str) -> bool {
-        self.read()
-            .get(market_id)
-            .is_some_and(|cached| cached.vip_dids.contains(did))
-    }
-
-    /// Builds the VIP snapshot consumed by [`EngineRegistry::matching_markets`].
+    /// Inserts or replaces one market.
     ///
-    /// A fresh map is returned so the registry is never given a reference into
-    /// the cache while the cache may be mutated.
-    pub fn vip_lookup(&self) -> VipLookup {
-        let mut lookup = VipLookup::new();
-        for (market_id, cached) in self.read().iter() {
-            if cached.vip_dids.is_empty() {
-                continue;
-            }
-            lookup.insert(market_id.clone(), cached.vip_dids.clone());
-        }
-        lookup
-    }
-
-    /// Inserts or replaces one market and replaces its VIP list.
-    pub fn upsert(&self, market: TrackedMarket, vips: Vec<VipEntry>) {
-        let id = market.id.clone();
-        self.write().insert(id, CachedMarket::new(market, vips));
-    }
-
-    /// Replaces one cached market while preserving its VIP list.
-    ///
-    /// Used by the trading layer after it persists position, probability, or
-    /// status changes. A market that is not in the cache yet is inserted with an
-    /// empty VIP list; callers adding a new market should use
-    /// [`MarketCache::upsert`] so the VIPs arrive with it.
-    pub fn update_market(&self, market: TrackedMarket) {
-        let mut markets = self.write();
-        match markets.get_mut(&market.id) {
-            Some(cached) => cached.market = market,
-            None => {
-                markets.insert(market.id.clone(), CachedMarket::new(market, Vec::new()));
-            }
-        }
+    /// Used both when a market is onboarded and when the trading or control
+    /// plane layer persists position, probability, or status changes.
+    pub fn upsert(&self, market: TrackedMarket) {
+        self.write().insert(market.id.clone(), market);
     }
 
     /// Removes one market from the cache. Missing IDs are ignored.
@@ -169,33 +114,28 @@ impl MarketCache {
     /// belief state when they start, not the state at enqueue time.
     fn record_belief(&self, id: &str, log_odds: f64, p_market: f64, updated_at: i64) {
         let mut markets = self.write();
-        if let Some(cached) = markets.get_mut(id) {
-            cached.market.p_internal_log_odds = log_odds;
-            cached.market.p_market_last = p_market;
-            cached.market.belief_updated_at = updated_at;
+        if let Some(market) = markets.get_mut(id) {
+            market.p_internal_log_odds = log_odds;
+            market.p_market_last = p_market;
+            market.belief_updated_at = updated_at;
         }
     }
 
-    fn snapshot(db: &Db) -> AppResult<HashMap<MarketId, CachedMarket>> {
+    fn snapshot(db: &Db) -> AppResult<HashMap<MarketId, TrackedMarket>> {
         let markets = db.list_markets()?;
-        let mut vips = db.all_vips()?;
-        let mut cached = HashMap::with_capacity(markets.len());
-
-        for market in markets {
-            let entries = vips.remove(&market.id).unwrap_or_default();
-            cached.insert(market.id.clone(), CachedMarket::new(market, entries));
-        }
-
-        Ok(cached)
+        Ok(markets
+            .into_iter()
+            .map(|market| (market.id.clone(), market))
+            .collect())
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<MarketId, CachedMarket>> {
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<MarketId, TrackedMarket>> {
         self.markets
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<MarketId, CachedMarket>> {
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<MarketId, TrackedMarket>> {
         self.markets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -209,7 +149,6 @@ struct TriageJob {
     /// the cache so sequential jobs never start from a stale snapshot.
     market: TrackedMarket,
     post: ExtractedPost,
-    is_vip: bool,
 }
 
 /// Per-market queue handle: sender, queue depth, and saturation warning clock.
@@ -276,7 +215,7 @@ impl QueueDepth {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
-    /// A post matched a market's filter (Sieve or VIP) and is being sent to LLM triage.
+    /// A post matched a market's Sieve rule and is being sent to LLM triage.
     PostMatched {
         market_id: MarketId,
         post_uri: String,
@@ -299,7 +238,6 @@ pub enum PipelineEvent {
         p_before: f64,
         p_after: f64,
         p_market: f64,
-        is_vip: bool,
         created_at: i64,
     },
     /// Triage, belief persistence, queue, or ledger failure.
@@ -390,10 +328,7 @@ impl Pipeline {
     /// cache or not active are skipped, matching the control-plane semantics of
     /// paused and closed markets.
     fn dispatch(self: &Arc<Self>, post: ExtractedPost) {
-        let vip_lookup = self.cache.vip_lookup();
-        let market_ids = self
-            .registry
-            .matching_markets(&post.text, &post.did, &vip_lookup);
+        let market_ids = self.registry.matching_markets(&post.text);
 
         for market_id in market_ids {
             let Some(market) = self.cache.get(&market_id) else {
@@ -403,11 +338,9 @@ impl Pipeline {
                 continue;
             }
 
-            let is_vip = self.cache.is_vip(&market_id, &post.did);
             let job = TriageJob {
                 market,
                 post: post.clone(),
-                is_vip,
             };
             self.enqueue(market_id, job);
         }
@@ -522,11 +455,7 @@ impl Pipeline {
     /// is still written and the signal event is still emitted so the failure is
     /// visible downstream.
     async fn process(&self, job: TriageJob) {
-        let TriageJob {
-            market,
-            post,
-            is_vip,
-        } = job;
+        let TriageJob { market, post } = job;
 
         // Refresh belief fields from the cache: several jobs for one market may
         // have been enqueued before the first one finished, and their snapshots
@@ -580,7 +509,6 @@ impl Pipeline {
                         &mut updated_at,
                         ans_triage.direction,
                         ans_triage.strength,
-                        is_vip,
                         ans_p_market,
                         now,
                         kappa,
@@ -622,7 +550,6 @@ impl Pipeline {
                 p_before,
                 p_after: p_before,
                 p_market,
-                is_vip,
                 created_at: now,
             });
             return;
@@ -640,7 +567,6 @@ impl Pipeline {
                 &mut updated_at,
                 direction,
                 result.strength,
-                is_vip,
                 p_market,
                 now,
                 kappa,
@@ -775,26 +701,17 @@ mod tests {
         }
     }
 
-    fn sample_vip(did: &str, handle: &str) -> VipEntry {
-        VipEntry {
-            did: did.to_owned(),
-            handle: handle.to_owned(),
-        }
-    }
-
     fn market_ids(markets: &[TrackedMarket]) -> Vec<&str> {
         markets.iter().map(|market| market.id.as_str()).collect()
     }
 
     #[test]
-    fn load_copies_markets_and_groups_vips() {
+    fn load_copies_markets() {
         let db = Db::open_in_memory().expect("in-memory DB");
         db.insert_market(&sample_market("m1", MarketStatus::Active, 1))
             .expect("insert m1");
         db.insert_market(&sample_market("m2", MarketStatus::Paused, 2))
             .expect("insert m2");
-        db.add_vip("m1", &sample_vip("did:plc:vip", "vip.test"))
-            .expect("add vip");
 
         let cache = MarketCache::load(&db).expect("load cache");
 
@@ -804,14 +721,6 @@ mod tests {
             MarketStatus::Paused
         );
         assert!(cache.get("missing").is_none());
-
-        assert!(cache.is_vip("m1", "did:plc:vip"));
-        assert!(!cache.is_vip("m1", "did:plc:other"));
-        assert!(!cache.is_vip("m2", "did:plc:vip"));
-
-        let lookup = cache.vip_lookup();
-        assert!(lookup["m1"].contains("did:plc:vip"));
-        assert!(!lookup.contains_key("m2"));
 
         assert_eq!(
             market_ids(&cache.active_markets()),
@@ -826,52 +735,41 @@ mod tests {
         let cache = MarketCache::load(&db).expect("load cache");
         assert!(cache.get("m3").is_none());
 
-        cache.upsert(
-            sample_market("m3", MarketStatus::Active, 3),
-            vec![sample_vip("did:plc:new", "new.test")],
-        );
+        cache.upsert(sample_market("m3", MarketStatus::Active, 3));
 
         assert_eq!(
             cache.get("m3").expect("upserted market").status,
             MarketStatus::Active
         );
-        assert!(cache.is_vip("m3", "did:plc:new"));
         assert_eq!(market_ids(&cache.active_markets()), vec!["m3"]);
 
         cache.remove("m3");
         assert!(cache.get("m3").is_none());
-        assert!(!cache.is_vip("m3", "did:plc:new"));
-        assert!(!cache.vip_lookup().contains_key("m3"));
     }
 
     #[test]
-    fn update_market_replaces_state_and_keeps_vips() {
+    fn upsert_replaces_state() {
         let db = Db::open_in_memory().expect("in-memory DB");
         let cache = MarketCache::load(&db).expect("load cache");
-        cache.upsert(
-            sample_market("m1", MarketStatus::Active, 1),
-            vec![sample_vip("did:plc:vip", "vip.test")],
-        );
-        cache.upsert(sample_market("m2", MarketStatus::Active, 2), Vec::new());
+        cache.upsert(sample_market("m1", MarketStatus::Active, 1));
+        cache.upsert(sample_market("m2", MarketStatus::Active, 2));
 
         let mut updated = cache.get("m1").expect("cached m1");
         updated.yes_shares = 12.5;
         updated.invested_mana = 8.0;
         updated.p_market_last = 0.61;
-        cache.update_market(updated);
+        cache.upsert(updated);
 
         let cached = cache.get("m1").expect("updated m1");
         assert_eq!(cached.yes_shares, 12.5);
         assert_eq!(cached.invested_mana, 8.0);
         assert_eq!(cached.p_market_last, 0.61);
-        assert!(cache.is_vip("m1", "did:plc:vip"), "VIP list must survive");
 
-        // Updating an unknown market inserts it with no VIPs.
+        // Upserting an unknown market inserts it.
         let mut fresh = sample_market("m3", MarketStatus::Paused, 3);
         fresh.no_shares = 4.0;
-        cache.update_market(fresh);
+        cache.upsert(fresh);
         assert_eq!(cache.get("m3").expect("inserted m3").no_shares, 4.0);
-        assert!(!cache.is_vip("m3", "did:plc:vip"));
     }
 
     #[test]
@@ -884,12 +782,9 @@ mod tests {
 
         db.insert_market(&sample_market("m2", MarketStatus::Active, 2))
             .expect("insert m2");
-        db.add_vip("m2", &sample_vip("did:plc:vip", "vip.test"))
-            .expect("add vip");
         cache.reload(&db).expect("reload cache");
 
         assert!(cache.get("m2").is_some());
-        assert!(cache.is_vip("m2", "did:plc:vip"));
 
         db.delete_market("m1").expect("delete m1");
         cache.reload(&db).expect("reload after delete");
