@@ -818,11 +818,13 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             };
             send_followup(ctx, interaction, &content).await;
         }
-        Ok(Ok(summary)) => {
+        Ok(Ok(_)) => {
             if let Err(error) = interaction.delete_followup(&ctx.http, progress_id).await {
                 tracing::debug!(error = %error, "failed to delete progress followup message");
             }
-            send_followup(ctx, interaction, &summary).await;
+            if let Err(error) = interaction.delete_response(&ctx.http).await {
+                tracing::debug!(error = %error, "failed to delete interaction response");
+            }
         }
     }
 }
@@ -840,7 +842,7 @@ async fn onboard(
     budget: f64,
     initial_prob: Option<u8>,
     attempts: mpsc::Sender<SieveAttempt>,
-) -> AppResult<String> {
+) -> AppResult<()> {
     let draft = state.onboarding.prepare(url, budget, initial_prob, &attempts).await?;
 
     if let Some(existing) = state.db.get_market(&draft.market.id)? {
@@ -886,7 +888,7 @@ async fn onboard(
         tracing::error!(thread_id, error = %error, "failed to post the [ONBOARDED] embed");
     }
 
-    Ok(format!("<#{thread_id}>"))
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
