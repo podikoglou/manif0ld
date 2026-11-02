@@ -32,7 +32,7 @@ use tokio::sync::broadcast;
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::error::{AppResult, Context};
+use crate::error::{anyhow, AppResult, Context};
 use crate::onboarding::OnboardingService;
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::trade::TradeExecutor;
@@ -40,6 +40,13 @@ use crate::types::MarketStatus;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
+    // Serenity compiles with the rustls `ring` provider while rig's reqwest
+    // stack adds `aws-lc-rs`, so rustls cannot pick one automatically. Pin
+    // `ring` here, before any TLS handshake.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|error| anyhow!("installing the default rustls crypto provider: {error:?}"))?;
+
     init_tracing();
 
     let config = Arc::new(Config::from_env()?);

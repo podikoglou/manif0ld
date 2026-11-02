@@ -12,6 +12,10 @@ dotenvy = "0.15"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 rig = { path = "rig", default-features = false, features = ["reqwest", "rustls"] }
+# Serenity's rustls backend enables the `ring` provider while rig's reqwest
+# stack enables `aws-lc-rs`; rustls then cannot auto-select at runtime. This
+# direct dependency lets main() install the `ring` provider explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
