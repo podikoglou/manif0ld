@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS market_vip_dids (
 CREATE TABLE IF NOT EXISTS signal_ledger (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id      TEXT NOT NULL,
+  answer_id      TEXT,
   post_uri       TEXT NOT NULL,
   author_handle  TEXT NOT NULL,
   post_text      TEXT NOT NULL,
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS signal_ledger (
 CREATE TABLE IF NOT EXISTS trade_ledger (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id        TEXT NOT NULL,
+  answer_id        TEXT,
   action           TEXT NOT NULL,
   mana_amount      REAL NOT NULL,
   shares_delta     REAL NOT NULL,
@@ -53,6 +55,23 @@ CREATE TABLE IF NOT EXISTS trade_ledger (
   manifold_bet_id  TEXT,
   created_at       INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS market_answers (
+  id                   TEXT NOT NULL,
+  market_id            TEXT NOT NULL,
+  text                 TEXT NOT NULL,
+  p_internal_log_odds  REAL NOT NULL,
+  p_market_last        REAL NOT NULL,
+  belief_updated_at    INTEGER NOT NULL,
+  yes_shares           REAL NOT NULL DEFAULT 0,
+  no_shares            REAL NOT NULL DEFAULT 0,
+  created_at           INTEGER NOT NULL,
+  PRIMARY KEY (id, market_id),
+  FOREIGN KEY (market_id) REFERENCES tracked_markets(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_answers_market
+  ON market_answers(market_id);
 
 CREATE TABLE IF NOT EXISTS kv (
   key   TEXT PRIMARY KEY,

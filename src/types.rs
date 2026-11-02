@@ -212,10 +212,41 @@ impl fmt::Display for TradeAction {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TriageResult {
     pub material: bool,
-    pub direction: Direction,
+    #[serde(default)]
+    pub direction: Option<Direction>,
     /// Evidence strength, 0 = noise through 3 = definitive.
+    #[serde(default)]
     pub strength: u8,
+    #[serde(default)]
     pub rationale: String,
+    /// Answers affected by the post for multiple choice markets.
+    #[serde(default)]
+    pub affected_answers: Vec<AnswerTriage>,
+}
+
+/// An individual answer evaluation in a multiple choice market.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AnswerTriage {
+    pub answer_id: String,
+    pub direction: Direction,
+    #[serde(default)]
+    pub strength: u8,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// Tracked answer within a multiple choice market.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackedAnswer {
+    pub id: String,
+    pub market_id: MarketId,
+    pub text: String,
+    pub p_internal_log_odds: f64,
+    pub p_market_last: f64,
+    pub belief_updated_at: i64,
+    pub yes_shares: f64,
+    pub no_shares: f64,
+    pub created_at: i64,
 }
 
 /// Outcome of the trading rules for one market.
@@ -225,6 +256,8 @@ pub struct TradeDecision {
     pub amount_mana: f64,
     /// Shares to sell for exit actions; `None` for market buys.
     pub shares: Option<f64>,
+    /// Target answer ID for multiple choice markets (`None` for binary).
+    pub answer_id: Option<String>,
 }
 
 /// A row from `signal_ledger`.
@@ -232,6 +265,7 @@ pub struct TradeDecision {
 pub struct SignalRecord {
     pub id: i64,
     pub market_id: MarketId,
+    pub answer_id: Option<String>,
     pub post_uri: String,
     pub author_handle: String,
     pub post_text: String,
@@ -248,6 +282,7 @@ pub struct SignalRecord {
 pub struct TradeRecord {
     pub id: i64,
     pub market_id: MarketId,
+    pub answer_id: Option<String>,
     pub action: TradeAction,
     pub mana_amount: f64,
     pub shares_delta: f64,
@@ -441,9 +476,10 @@ mod tests {
             parsed,
             TriageResult {
                 material: true,
-                direction: Direction::No,
+                direction: Some(Direction::No),
                 strength: 2,
                 rationale: "Official denial.".into(),
+                affected_answers: Vec::new(),
             }
         );
     }
