@@ -4,17 +4,16 @@
 //! and create a thread before anything becomes live:
 //!
 //! 1. [`OnboardingService::prepare`] fetches the market, asks the onboarding
-//!    model for a Sieve rule, compiles it with retries, and resolves VIP actors.
-//!    It performs no writes.
+//!    model for a Sieve rule, and compiles it with retries. It performs no
+//!    writes.
 //! 2. [`OnboardingService::activate`] persists the draft, registers the compiled
 //!    engine, and refreshes the market cache. Any failure after the database
 //!    insert rolls the new row back.
 //!
-//! All Manifold and Bluesky HTTP calls use short timeouts and put the HTTP
+//! All Manifold HTTP calls use short timeouts and put the HTTP
 //! status plus a bounded body excerpt into errors. The Cloudflare credential
 //! lives in the rig provider and never appears in an error or log line.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,28 +31,16 @@ use crate::error::{anyhow, bail, AppResult, Context};
 use crate::pipeline::MarketCache;
 use crate::sieve::{self, EngineRegistry};
 use crate::triage::{extract_json_object, snippet, LlmClient};
-use crate::types::{MarketStatus, TrackedMarket, VipEntry};
+use crate::types::{MarketStatus, TrackedMarket};
 
 /// Manifold slug lookup endpoint; the slug is appended as a path segment.
 const MANIFOLD_SLUG_URL: &str = "https://api.manifold.markets/v0/slug";
 
-/// Public Bluesky AppView that serves actor search and profiles.
-const BSKY_PUBLIC_API: &str = "https://public.api.bsky.app/xrpc";
-
-/// Timeout for Manifold and Bluesky lookups.
+/// Timeout for Manifold lookups.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Maximum number of LLM-suggested VIP queries to resolve.
-const MAX_VIP_QUERIES: usize = 10;
-
-/// Candidate actors requested per VIP search.
-const VIP_SEARCH_LIMIT: u64 = 5;
 
 /// LLM attempts allowed for one Sieve program.
 const MAX_SIEVE_ATTEMPTS: usize = 5;
-
-/// Minimum follower count that makes an actor a preferred VIP candidate.
-const PREFERRED_VIP_FOLLOWERS: u64 = 500;
 
 /// System prompt for Sieve synthesis, copied verbatim from the specification.
 pub const SIEVE_SYSTEM_PROMPT: &str = r##"You are an expert filtration engineer writing a program in the Sieve DSL.
@@ -147,21 +134,11 @@ pub struct ManifoldSlugAnswer {
     pub probability: Option<f64>,
 }
 
-/// A Bluesky actor that may become a VIP for one market.
-#[derive(Debug, Clone, PartialEq)]
-pub struct VipCandidate {
-    pub did: String,
-    pub handle: String,
-    pub followers_count: Option<u64>,
-}
-
 /// The LLM's answer to the Sieve synthesis prompt.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SieveSynthesis {
     #[serde(default)]
     pub sieve_program: String,
-    #[serde(default)]
-    pub vip_actor_queries: Vec<String>,
 }
 
 /// Validation result of one generated Sieve program.
@@ -202,9 +179,7 @@ pub struct SieveAttempt {
 #[derive(Debug, Clone)]
 pub struct OnboardingDraft {
     pub market: TrackedMarket,
-    pub vips: Vec<VipEntry>,
     pub sieve_source: String,
-    pub warnings: Vec<String>,
     pub answers: Vec<crate::types::TrackedAnswer>,
 }
 
@@ -271,17 +246,6 @@ impl OnboardingService {
 
         let synthesis = self.synthesize(&market, attempts).await?;
 
-        let mut warnings = Vec::new();
-        let mut queries = synthesis.vip_actor_queries;
-        if queries.len() > MAX_VIP_QUERIES {
-            warnings.push(format!(
-                "LLM returned {} VIP queries; resolving only the first {MAX_VIP_QUERIES}",
-                queries.len()
-            ));
-            queries.truncate(MAX_VIP_QUERIES);
-        }
-        let vips = self.resolve_vips(&http, &queries, &mut warnings).await;
-
         let sieve_source = synthesis.sieve_program;
         let tracked = build_market(&market, &slug, budget, initial_prob, sieve_source.clone());
 
@@ -309,32 +273,27 @@ impl OnboardingService {
 
         Ok(OnboardingDraft {
             market: tracked,
-            vips,
             sieve_source,
-            warnings,
             answers,
         })
     }
 
     /// Persists a prepared draft and makes it live.
     ///
-    /// The market row is inserted first. If engine registration, VIP insertion,
-    /// or the cache update fails, the new row and VIPs are removed and the
-    /// engine is unregistered (best effort) before the error is returned.
+    /// The market row is inserted first. If engine registration or the cache
+    /// update fails, the new row is removed and the engine is unregistered
+    /// (best effort) before the error is returned.
     pub fn activate(&self, draft: OnboardingDraft, thread_id: &str) -> AppResult<TrackedMarket> {
         let OnboardingDraft {
             mut market,
-            vips,
             sieve_source,
             answers,
-            ..
         } = draft;
 
         market.discord_thread_id = thread_id.to_owned();
         if let Some(existing) = self.db.get_market(&market.id)? {
             if existing.status == MarketStatus::Closed {
                 let _ = self.db.delete_answers_for_market(&market.id);
-                let _ = self.db.delete_vips_for_market(&market.id);
                 let _ = self.db.delete_market(&market.id);
             }
         }
@@ -342,7 +301,6 @@ impl OnboardingService {
 
         let rollback = |market_id: &str| {
             let _ = self.db.delete_answers_for_market(market_id);
-            let _ = self.db.delete_vips_for_market(market_id);
             let _ = self.db.delete_market(market_id);
             let _ = self.registry.unregister(market_id);
         };
@@ -362,14 +320,7 @@ impl OnboardingService {
             return Err(error);
         }
 
-        for vip in &vips {
-            if let Err(error) = self.db.add_vip(&market.id, vip) {
-                rollback(&market.id);
-                return Err(error);
-            }
-        }
-
-        self.cache.upsert(market.clone(), vips);
+        self.cache.upsert(market.clone());
         Ok(market)
     }
 
@@ -462,71 +413,6 @@ impl OnboardingService {
             "Sieve rule synthesis failed after {MAX_SIEVE_ATTEMPTS} attempts: {last_error}\n\
              Last LLM output:\n{last_output}"
         )
-    }
-
-    /// Resolves VIP queries through the public Bluesky AppView.
-    ///
-    /// Search and profile failures are warnings, not fatal errors: a market with
-    /// no VIPs is still useful. Results are deduplicated by DID.
-    async fn resolve_vips(
-        &self,
-        http: &Client,
-        queries: &[String],
-        warnings: &mut Vec<String>,
-    ) -> Vec<VipEntry> {
-        let mut vips = Vec::new();
-        let mut seen_dids = HashSet::new();
-        let mut seen_queries = HashSet::new();
-
-        for raw_query in queries {
-            let query = raw_query.trim().trim_start_matches('@').trim();
-            if query.is_empty() {
-                continue;
-            }
-            if !seen_queries.insert(query.to_ascii_lowercase()) {
-                continue;
-            }
-
-            let actors = match search_actors(http, query).await {
-                Ok(actors) if !actors.is_empty() => actors,
-                Ok(_) => {
-                    warnings.push(format!("VIP search for '{query}' returned no actors"));
-                    continue;
-                }
-                Err(error) => {
-                    warnings.push(format!("VIP search for '{query}' failed: {error}"));
-                    continue;
-                }
-            };
-
-            let mut candidates = Vec::with_capacity(actors.len());
-            for actor in actors {
-                candidates.push(VipCandidate {
-                    followers_count: fetch_followers(http, &actor.handle).await,
-                    did: actor.did,
-                    handle: actor.handle,
-                });
-            }
-
-            let exact = candidates
-                .iter()
-                .position(|candidate| candidate.handle.eq_ignore_ascii_case(query));
-            let selected = match exact {
-                Some(index) => Some(candidates[index].clone()),
-                None => select_best_vip(&candidates),
-            };
-
-            if let Some(candidate) = selected {
-                if seen_dids.insert(candidate.did.clone()) {
-                    vips.push(VipEntry {
-                        did: candidate.did,
-                        handle: candidate.handle,
-                    });
-                }
-            }
-        }
-
-        vips
     }
 }
 
@@ -632,8 +518,7 @@ Market close time: {close_time}
 Write one Sieve program that matches posts plausibly related to this market.
 Respond as JSON only, using exactly this shape:
 {{
-  "sieve_program": "match Market_{id} {{ ... }}",
-  "vip_actor_queries": ["@handle_or_name", ...]
+  "sieve_program": "match Market_{id} {{ ... }}"
 }}"#,
         id = market.id,
         question = market.question,
@@ -641,7 +526,7 @@ Respond as JSON only, using exactly this shape:
     )
 }
 
-/// Parses a synthesis answer into its Sieve program and VIP queries.
+/// Parses a synthesis answer into its Sieve program.
 pub fn parse_sieve_synthesis(raw: &str) -> AppResult<SieveSynthesis> {
     let value = extract_json_object(raw).context("parsing Sieve synthesis response")?;
     let synthesis: SieveSynthesis =
@@ -673,59 +558,6 @@ fn validate_synthesis(raw: &str) -> Validation {
             error: error.to_string(),
         },
     }
-}
-
-/// Chooses the most useful VIP among the search results for one query.
-///
-/// Candidates on a custom domain or with at least
-/// [`PREFERRED_VIP_FOLLOWERS`] followers are considered first. Within that
-/// pool, the highest follower count wins; a custom domain breaks a tie, and
-/// otherwise the first candidate is kept. If no candidate is preferred, the
-/// same ordering is applied to the whole list.
-pub fn select_best_vip(candidates: &[VipCandidate]) -> Option<VipCandidate> {
-    let preferred: Vec<&VipCandidate> = candidates
-        .iter()
-        .filter(|candidate| is_preferred_vip(candidate))
-        .collect();
-    let pool: Vec<&VipCandidate> = if preferred.is_empty() {
-        candidates.iter().collect()
-    } else {
-        preferred
-    };
-
-    let mut best: Option<&VipCandidate> = None;
-    for candidate in pool {
-        match best {
-            None => best = Some(candidate),
-            Some(current) => {
-                let candidate_followers = candidate.followers_count.unwrap_or(0);
-                let current_followers = current.followers_count.unwrap_or(0);
-                let higher_followers = candidate_followers > current_followers;
-                let custom_wins_tie = candidate_followers == current_followers
-                    && is_custom_domain(candidate)
-                    && !is_custom_domain(current);
-                if higher_followers || custom_wins_tie {
-                    best = Some(candidate);
-                }
-            }
-        }
-    }
-
-    best.cloned()
-}
-
-fn is_preferred_vip(candidate: &VipCandidate) -> bool {
-    is_custom_domain(candidate)
-        || candidate
-            .followers_count
-            .is_some_and(|count| count >= PREFERRED_VIP_FOLLOWERS)
-}
-
-fn is_custom_domain(candidate: &VipCandidate) -> bool {
-    !candidate
-        .handle
-        .to_ascii_lowercase()
-        .ends_with(".bsky.social")
 }
 
 /// Builds the tracked-market row for a validated market.
@@ -770,37 +602,6 @@ fn build_market(
         discord_thread_id: String::new(),
         created_at: now,
     }
-}
-
-/// One actor from `app.bsky.actor.searchActors`.
-#[derive(Debug, Deserialize)]
-struct ActorRef {
-    did: String,
-    handle: String,
-}
-
-/// Response envelope of `app.bsky.actor.searchActors`.
-#[derive(Debug, Deserialize)]
-struct SearchActorsResponse {
-    #[serde(default)]
-    actors: Vec<ActorRef>,
-}
-
-/// Searches the public Bluesky AppView for actors.
-async fn search_actors(http: &Client, query: &str) -> AppResult<Vec<ActorRef>> {
-    let url = format!("{BSKY_PUBLIC_API}/app.bsky.actor.searchActors");
-    let limit = VIP_SEARCH_LIMIT.to_string();
-    let value = get_json(http, &url, &[("q", query), ("limit", &limit)]).await?;
-    let response: SearchActorsResponse =
-        serde_json::from_value(value).context("parsing Bluesky actor search response")?;
-    Ok(response.actors)
-}
-
-/// Reads `followersCount` for one handle, treating any failure as unknown.
-async fn fetch_followers(http: &Client, handle: &str) -> Option<u64> {
-    let url = format!("{BSKY_PUBLIC_API}/app.bsky.actor.getProfile");
-    let value = get_json(http, &url, &[("actor", handle)]).await.ok()?;
-    value.get("followersCount").and_then(Value::as_u64)
 }
 
 /// GETs a JSON document, reporting status and a bounded body excerpt on error.
@@ -855,21 +656,6 @@ mod tests {
         }
     }
 
-    fn sample_vip(did: &str, handle: &str) -> VipEntry {
-        VipEntry {
-            did: did.to_owned(),
-            handle: handle.to_owned(),
-        }
-    }
-
-    fn sample_candidate(handle: &str, followers: Option<u64>) -> VipCandidate {
-        VipCandidate {
-            did: format!("did:plc:{handle}"),
-            handle: handle.to_owned(),
-            followers_count: followers,
-        }
-    }
-
     fn sample_draft(id: &str) -> OnboardingDraft {
         let market = TrackedMarket {
             id: id.to_owned(),
@@ -893,12 +679,7 @@ mod tests {
         };
         OnboardingDraft {
             market,
-            vips: vec![
-                sample_vip("did:plc:vip1", "vip1.test"),
-                sample_vip("did:plc:vip2", "vip2.test"),
-            ],
             sieve_source: GOOD_SIEVE.to_owned(),
-            warnings: Vec::new(),
             answers: Vec::new(),
         }
     }
@@ -994,7 +775,7 @@ mod tests {
         assert!(prompt.contains("Resolves YES if a spot ETF launches."));
         assert!(prompt.contains("Market close time: 2023-11-14T22:13:20+00:00"));
         assert!(prompt.contains("\"sieve_program\""));
-        assert!(prompt.contains("\"vip_actor_queries\""));
+        assert!(!prompt.contains("vip"));
     }
 
     #[test]
@@ -1015,10 +796,7 @@ mod tests {
 
     #[test]
     fn parse_synthesis_accepts_plain_fenced_and_prose_wrapped_json() {
-        let json = r#"{
-            "sieve_program": "match Market_test { \"bitcoin\" }",
-            "vip_actor_queries": ["@alice.test"]
-        }"#;
+        let json = r#"{"sieve_program": "match Market_test { \"bitcoin\" }"}"#;
 
         for raw in [
             json.to_owned(),
@@ -1030,16 +808,13 @@ mod tests {
                 synthesis.sieve_program,
                 r#"match Market_test { "bitcoin" }"#
             );
-            assert_eq!(synthesis.vip_actor_queries, vec!["@alice.test"]);
         }
     }
 
     #[test]
     fn parse_synthesis_rejects_missing_or_empty_program() {
-        assert!(parse_sieve_synthesis(r#"{"vip_actor_queries": []}"#).is_err());
-        assert!(
-            parse_sieve_synthesis(r#"{"sieve_program": "   ", "vip_actor_queries": []}"#).is_err()
-        );
+        assert!(parse_sieve_synthesis(r#"{"other": []}"#).is_err());
+        assert!(parse_sieve_synthesis(r#"{"sieve_program": "   "}"#).is_err());
         assert!(parse_sieve_synthesis("no json here").is_err());
     }
 
@@ -1051,57 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn select_best_vip_prefers_custom_domains_and_large_accounts() {
-        let candidates = vec![
-            sample_candidate("new.bsky.social", Some(10)),
-            sample_candidate("unrelated.bsky.social", Some(50)),
-            sample_candidate("custom.example", Some(5)),
-        ];
-        let best = select_best_vip(&candidates).expect("candidate");
-        assert_eq!(best.handle, "custom.example");
-
-        let candidates = vec![
-            sample_candidate("small.bsky.social", Some(10)),
-            sample_candidate("big.bsky.social", Some(600)),
-        ];
-        let best = select_best_vip(&candidates).expect("candidate");
-        assert_eq!(best.handle, "big.bsky.social");
-    }
-
-    #[test]
-    fn select_best_vip_uses_highest_followers_then_custom_domain_then_first() {
-        let highest = vec![
-            sample_candidate("custom.example", Some(100)),
-            sample_candidate("big.bsky.social", Some(1_000)),
-        ];
-        assert_eq!(
-            select_best_vip(&highest).expect("candidate").handle,
-            "big.bsky.social"
-        );
-
-        let tie = vec![
-            sample_candidate("plain.bsky.social", Some(700)),
-            sample_candidate("custom.example", Some(700)),
-        ];
-        assert_eq!(
-            select_best_vip(&tie).expect("candidate").handle,
-            "custom.example"
-        );
-
-        let all_equal = vec![
-            sample_candidate("first.example", Some(10)),
-            sample_candidate("second.example", Some(10)),
-        ];
-        assert_eq!(
-            select_best_vip(&all_equal).expect("candidate").handle,
-            "first.example"
-        );
-
-        assert!(select_best_vip(&[]).is_none());
-    }
-
-    #[test]
-    fn activate_persists_market_vips_engine_and_cache() {
+    fn activate_persists_market_engine_and_cache() {
         let db = Db::open_in_memory().expect("in-memory DB");
         let registry = Arc::new(EngineRegistry::new());
         let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
@@ -1120,15 +845,11 @@ mod tests {
         assert_eq!(stored.discord_thread_id, "thread-1");
         assert_eq!(stored.sieve_source, GOOD_SIEVE);
 
-        let vips = db.list_vips("Market_test").expect("list VIPs");
-        assert_eq!(vips.len(), 2);
-
         assert!(registry.contains("Market_test"));
         assert_eq!(registry.len(), 1);
 
         let cached = cache.get("Market_test").expect("cached market");
         assert_eq!(cached.discord_thread_id, "thread-1");
-        assert!(cache.is_vip("Market_test", "did:plc:vip1"));
     }
 
     #[test]
@@ -1136,8 +857,6 @@ mod tests {
         let db = Db::open_in_memory().expect("in-memory DB");
         let existing = sample_draft("Market_test");
         db.insert_market(&existing.market).expect("insert existing");
-        db.add_vip("Market_test", &sample_vip("did:plc:old", "old.test"))
-            .expect("add existing VIP");
 
         let registry = Arc::new(EngineRegistry::new());
         let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
@@ -1154,8 +873,6 @@ mod tests {
             .expect("read market")
             .expect("original row");
         assert_eq!(stored.discord_thread_id, "");
-        let vips = db.list_vips("Market_test").expect("list VIPs");
-        assert_eq!(vips, vec![sample_vip("did:plc:old", "old.test")]);
     }
 
     #[test]
@@ -1164,8 +881,6 @@ mod tests {
         let mut existing = sample_draft("Market_test");
         existing.market.status = MarketStatus::Closed;
         db.insert_market(&existing.market).expect("insert existing");
-        db.add_vip("Market_test", &sample_vip("did:plc:old", "old.test"))
-            .expect("add existing VIP");
 
         let registry = Arc::new(EngineRegistry::new());
         let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
@@ -1199,7 +914,6 @@ mod tests {
 
         assert!(service.activate(draft, "thread-3").is_err());
         assert!(db.get_market("Market_bad").expect("read").is_none());
-        assert!(db.list_vips("Market_bad").expect("vips").is_empty());
         assert!(!registry.contains("Market_bad"));
         assert!(cache.get("Market_bad").is_none());
     }
