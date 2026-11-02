@@ -418,7 +418,7 @@ mod tests {
             "commit": {
                 "operation": "create",
                 "collection": "app.bsky.feed.post",
-                "uri": "at://did:plc:author/app.bsky.feed.post/3kabc",
+                "rkey": "3kabc",
                 "record": { "text": "MiXeD case!" }
             }
         }"#;
@@ -461,7 +461,7 @@ mod tests {
             "commit": {
                 "operation": "delete",
                 "collection": "app.bsky.feed.post",
-                "uri": "at://did:plc:author/app.bsky.feed.post/3kabc",
+                "rkey": "3kabc",
                 "record": { "text": "gone" }
             }
         }"#;

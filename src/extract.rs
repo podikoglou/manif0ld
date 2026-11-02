@@ -28,8 +28,13 @@ pub fn extract(event: &serde_json::Value) -> Option<ExtractedPost> {
 /// result falls back to the DID so downstream logs always identify an author.
 ///
 /// Returns `None` for events that are not post creations, for events missing a
-/// URI, author DID, or `time_us`, and for posts whose extracted text is empty
-/// or whitespace only.
+/// URI or rkey, author DID, or `time_us`, and for posts whose extracted text is
+/// empty or whitespace only.
+///
+/// Real Jetstream commit events omit `commit.uri` and carry only `commit.rkey`.
+/// The canonical AT URI is therefore constructed as
+/// `at://{did}/{collection}/{rkey}`; an explicit `commit.uri`, when present, is
+/// preferred verbatim.
 pub fn extract_with_handle<F>(event: &serde_json::Value, resolve_handle: F) -> Option<ExtractedPost>
 where
     F: Fn(&str) -> Option<String>,
@@ -40,12 +45,19 @@ where
     if event["commit"]["operation"].as_str() != Some("create") {
         return None;
     }
-    if event["commit"]["collection"].as_str() != Some("app.bsky.feed.post") {
+    let collection = event["commit"]["collection"].as_str()?;
+    if collection != "app.bsky.feed.post" {
         return None;
     }
 
-    let uri = event["commit"]["uri"].as_str()?.to_owned();
     let did = event["did"].as_str()?.to_owned();
+    let uri = match event["commit"]["uri"].as_str() {
+        Some(uri) => uri.to_owned(),
+        None => {
+            let rkey = event["commit"]["rkey"].as_str()?;
+            format!("at://{did}/{collection}/{rkey}")
+        }
+    };
     let time_us = event["time_us"].as_i64()?;
 
     let text = extract_text(event);
@@ -108,6 +120,9 @@ mod tests {
     const DID: &str = "did:plc:author";
 
     /// Builds a minimal valid `app.bsky.feed.post` creation event.
+    ///
+    /// Real Jetstream events carry `rkey` but no `commit.uri`; the extractor
+    /// must construct the canonical AT URI from the DID, collection, and rkey.
     fn post_event(record: Value) -> Value {
         json!({
             "did": DID,
@@ -117,7 +132,6 @@ mod tests {
                 "operation": "create",
                 "collection": "app.bsky.feed.post",
                 "rkey": "3kabc",
-                "uri": "at://did:plc:author/app.bsky.feed.post/3kabc",
                 "record": record
             }
         })
@@ -162,8 +176,8 @@ mod tests {
         event["commit"]
             .as_object_mut()
             .expect("commit")
-            .remove("uri");
-        assert!(extract(&event).is_none(), "missing uri");
+            .remove("rkey");
+        assert!(extract(&event).is_none(), "missing rkey");
 
         let mut event = post_event(body("hello"));
         event.as_object_mut().expect("event").remove("did");
