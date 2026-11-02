@@ -411,7 +411,7 @@ Using `limitProb=0.99` (YES) / `0.01` (NO) emulates a market buy that fills at t
 Triggered by `/track url:<url> budget:<mana>`:
 
 1. **Parse slug** from URL's last path segment.
-2. **Fetch market:** `GET https://api.manifold.markets/v0/slug/{slug}`. Verify `outcomeType == "BINARY"` and `isResolved == false`. Extract `{id, question, textDescription, resolutionCriteria?, closeTime, probability}`.
+2. **Fetch market:** `GET https://api.manifold.markets/v0/slug/{slug}`. Verify `outcomeType == "BINARY"` and `isResolved == false`. Extract `{id, question, textDescription, resolutionCriteria?, closeTime, probability, url}`. The canonical `url` is persisted as `tracked_markets.market_url` and shown in the ONBOARDED embed; the bare slug cannot reconstruct it because the creator segment is not part of the slug.
 3. **LLM Sieve synthesis:** Call `ONBOARDING_MODEL` with `SIEVE_SYSTEM_PROMPT` + market context. Request JSON:
    ```json
    {
