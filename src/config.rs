@@ -26,7 +26,7 @@ const DEFAULT_BELIEF_HALFLIFE_HOURS: f64 = 4.0;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub jetstream_url: String,
-    pub cloudflare_account_id: String,
+    pub cloudflare_account_id: Option<String>,
     pub triage_model: String,
     pub onboarding_model: String,
     pub manifold_api_key: String,
@@ -63,13 +63,36 @@ impl Config {
             optional(&get, "JETSTREAM_URL").unwrap_or_else(|| DEFAULT_JETSTREAM_URL.to_owned());
 
         // The rig cloudflare provider reads `CLOUDFLARE_API_TOKEN` and
-        // `CLOUDFLARE_AI_GATEWAY_ID` from the process environment itself. This
-        // struct validates the account id here so a missing or placeholder
-        // value fails at startup, and owns the model names the LLM calls use.
-        let cloudflare_account_id = required(&get, "CLOUDFLARE_ACCOUNT_ID")?;
-        validate_cloudflare_account_id(&cloudflare_account_id)?;
+        // `CLOUDFLARE_AI_GATEWAY_ID` from the process environment itself.
+        // The rig openrouter provider reads `OPENROUTER_API_KEY`.
         let triage_model = required(&get, "TRIAGE_MODEL")?;
+        let (triage_provider, _) = parse_model_spec(&triage_model)?;
         let onboarding_model = required(&get, "ONBOARDING_MODEL")?;
+        let (onboarding_provider, _) = parse_model_spec(&onboarding_model)?;
+
+        let needs_cloudflare = triage_provider == ModelProvider::Cloudflare
+            || onboarding_provider == ModelProvider::Cloudflare;
+        let needs_openrouter = triage_provider == ModelProvider::OpenRouter
+            || onboarding_provider == ModelProvider::OpenRouter;
+
+        let cloudflare_account_id = if needs_cloudflare {
+            let account_id = required(&get, "CLOUDFLARE_ACCOUNT_ID")?;
+            validate_cloudflare_account_id(&account_id)?;
+            Some(account_id)
+        } else {
+            match optional(&get, "CLOUDFLARE_ACCOUNT_ID") {
+                Some(id) if id != "{account_id}" => {
+                    validate_cloudflare_account_id(&id)?;
+                    Some(id)
+                }
+                _ => None,
+            }
+        };
+
+        if needs_openrouter {
+            let _ = required(&get, "OPENROUTER_API_KEY")?;
+        }
+
         let manifold_api_key = required(&get, "MANIFOLD_API_KEY")?;
         let discord_bot_token = required(&get, "DISCORD_BOT_TOKEN")?;
         let discord_guild_id = required_u64(&get, "DISCORD_GUILD_ID")?;
@@ -111,6 +134,62 @@ impl Config {
         };
 
         Ok(config)
+    }
+}
+
+/// Provider selected by a model name prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProvider {
+    Cloudflare,
+    OpenRouter,
+}
+
+impl ModelProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::OpenRouter => "openrouter",
+        }
+    }
+}
+
+/// Parses a model name prefix to determine the provider and underlying model name.
+///
+/// Supported prefixes:
+/// - `cloudflare/` -> Cloudflare AI Gateway
+/// - `openrouter/` -> OpenRouter
+/// - (none) -> defaults to Cloudflare AI Gateway (e.g. `@cf/...`)
+pub fn parse_model_spec(model: &str) -> AppResult<(ModelProvider, &str)> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        bail!("model name cannot be empty");
+    }
+    if let Some(rest) = trimmed.strip_prefix("openrouter/").or_else(|| {
+        if trimmed.len() >= 11 && trimmed[..11].eq_ignore_ascii_case("openrouter/") {
+            Some(&trimmed[11..])
+        } else {
+            None
+        }
+    }) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            bail!("model name after 'openrouter/' prefix cannot be empty");
+        }
+        Ok((ModelProvider::OpenRouter, rest))
+    } else if let Some(rest) = trimmed.strip_prefix("cloudflare/").or_else(|| {
+        if trimmed.len() >= 11 && trimmed[..11].eq_ignore_ascii_case("cloudflare/") {
+            Some(&trimmed[11..])
+        } else {
+            None
+        }
+    }) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            bail!("model name after 'cloudflare/' prefix cannot be empty");
+        }
+        Ok((ModelProvider::Cloudflare, rest))
+    } else {
+        Ok((ModelProvider::Cloudflare, trimmed))
     }
 }
 
@@ -292,9 +371,54 @@ mod tests {
     fn stores_cloudflare_account_id_and_models() {
         let config = config_from(&required_vars()).expect("config should load");
 
-        assert_eq!(config.cloudflare_account_id, "test-account");
+        assert_eq!(config.cloudflare_account_id.as_deref(), Some("test-account"));
         assert_eq!(config.triage_model, "@cf/google/gemini-test");
         assert_eq!(config.onboarding_model, "@cf/deepseek/test");
+    }
+
+    #[test]
+    fn parses_openrouter_configuration() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| {
+            *name != "CLOUDFLARE_ACCOUNT_ID" && *name != "TRIAGE_MODEL" && *name != "ONBOARDING_MODEL"
+        });
+        vars.push(("TRIAGE_MODEL", "openrouter/google/gemini-2.0-flash-001"));
+        vars.push(("ONBOARDING_MODEL", "openrouter/anthropic/claude-3.5-sonnet"));
+        vars.push(("OPENROUTER_API_KEY", "sk-or-test-key"));
+
+        let config = config_from(&vars).expect("openrouter config should load");
+        assert_eq!(config.cloudflare_account_id, None);
+        assert_eq!(config.triage_model, "openrouter/google/gemini-2.0-flash-001");
+        assert_eq!(config.onboarding_model, "openrouter/anthropic/claude-3.5-sonnet");
+    }
+
+    #[test]
+    fn rejects_missing_openrouter_key() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| *name != "TRIAGE_MODEL");
+        vars.push(("TRIAGE_MODEL", "openrouter/google/gemini-2.0-flash-001"));
+
+        let error = config_from(&vars).expect_err("missing OPENROUTER_API_KEY should fail");
+        assert!(error.to_string().contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn parses_model_prefixes() {
+        let (p, m) = parse_model_spec("openrouter/anthropic/claude").unwrap();
+        assert_eq!(p, ModelProvider::OpenRouter);
+        assert_eq!(m, "anthropic/claude");
+
+        let (p, m) = parse_model_spec("cloudflare/@cf/meta/llama").unwrap();
+        assert_eq!(p, ModelProvider::Cloudflare);
+        assert_eq!(m, "@cf/meta/llama");
+
+        let (p, m) = parse_model_spec("@cf/meta/llama").unwrap();
+        assert_eq!(p, ModelProvider::Cloudflare);
+        assert_eq!(m, "@cf/meta/llama");
+
+        assert!(parse_model_spec("openrouter/").is_err());
+        assert!(parse_model_spec("cloudflare/").is_err());
+        assert!(parse_model_spec("").is_err());
     }
 
     #[test]

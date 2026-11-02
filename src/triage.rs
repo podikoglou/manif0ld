@@ -41,7 +41,7 @@ use std::sync::Arc;
 use rig::completion::{CompletionRequest, Message};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{parse_model_spec, Config, ModelProvider};
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::types::{Direction, ExtractedPost, TrackedMarket, TriageResult};
 
@@ -54,25 +54,42 @@ const MAX_STRENGTH: u8 = 3;
 /// System message from the triage prompt in the specification.
 const SYSTEM_PROMPT: &str = "You evaluate Bluesky posts as signal for a prediction market.";
 
-/// Shared Cloudflare AI Gateway completion client built on rig.
+/// Shared LLM completion client supporting Cloudflare AI Gateway and OpenRouter, built on rig.
 ///
 /// Cloneable so triage and onboarding can each hold a handle; the underlying
-/// rig client shares one connection pool.
+/// rig clients share connection pools.
 #[derive(Clone)]
 pub struct LlmClient {
-    client: rig::providers::openai::OpenAI,
+    cloudflare: Option<rig::providers::openai::OpenAI>,
+    openrouter: Option<rig::providers::openai::OpenAI>,
 }
 
 impl LlmClient {
     /// Builds the client from the process environment.
     ///
-    /// [`rig::providers::cloudflare::from_env`] reads `CLOUDFLARE_ACCOUNT_ID`
-    /// and `CLOUDFLARE_API_TOKEN` here, so a misconfigured environment fails
-    /// at construction (i.e. at startup) rather than on the first LLM call.
+    /// Initializes Cloudflare and/or OpenRouter depending on the credentials
+    /// present in the process environment.
     pub fn new() -> AppResult<Self> {
-        let client = rig::providers::cloudflare::from_env()
-            .map_err(|error| anyhow!("initializing the Cloudflare AI Gateway client: {error}"))?;
-        Ok(Self { client })
+        let (cloudflare, cf_err) = match rig::providers::cloudflare::from_env() {
+            Ok(client) => (Some(client), None),
+            Err(e) => (None, Some(e)),
+        };
+        let (openrouter, or_err) = match rig::providers::openrouter::from_env() {
+            Ok(client) => (Some(client), None),
+            Err(e) => (None, Some(e)),
+        };
+        if cloudflare.is_none() && openrouter.is_none() {
+            bail!(
+                "failed to initialize LLM client; neither Cloudflare nor OpenRouter credentials were valid \
+                 (Cloudflare: {}; OpenRouter: {})",
+                cf_err.map_or_else(|| "none".to_string(), |e| e.to_string()),
+                or_err.map_or_else(|| "none".to_string(), |e| e.to_string()),
+            );
+        }
+        Ok(Self {
+            cloudflare,
+            openrouter,
+        })
     }
 
     /// Sends one chat-completion request and returns the assistant text.
@@ -106,16 +123,36 @@ impl LlmClient {
     }
 
     /// Runs one completion request and returns the assistant text.
-    async fn send(&self, model: &str, request: CompletionRequest) -> AppResult<String> {
-        let response = self
-            .client
+    async fn send(&self, raw_model: &str, request: CompletionRequest) -> AppResult<String> {
+        let (provider, model) = parse_model_spec(raw_model)?;
+        let (client, provider_name) = match provider {
+            ModelProvider::Cloudflare => {
+                let client = self.cloudflare.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "Cloudflare AI Gateway client is not initialized; please set \
+                         CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
+                    )
+                })?;
+                (client, "the Cloudflare AI Gateway")
+            }
+            ModelProvider::OpenRouter => {
+                let client = self.openrouter.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "OpenRouter client is not initialized; please set OPENROUTER_API_KEY"
+                    )
+                })?;
+                (client, "OpenRouter")
+            }
+        };
+
+        let response = client
             .completion(model)
             .call(request)
             .await
-            .context("calling the Cloudflare AI Gateway")?;
+            .with_context(|| format!("calling {provider_name}"))?;
         let text = response.text();
         if text.trim().is_empty() {
-            bail!("the Cloudflare AI Gateway returned no assistant text");
+            bail!("{provider_name} returned no assistant text");
         }
         Ok(text)
     }
@@ -126,7 +163,8 @@ impl LlmClient {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            client: rig::providers::cloudflare::new("test-key"),
+            cloudflare: Some(rig::providers::cloudflare::new("test-key")),
+            openrouter: Some(rig::providers::openrouter::new("test-key")),
         }
     }
 }
