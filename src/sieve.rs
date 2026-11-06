@@ -185,10 +185,13 @@ mod tests {
 
     #[test]
     fn raw_text_is_not_preprocessed_by_the_registry() {
-        // A case-sensitive literal cannot see through dotted obfuscation.
+        // A case-sensitive lowercase literal sees the raw text: dotted
+        // obfuscation and a capitalized alternative both defeat it.
         let case_sensitive = EngineRegistry::new();
-        case_sensitive.register("M".to_owned(), engine(r#"match M { "SCAM"! }"#));
+        case_sensitive.register("M".to_owned(), engine(r#"match M { "scam"! }"#));
         assert!(matched(&case_sensitive, "S.C.A.M").is_empty());
+        assert!(matched(&case_sensitive, "Scam is up").is_empty());
+        assert_eq!(matched(&case_sensitive, "pure scam"), vec!["M".to_owned()]);
 
         // The leetspeak modifier asks Sieve to do the expansion itself.
         let leetspeak = EngineRegistry::new();
