@@ -1518,6 +1518,8 @@ mod tests {
             discord_thread_id: String::new(),
             created_at: 0,
             deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
         }
     }
 

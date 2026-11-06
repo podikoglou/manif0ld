@@ -17,10 +17,10 @@ use crate::types::{MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, Tra
 const MARKET_COLUMNS: &str = "id, slug, market_url, question, description, resolution_criteria, close_time, \
      status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, no_shares, \
      p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, discord_thread_id, \
-     created_at, deleted_at";
+     created_at, deleted_at, outcome_type, should_answers_sum_to_one";
 
 const ANSWER_COLUMNS: &str = "id, market_id, text, p_internal_log_odds, p_market_last, \
-     belief_updated_at, yes_shares, no_shares, created_at";
+     belief_updated_at, yes_shares, no_shares, created_at, invested_mana";
 
 const SIGNAL_COLUMNS: &str = "id, market_id, answer_id, post_uri, author_handle, post_text, material, \
      direction, strength, impulse, p_after, created_at, p_evidence, p_target, strength_real, p_priced";
@@ -104,6 +104,11 @@ impl Db {
             conn.execute_batch(include_str!("../migrations/004_signal_probabilities.sql"))
                 .context("applying database migration 004 (signal probabilities)")?;
         }
+        // 005: per-answer trading state for multiple-choice markets.
+        if !table_has_column(conn, "market_answers", "invested_mana")? {
+            conn.execute_batch(include_str!("../migrations/005_answer_trading.sql"))
+                .context("applying database migration 005 (answer trading)")?;
+        }
         Ok(())
     }
 
@@ -126,8 +131,8 @@ impl Db {
             "INSERT INTO tracked_markets (id, slug, market_url, question, description, resolution_criteria, \
              close_time, status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, \
              no_shares, p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, \
-             discord_thread_id, created_at, deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+             discord_thread_id, created_at, deleted_at, outcome_type, should_answers_sum_to_one) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 market.id,
                 market.slug,
@@ -149,6 +154,8 @@ impl Db {
                 market.discord_thread_id,
                 market.created_at,
                 market.deleted_at,
+                market.outcome_type,
+                market.should_answers_sum_to_one,
             ],
         )
         .with_context(|| format!("inserting market {}", market.id))?;
@@ -285,6 +292,24 @@ impl Db {
                 params![id, invested, realized_pnl, yes_shares, no_shares],
             )
             .with_context(|| format!("updating position for market {id}"))?;
+        ensure_updated(updated, id)
+    }
+
+    /// Refreshes the outcome type and the sum-to-one flag from Manifold.
+    pub fn update_market_kind(
+        &self,
+        id: &str,
+        outcome_type: &str,
+        should_answers_sum_to_one: bool,
+    ) -> AppResult<()> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE tracked_markets SET outcome_type = ?2, should_answers_sum_to_one = ?3 \
+                 WHERE id = ?1",
+                params![id, outcome_type, should_answers_sum_to_one],
+            )
+            .with_context(|| format!("updating outcome type for market {id}"))?;
         ensure_updated(updated, id)
     }
 
@@ -448,8 +473,8 @@ impl Db {
         let conn = self.lock()?;
         conn.execute(
             "INSERT OR REPLACE INTO market_answers (id, market_id, text, p_internal_log_odds, \
-             p_market_last, belief_updated_at, yes_shares, no_shares, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             p_market_last, belief_updated_at, yes_shares, no_shares, created_at, invested_mana) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 answer.id,
                 answer.market_id,
@@ -460,6 +485,7 @@ impl Db {
                 answer.yes_shares,
                 answer.no_shares,
                 answer.created_at,
+                answer.invested_mana,
             ],
         )
         .with_context(|| format!("upserting answer {} for market {}", answer.id, answer.market_id))?;
@@ -529,6 +555,98 @@ impl Db {
             )
             .with_context(|| format!("updating shares for answer {answer_id} in {market_id}"))?;
         ensure_updated(updated, &format!("{market_id}/{answer_id}"))
+    }
+
+    /// Stores the reconciled position of one answer.
+    ///
+    /// Shares and cost basis move together because they always come from the
+    /// same remote `ContractMetric` row. Belief columns are untouched: triage
+    /// owns those and may write them concurrently.
+    pub fn update_answer_position(
+        &self,
+        market_id: &str,
+        answer_id: &str,
+        yes_shares: f64,
+        no_shares: f64,
+        invested: f64,
+    ) -> AppResult<()> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE market_answers SET yes_shares = ?3, no_shares = ?4, invested_mana = ?5 \
+                 WHERE market_id = ?1 AND id = ?2",
+                params![market_id, answer_id, yes_shares, no_shares, invested],
+            )
+            .with_context(|| format!("updating position for answer {answer_id} in {market_id}"))?;
+        ensure_updated(updated, &format!("{market_id}/{answer_id}"))
+    }
+
+    /// Updates the market price of one answer without touching belief state.
+    ///
+    /// This is the per-tick price sync. `belief_updated_at` is deliberately
+    /// left alone: it marks the last impulse, and decay is computed from it.
+    pub fn update_answer_market_price(
+        &self,
+        market_id: &str,
+        answer_id: &str,
+        p_market: f64,
+    ) -> AppResult<()> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE market_answers SET p_market_last = ?3 WHERE market_id = ?1 AND id = ?2",
+                params![market_id, answer_id, p_market],
+            )
+            .with_context(|| format!("updating market price for answer {answer_id} in {market_id}"))?;
+        ensure_updated(updated, &format!("{market_id}/{answer_id}"))
+    }
+
+    /// Updates the text of one answer after an operator or Manifold edit.
+    pub fn update_answer_text(
+        &self,
+        market_id: &str,
+        answer_id: &str,
+        text: &str,
+    ) -> AppResult<()> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE market_answers SET text = ?3 WHERE market_id = ?1 AND id = ?2",
+                params![market_id, answer_id, text],
+            )
+            .with_context(|| format!("updating text for answer {answer_id} in {market_id}"))?;
+        ensure_updated(updated, &format!("{market_id}/{answer_id}"))
+    }
+
+    /// Inserts an answer only when it is not tracked yet.
+    ///
+    /// Unlike [`Db::upsert_answer`], an existing row is left untouched, so a
+    /// new answer discovered during a price sync cannot overwrite belief or
+    /// position state.
+    pub fn insert_answer_if_missing(&self, answer: &TrackedAnswer) -> AppResult<bool> {
+        let conn = self.lock()?;
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO market_answers (id, market_id, text, p_internal_log_odds, \
+                 p_market_last, belief_updated_at, yes_shares, no_shares, created_at, invested_mana) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    answer.id,
+                    answer.market_id,
+                    answer.text,
+                    answer.p_internal_log_odds,
+                    answer.p_market_last,
+                    answer.belief_updated_at,
+                    answer.yes_shares,
+                    answer.no_shares,
+                    answer.created_at,
+                    answer.invested_mana,
+                ],
+            )
+            .with_context(|| {
+                format!("inserting new answer {} for market {}", answer.id, answer.market_id)
+            })?;
+        Ok(inserted > 0)
     }
 
     /// Deletes all answers for a market.
@@ -652,6 +770,8 @@ fn market_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedMarket> {
         discord_thread_id: row.get(17)?,
         created_at: row.get(18)?,
         deleted_at: row.get(19)?,
+        outcome_type: row.get(20)?,
+        should_answers_sum_to_one: row.get(21)?,
     })
 }
 
@@ -707,6 +827,7 @@ fn answer_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedAnswer> {
         yes_shares: row.get(6)?,
         no_shares: row.get(7)?,
         created_at: row.get(8)?,
+        invested_mana: row.get(9)?,
     })
 }
 
@@ -738,6 +859,8 @@ mod tests {
             discord_thread_id: String::new(),
             created_at,
             deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
         }
     }
 
@@ -971,6 +1094,7 @@ mod tests {
             yes_shares: 0.0,
             no_shares: 0.0,
             created_at: 1,
+            invested_mana: 0.0,
         })
         .expect("insert answer");
 
@@ -1154,6 +1278,7 @@ mod tests {
             yes_shares: 10.0,
             no_shares: 0.0,
             created_at: 100,
+            invested_mana: 0.0,
         };
         db.upsert_answer(&answer).expect("upsert answer");
 

@@ -156,6 +156,14 @@ pub struct TrackedMarket {
     /// Unix seconds at which the operator ran `/untrack`; `None` while the
     /// market is still tracked.
     pub deleted_at: Option<i64>,
+    /// Manifold `outcomeType`, for example `BINARY` or `MULTIPLE_CHOICE`.
+    pub outcome_type: String,
+    /// Whether the answers of a multiple-choice market compete for mass.
+    ///
+    /// True for `cpmm-multi-1` markets where exactly one answer wins; the
+    /// trading layer then normalizes the internal distribution. False for
+    /// independent (`cpmm-multi-2`) answer sets.
+    pub should_answers_sum_to_one: bool,
 }
 
 impl TrackedMarket {
@@ -165,6 +173,11 @@ impl TrackedMarket {
     /// but it is hidden from listings and no longer trades.
     pub fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
+    }
+
+    /// Whether this market carries a separate position per answer.
+    pub fn is_multiple_choice(&self) -> bool {
+        self.outcome_type == "MULTIPLE_CHOICE"
     }
 }
 
@@ -229,6 +242,8 @@ pub struct TrackedAnswer {
     pub yes_shares: f64,
     pub no_shares: f64,
     pub created_at: i64,
+    /// Mana currently committed to this answer; the cost basis for a sell.
+    pub invested_mana: f64,
 }
 
 /// Outcome of the trading rules for one market.
@@ -415,6 +430,8 @@ mod tests {
             discord_thread_id: String::new(),
             created_at: 0,
             deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
         };
         assert_eq!(available_budget(&market), 70.0);
     }
@@ -442,6 +459,8 @@ mod tests {
             discord_thread_id: String::new(),
             created_at: 0,
             deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
         };
         assert_eq!(available_budget(&market), -20.0);
         market.invested_mana = 0.0;

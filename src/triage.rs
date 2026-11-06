@@ -746,6 +746,7 @@ mod tests {
             yes_shares: 0.0,
             no_shares: 0.0,
             created_at: 0,
+            invested_mana: 0.0,
         }
     }
 
@@ -1111,6 +1112,8 @@ mod tests {
             discord_thread_id: String::new(),
             created_at: 0,
             deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
         }
     }
 

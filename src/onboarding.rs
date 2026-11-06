@@ -155,6 +155,12 @@ pub struct ManifoldSlugMarket {
     pub probability: Option<f64>,
     #[serde(rename = "outcomeType")]
     pub outcome_type: String,
+    /// `cpmm-multi-1` for competing answers, `cpmm-multi-2` for independent ones.
+    #[serde(default)]
+    pub mechanism: String,
+    /// True when exactly one answer can win and answer probabilities sum to 1.
+    #[serde(rename = "shouldAnswersSumToOne", default)]
+    pub should_answers_sum_to_one: bool,
     #[serde(rename = "isResolved")]
     pub is_resolved: bool,
     #[serde(default)]
@@ -328,6 +334,7 @@ impl OnboardingService {
                     yes_shares: 0.0,
                     no_shares: 0.0,
                     created_at: now,
+                    invested_mana: 0.0,
                 }
             })
             .collect();
@@ -564,6 +571,8 @@ fn build_market(
         discord_thread_id: String::new(),
         created_at: now,
         deleted_at: None,
+        outcome_type: market.outcome_type.clone(),
+        should_answers_sum_to_one: market.should_answers_sum_to_one,
     }
 }
 
@@ -616,6 +625,8 @@ mod tests {
             close_time_ms: Some(1_700_000_000_000),
             probability: Some(0.63),
             outcome_type: "BINARY".to_owned(),
+            mechanism: "cpmm-1".to_owned(),
+            should_answers_sum_to_one: false,
             is_resolved: false,
             answers: None,
         }
@@ -643,6 +654,8 @@ mod tests {
             discord_thread_id: String::new(),
             created_at: 1,
             deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
         };
         OnboardingDraft {
             market,
