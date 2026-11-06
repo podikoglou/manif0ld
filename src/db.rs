@@ -1224,21 +1224,24 @@ mod tests {
     #[test]
     fn key_value_roundtrip() {
         let db = Db::open_in_memory().expect("in-memory DB");
-        assert_eq!(db.get_kv("cursor").expect("missing key"), None);
+        assert_eq!(db.get_kv("example_key").expect("missing key"), None);
 
-        db.set_kv("cursor", "123").expect("set kv");
-        assert_eq!(db.get_kv("cursor").expect("get kv").as_deref(), Some("123"));
-
-        db.set_kv("cursor", "456").expect("overwrite kv");
+        db.set_kv("example_key", "123").expect("set kv");
         assert_eq!(
-            db.get_kv("cursor").expect("get overwritten").as_deref(),
+            db.get_kv("example_key").expect("get kv").as_deref(),
+            Some("123")
+        );
+
+        db.set_kv("example_key", "456").expect("overwrite kv");
+        assert_eq!(
+            db.get_kv("example_key").expect("get overwritten").as_deref(),
             Some("456")
         );
 
-        db.delete_kv("cursor").expect("delete kv");
-        assert_eq!(db.get_kv("cursor").expect("get deleted"), None);
+        db.delete_kv("example_key").expect("delete kv");
+        assert_eq!(db.get_kv("example_key").expect("get deleted"), None);
         // Deleting a missing key is idempotent.
-        db.delete_kv("cursor").expect("delete missing kv");
+        db.delete_kv("example_key").expect("delete missing kv");
     }
 
     #[test]
