@@ -1,4 +1,4 @@
-# Technical Specification: `bsky-manifold-arb` (v2, trimmed)
+# Technical Specification: `manif0ld` (v2, trimmed)
 
 **Scope:** Personal Bluesky → Manifold auto-trader. The core value is **filtering**: turning the Jetstream firehose into a small number of "this matters for market X" posts, and acting on them. Everything else is minimal infrastructure to make that useful.
 
@@ -43,7 +43,7 @@ Jetstream WS ──► post extractor ──► EngineRegistry (N markets, N Com
 Single Rust crate:
 
 ```
-bsky-manifold-arb/
+manif0ld/
 ├── Cargo.toml
 ├── .env.example
 ├── README.md
@@ -113,7 +113,7 @@ BELIEF_KAPPA=1.1
 BELIEF_HALFLIFE_HOURS=4.0
 
 # Storage
-DB_PATH=./data/arb.db
+DB_PATH=./data/manif0ld.db
 ```
 
 **Note on the transport.** Triage never calls a chat endpoint. The decisions
