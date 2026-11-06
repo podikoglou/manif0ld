@@ -128,8 +128,8 @@ impl App {
         })
     }
 
-    /// Subscribes every broadcast receiver, then starts the long-running tasks
-    /// (six, plus the websocket client when `MANIFOLD_WS_ENABLED=1`).
+    /// Subscribes every broadcast receiver, then starts the long-running
+    /// tasks (seven, including the Manifold websocket client).
     ///
     /// The two blocks are ordered on purpose and must stay in this function: see
     /// the module doc.
@@ -220,22 +220,16 @@ impl App {
             }
         });
 
-        // The websocket client is part of the live-price path; the legacy
-        // polling loop (`MANIFOLD_WS_ENABLED=0`) runs without it and the
-        // unconsumed sender just drops.
-        let manifold_ws_task = if config.manifold_ws_enabled {
-            Some(tokio::spawn({
-                let config = (*config).clone();
-                async move {
-                    if let Err(error) = manifold_ws::run(config, manifold_event_tx).await {
-                        tracing::error!(error = %error, "manifold websocket stopped");
-                    }
+        // The Manifold websocket client feeds the executor's live-price
+        // mirror; it is always part of the operate mode.
+        let manifold_ws_task = tokio::spawn({
+            let config = (*config).clone();
+            async move {
+                if let Err(error) = manifold_ws::run(config, manifold_event_tx).await {
+                    tracing::error!(error = %error, "manifold websocket stopped");
                 }
-            }))
-        } else {
-            drop(manifold_event_tx);
-            None
-        };
+            }
+        });
 
         let ingest_task = tokio::spawn(async move {
             if let Err(error) = ingest::run((*config).clone(), post_tx).await {
@@ -283,9 +277,8 @@ pub struct Tasks {
     ingest: JoinHandle<()>,
     discord: JoinHandle<()>,
     event: JoinHandle<()>,
-    /// The websocket client task, absent while `MANIFOLD_WS_ENABLED=0` runs
-    /// the legacy polling loop.
-    manifold_ws: Option<JoinHandle<()>>,
+    /// The Manifold websocket client feeding the executor's price mirror.
+    manifold_ws: JoinHandle<()>,
 }
 
 impl Tasks {
@@ -305,9 +298,7 @@ impl Tasks {
         self.ingest.abort();
         self.event.abort();
         self.discord.abort();
-        if let Some(manifold_ws) = self.manifold_ws {
-            manifold_ws.abort();
-        }
+        self.manifold_ws.abort();
 
         Ok(())
     }

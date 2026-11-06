@@ -96,9 +96,8 @@ TRIAGE_MIN_EVIDENCE=0.7                                # probability of evidence
 # Manifold
 MANIFOLD_API_KEY=...
 # The bot user ID is fetched from GET /v0/me at startup.
-# Live prices come from the broadcast websocket; REST is demoted to a slow
-# batched reconcile. 0 restores the legacy 60-second polling loop.
-MANIFOLD_WS_ENABLED=1
+# Live prices come from the Manifold broadcast websocket; REST is demoted to
+# a slow batched reconcile.
 
 # Discord
 DISCORD_BOT_TOKEN=...
@@ -470,9 +469,8 @@ For an answer entry the target is additionally capped at
 `MC_MAX_ANSWER_FRACTION × budget_mana`.
 
 **Binary decision (called after each belief update, on every debounced
-websocket price update, after every 5-minute reconcile pass over all
-active markets on the cached state, and — with `MANIFOLD_WS_ENABLED=0` —
-on the legacy 60s ticker per active market):**
+websocket price update, and after every 5-minute reconcile pass over all
+active markets on the cached state):**
 
 ```
 edge = p_internal − p_market
@@ -488,7 +486,7 @@ if no position and edge < −ENTRY_EDGE_THRESHOLD and target_mana >= MIN_TRADE_S
     → BUY_NO(target_mana)
 ```
 
-**Multiple-choice decision (same 60s ticker, same material-signal trigger):**
+**Multiple-choice decision (same material-signal trigger):**
 
 1. **Sync answers.** New answers are inserted with
    `p_internal = logit(price)`; existing rows get a price-only update. Belief

@@ -14,11 +14,9 @@
 //!
 //! Prices arrive live; REST is demoted to housekeeping (`docs/ALGO.md` §1):
 //! a 5-minute `Priority::Reconcile` pass chunks `GET /v0/market-probs` and
-//! replaces the old per-market `/positions` sync with one paginated portfolio
+//! replaces the per-market `/positions` sync with one paginated portfolio
 //! snapshot, and each pass ends with a REST-free cached-state sweep of every
 //! active market so a quiet market still reaches its belief-decay exit.
-//! `MANIFOLD_WS_ENABLED=0` restores the legacy polling loop for the
-//! duration of the canary — see [`TradeExecutor::run`].
 //!
 //! Positions, accounting, and the trading policy live in [`crate::book`]. The
 //! dependency edge is one-way: `trade` uses `book`, and `book` never imports
@@ -34,10 +32,10 @@
 //! first exit. Manifold's `ContractMetric` reports `totalShares`, `invested`,
 //! and `profit` for the current position directly; that is the authoritative
 //! source, and any mismatch is resolved in Manifold's favour with a `warn!`.
-//! Since the reconcile swap the whole portfolio is one paginated call to
-//! `GET /v0/get-user-contract-metrics-with-contracts`; the legacy per-market
-//! `/positions` call only survives in `evaluate_market`/`sync_market`, which
-//! the legacy loop and liquidation still drive.
+//! Since the reconcile swap the whole portfolio is fetched as one paginated
+//! call to `GET /v0/get-user-contract-metrics-with-contracts`; the per-market
+//! `/positions` call remains only inside `prepare`, which the operator's
+//! re-check, the reconcile pass's full-sync branch, and liquidation drive.
 //!
 //! # Timestamps
 //!
@@ -101,12 +99,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest response snippet included in an error message.
 const ERROR_SNIPPET_CHARS: usize = 500;
 
-/// LEGACY: the 60-second per-market REST trade check of the polling loop.
-/// `MANIFOLD_WS_ENABLED=0` runs it in `TradeExecutor::run_legacy`; delete it
-/// after the websocket canary has proved out.
-const LEGACY_SYNC_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Interval of the slow REST reconcile backstop that replaces the legacy
+/// Interval of the slow REST reconcile backstop that demotes REST to
 /// ticker's freshness role: batched probabilities, one portfolio position
 /// snapshot, and a single summary line (`docs/ALGO.md` §1, §2).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
@@ -796,8 +789,8 @@ impl From<MarketProbs> for ProbPatch {
 ///
 /// A CPMM market cannot pin at exactly 0 or 1 while it is open, so an
 /// all-extreme patch is the practical signature of a resolution broadcast.
-/// Price patches carry no `isResolved` flag, so the legacy loop's snapshot
-/// check (`evaluate_market`) is replaced by this guard: a resolved market
+/// Price patches carry no `isResolved` flag, so the snapshot check's
+/// `isResolved` guard is not available here and this predicate replaces it: a resolved market
 /// must not trade — its positions settle automatically — and, because the
 /// mirror clamps the stored price to 0.99/0.01, the skip is recorded in
 /// [`TerminalMirrors`] until a full [`TradeExecutor::sync_market`] refresh
@@ -986,9 +979,6 @@ pub struct TradeExecutor {
     /// anything awaits.
     terminal_mirrors: SyncMutex<TerminalMirrors>,
     events: broadcast::Sender<TradeEvent>,
-    /// Whether live prices stream from the websocket. `false` selects the
-    /// legacy 60-second REST loop in [`TradeExecutor::run`].
-    ws_enabled: bool,
 }
 
 impl TradeExecutor {
@@ -1013,7 +1003,6 @@ impl TradeExecutor {
             execution_lock: Mutex::new(()),
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             events,
-            ws_enabled: config.manifold_ws_enabled,
         })
     }
 
@@ -1035,10 +1024,10 @@ impl TradeExecutor {
     /// reconciliation), plan one decision cycle, then execute and persist
     /// every action it returned.
     ///
-    /// This is the legacy path (the 60-second ticker, and the operator's
-    /// explicit recheck), and it is what the live operate mode keeps for
-    /// liquidation. The live-price loop calls [`TradeExecutor::evaluate_cached`]
-    /// instead because the price columns are already mirrored.
+    /// This is the full-REST path, driven by the operator's explicit recheck
+    /// (through the Discord control plane). The live-price loop calls
+    /// [`TradeExecutor::evaluate_cached`] instead because the price columns
+    /// are already mirrored.
     ///
     /// Returns `Ok(None)` when no trade happens. A resolved market, a paused
     /// market, an edge inside the thresholds, and a buy blocked by the kill
@@ -1079,7 +1068,7 @@ impl TradeExecutor {
     /// The websocket and the slow reconcile write the price columns through
     /// `MarketStore::market_prices_observed` and the position columns through
     /// `Book::reconcile`, so loading the book is enough to decide on. The
-    /// gating is exactly the legacy path's: status `ACTIVE`, kill switch,
+    /// gating is the standard one: status `ACTIVE`, kill switch,
     /// budget invariant (asserted per planned buy), and `TRADING_DRY_RUN`.
     /// The terminal-mirror skip (see [`TerminalMirrors`]) also applies here,
     /// since every call site — signal, price update, and the post-reconcile
@@ -1256,34 +1245,16 @@ impl TradeExecutor {
         Ok(book.market())
     }
 
-    /// Syncs and evaluates every active market once.
-    ///
-    /// This is the 60-second trade check. `evaluate_market` performs the
-    /// reconciliation itself, so the ticker makes one price and one position
-    /// request per market. Failures are collected per market so one broken
-    /// market cannot stop the tick for the others. The active set comes from
-    /// the store's snapshot, so a paused market is skipped without a query.
-    pub async fn sync_all(&self) -> Vec<(MarketId, anyhow::Error)> {
-        let markets = self.store.active();
-
-        let mut errors = Vec::new();
-        for market in markets {
-            let market_id = market.id.clone();
-            if let Err(error) = self.evaluate_market(&market_id, None).await {
-                errors.push((market_id, error));
-            }
-        }
-        errors
-    }
-
     /// Runs one REST-free cached-state trade check for every active market.
     ///
-    /// This is the post-reconcile evaluation sweep: the legacy 60-second
-    /// ticker caught exits caused by belief decay on markets that have gone
-    /// quiet — no sieve post sparks a signal, no websocket event fires, so
-    /// without a sweep such a market is never evaluated and its exit edge
-    /// never fires. The 5-minute reconcile pass is the new home for that
-    /// periodic role. Each check goes through [`TradeExecutor::evaluate_cached`],
+    /// Runs one REST-free cached-state trade check for every active market.
+    ///
+    /// This is the post-reconcile evaluation sweep: it catches exits caused
+    /// by belief decay on markets that have gone quiet — no sieve post sparks
+    /// a signal, no websocket event fires, so without a sweep such a market
+    /// is never evaluated and its exit edge never fires. The 5-minute
+    /// reconcile pass gives that periodic role a home. Each check goes
+    /// through [`TradeExecutor::evaluate_cached`],
     /// so the decision logic is not forked and every per-market gate
     /// (status, kill switch, terminal-mirror skip) is already inside it.
     /// No debounce is needed: 5 minutes is self-limiting cadence.
@@ -1414,17 +1385,15 @@ impl TradeExecutor {
 
     /// Runs the trade executor.
     ///
-    /// With `MANIFOLD_WS_ENABLED` (the default) the loop has four arms:
-    /// material pipeline signals (a trade check against the mirrored prices),
-    /// websocket `ManifoldEvent`s (price mirror + debounced trade check), a
-    /// 5-minute reconcile ticker (batched REST backstop, run on its own task
-    /// with the summary returned over a channel so the loop never stops
-    /// draining events while it runs), and the drained result arm that also
-    /// frees the reconcile slot. Each reconcile pass is followed by a
-    /// REST-free cached-state evaluation of every active market, which
-    /// restores the legacy ticker's catch of belief-decay exits on markets
-    /// that go quiet. The legacy branch below restores the old polling loop
-    /// when the flag is `0`.
+    /// The loop has four arms: material pipeline signals (a trade check
+    /// against the mirrored prices), websocket `ManifoldEvent`s (price
+    /// mirror + debounced trade check), a 5-minute reconcile ticker (batched
+    /// REST backstop, run on its own task with the summary returned over a
+    /// channel so the loop never stops draining events while it runs), and
+    /// the drained result arm that also frees the reconcile slot. Each
+    /// reconcile pass is followed by a REST-free cached-state evaluation of
+    /// every active market, which catches belief-decay exits on markets
+    /// that go quiet.
     ///
     /// No single failure stops the loop: trade errors are logged, broadcast
     /// lag is logged, and a closed pipeline channel ends the loop.
@@ -1433,14 +1402,7 @@ impl TradeExecutor {
         mut events: broadcast::Receiver<PipelineEvent>,
         mut manifold_events: mpsc::Receiver<ManifoldEvent>,
     ) -> AppResult<()> {
-        if !self.ws_enabled {
-            // LEGACY: delete after the websocket canary has proved out.
-            tracing::info!("MANIFOLD_WS_ENABLED=0; running the legacy 60-second REST loop");
-            drop(manifold_events);
-            return self.run_legacy(events).await;
-        }
-
-        tracing::info!("MANIFOLD_WS_ENABLED=1; live prices from the websocket");
+        tracing::info!("live prices from the Manifold websocket");
 
         let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
         reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1626,10 +1588,10 @@ impl TradeExecutor {
                     reconcile_task = Some(tokio::spawn(async move {
                         let summary = executor.reconcile_pass().await;
 
-                        // The legacy 60-second ticker caught exits caused by
-                        // belief decay on quiet markets (no posts, so no
-                        // signal; no websocket event, so no evaluation).
-                        // After every pass the cached state is complete
+                        // Belief-decay exits on quiet markets (no posts, so
+                        // no signal; no websocket event, so no evaluation)
+                        // are caught by this periodic sweep: after every
+                        // pass the cached state is complete
                         // enough to decide on, and this periodic sweep runs
                         // `evaluate_cached` for every active market with the
                         // same gating as the ws path (status, kill switch,
@@ -1663,73 +1625,6 @@ impl TradeExecutor {
                                 "some reconcile reads were skipped for the trade reserve"
                             );
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Consumes pipeline signals and runs a 60-second REST sync ticker.
-    ///
-    /// LEGACY: the pre-websocket control flow, selected by
-    /// `MANIFOLD_WS_ENABLED=0` while the websocket path canaries. Material
-    /// signals trigger an immediate trade check for their market. The ticker
-    /// reconciles every active market and then evaluates it, which is what
-    /// catches exits caused by belief decay between posts. Delete it with the
-    /// flag after canary.
-    async fn run_legacy(
-        self: Arc<Self>,
-        mut events: broadcast::Receiver<PipelineEvent>,
-    ) -> AppResult<()> {
-        let mut ticker = tokio::time::interval(LEGACY_SYNC_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first interval tick completes immediately. Consume it so startup
-        // does not race the first real 60-second reconciliation.
-        ticker.tick().await;
-
-        loop {
-            tokio::select! {
-                event = events.recv() => {
-                    match event {
-                        Ok(PipelineEvent::Signal {
-                            material: true,
-                            market_id,
-                            post_uri,
-                            ..
-                        }) => {
-                            if let Err(error) = self
-                                .evaluate_market(&market_id, Some(&post_uri))
-                                .await
-                            {
-                                tracing::error!(
-                                    market_id = %market_id,
-                                    error = %error,
-                                    "trade check failed after a material signal"
-                                );
-                                self.emit_error(Some(market_id), error.to_string());
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                            tracing::warn!(
-                                dropped,
-                                "trade event consumer lagged; some signals were skipped"
-                            );
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    }
-                }
-                _ = ticker.tick() => {
-                    for (market_id, error) in self.sync_all().await {
-                        tracing::error!(
-                            market_id = %market_id,
-                            error = %error,
-                            "scheduled market sync failed"
-                        );
-                        self.emit_error(
-                            Some(market_id).filter(|id| !id.is_empty()),
-                            error.to_string(),
-                        );
                     }
                 }
             }
@@ -1805,7 +1700,7 @@ impl TradeExecutor {
     ///    the full per-market sync for that one market (kind refresh, answer
     ///    discovery with text).
     /// 2. **One portfolio snapshot** — the paginated
-    ///    `get-user-contract-metrics-with-contracts` call replaces the legacy
+    ///    `get-user-contract-metrics-with-contracts` call replaces the
     ///    per-market `/positions` sync. Every tracked market present in the
     ///    snapshot is reconciled through [`Book::reconcile`] (the same
     ///    warn-on-mismatch-trust-remote comparison), and when the pagination
@@ -2202,7 +2097,7 @@ impl TradeExecutor {
     /// Every write costs the bucket one token, matching Manifold's per-request
     /// limit. When the bucket is at the trade floor the write is refused here,
     /// the same shape as a kill-switch buy refusal: the caller skips the REST
-    /// call and the next material signal or 60-second tick re-runs it.
+    /// call and the next material signal or price update re-runs it.
     /// Returning `false` instead of an error keeps a rate refusal out of the
     /// per-market error path, where it would be indistinguishable from a
     /// broken market.
@@ -2945,7 +2840,6 @@ mod tests {
             mc_max_new_per_tick: 2,
             mc_max_answer_fraction: 0.25,
             rate_limit_per_min: 500,
-            manifold_ws_enabled: true,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-mcq-live.db"),
         }
     }

@@ -617,7 +617,6 @@ TradeExecutor::new(&Config, Db, Arc<MarketStore>).await
 events() / client()
 evaluate_market(market_id, trigger_post_uri) -> Option<TradeRecord>
 sync_market(market_id) -> TrackedMarket
-sync_all() -> Vec<(MarketId, Error)>
 liquidate(market_id) -> LiquidationOutcome
 liquidate_all() -> Vec<(MarketId, Error)>
 run(self: Arc<Self>, broadcast::Receiver<PipelineEvent>)
@@ -629,9 +628,10 @@ plus the ledger row), `record_trade`, `emit_trade`, `emit_error`,
 `kill_switch_on`. `evaluate_market`, `sync_market`, and `liquidate` each have a
 single body for both market shapes; the shape lives in `book::Book`.
 
-`evaluate_market` does a full remote round trip on **every** material signal:
-`GET market` + `GET positions` + optional `POST bet/sell` + DB writes. It
-serializes all markets on one `execution_lock`.
+`evaluate_market` (full REST round trip: `GET market` + `GET positions` +
+optional `POST bet/sell` + DB writes) is the operator's re-check entry point;
+live trading evaluates against the already-mirrored cached state. All state
+changes serialize on one `execution_lock`.
 
 ### `onboarding.rs`
 
@@ -965,8 +965,8 @@ Properties to preserve:
 
 - `broadcast` has **no history**. `app::App::spawn` subscribes all receivers
   before the first `tokio::spawn`. A late subscriber misses events.
-- No event is persisted. A restart loses in-flight signals. The 60 s `sync_all`
-  recovers position and price, not missed signals.
+- No event is persisted. A restart loses in-flight signals. The 5-minute
+  reconcile pass recovers position and price, not missed signals.
 - Every channel is bounded. The design prefers dropping data to blocking the
   firehose.
 

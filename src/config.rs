@@ -25,10 +25,6 @@ const DEFAULT_MC_MAX_NEW_PER_TICK: usize = 2;
 const DEFAULT_MC_MAX_ANSWER_FRACTION: f64 = 0.25;
 /// Manifold allows 500 requests/minute per IP; the bucket starts at that.
 const DEFAULT_RATE_LIMIT_PER_MIN: usize = 500;
-/// Live prices come from the broadcast websocket; REST is demoted to the slow
-/// reconcile backstop. Setting the flag to `0` restores the legacy 60-second
-/// per-market polling loop until the canary proves the websocket path.
-const DEFAULT_MANIFOLD_WS_ENABLED: bool = true;
 
 /// Runtime configuration for the bot.
 ///
@@ -69,9 +65,6 @@ pub struct Config {
     /// Manifold REST requests per minute shared by every consumer, refilled
     /// continuously; trade writes have priority over housekeeping.
     pub rate_limit_per_min: usize,
-    /// Whether live prices stream from the Manifold broadcast websocket.
-    /// Disabling this restores the legacy 60-second REST polling loop.
-    pub manifold_ws_enabled: bool,
     pub db_path: PathBuf,
 }
 
@@ -166,9 +159,6 @@ impl Config {
             bail!("RATE_LIMIT_PER_MIN must be a positive number of requests per minute");
         }
 
-        let manifold_ws_enabled =
-            bool_or(&get, "MANIFOLD_WS_ENABLED", DEFAULT_MANIFOLD_WS_ENABLED)?;
-
         let db_path = optional(&get, "DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
@@ -197,7 +187,6 @@ impl Config {
             mc_max_new_per_tick,
             mc_max_answer_fraction,
             rate_limit_per_min,
-            manifold_ws_enabled,
             db_path,
         };
 
@@ -391,10 +380,6 @@ mod tests {
         assert_eq!(config.mc_max_new_per_tick, 2);
         assert_eq!(config.mc_max_answer_fraction, 0.25);
         assert_eq!(config.rate_limit_per_min, DEFAULT_RATE_LIMIT_PER_MIN);
-        assert!(
-            config.manifold_ws_enabled,
-            "the websocket path must default to on"
-        );
         assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
@@ -415,7 +400,6 @@ mod tests {
             ("MC_MAX_NEW_PER_TICK", "1"),
             ("MC_MAX_ANSWER_FRACTION", "0.5"),
             ("RATE_LIMIT_PER_MIN", "400"),
-            ("MANIFOLD_WS_ENABLED", "0"),
             ("DB_PATH", "/tmp/test.db"),
         ]);
 
@@ -437,22 +421,7 @@ mod tests {
         assert_eq!(config.mc_max_new_per_tick, 1);
         assert_eq!(config.mc_max_answer_fraction, 0.5);
         assert_eq!(config.rate_limit_per_min, 400);
-        assert!(!config.manifold_ws_enabled, "0 disables the websocket path");
         assert_eq!(config.db_path, PathBuf::from("/tmp/test.db"));
-    }
-
-    #[test]
-    fn parses_the_websocket_flag_in_both_spellings() {
-        for (raw, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-            let mut vars = required_vars();
-            vars.push(("MANIFOLD_WS_ENABLED", raw));
-
-            let config = config_from(&vars).expect("config should load");
-            assert_eq!(
-                config.manifold_ws_enabled, expected,
-                "MANIFOLD_WS_ENABLED={raw}"
-            );
-        }
     }
 
     #[test]
