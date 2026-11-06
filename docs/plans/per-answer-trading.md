@@ -326,37 +326,67 @@ changes, before the canary.
 
 ## 10. Phasing and gates
 
-### Phase 0 — Probe the live API (no code, no mana)
+### Phase 0 — Probe the live API (no code, no mana) — **DONE 2026-11-06**
 
-Checklist:
+Results:
 
-1. `GET /v0/market/{id}` includes `probability` for every answer on both
-   mechanisms (already seen for `hEpuZQpgR2` and `thlctZn5PU`).
-2. `GET /v0/market/{id}/positions?userId=...` returns one row per answer with
-   `answerId`, and does not cap at a default limit for 53 answers.
-3. `POST /v0/bet` with `"dryRun": true` returns a filled `Bet` with
-   `answerId`, and creates no position.
-4. Whether a real single-answer YES bet on a `cpmm-multi-1` market creates
-   synthetic NO legs on the bot's account. If yes, keep the YES-only design
-   and exempt non-decided legs from exits.
-5. Whether `/v0/market/{id}/prob` agrees with `answers[].probability`.
+1. **Snapshot prices.** `GET /v0/market/{id}` includes `probability` for every
+   answer on both mechanisms: 53/53 on MEGA (`cpmm-multi-2`) and 7/7 on Israel
+   (`cpmm-multi-1`). **23 of the 53 MEGA answers are exactly `0` or `1`**, so
+   price clamping and skipping near-certain answers are mandatory, not
+   defensive.
+2. **`/prob` agreement.** `GET /v0/market/{id}/prob` matches
+   `answers[].probability` exactly on every Israel answer, so the snapshot is a
+   sufficient price source and `/prob` is a safe fallback.
+3. **Positions shape.** `GET /v0/market/{id}/positions?userId=...` returns one
+   **root** summary row (`answerId: null`) plus one row per answer the user has
+   ever bet on, including rows with zero shares and zero invested. `top` and
+   `bottom` do not change the per-user response. Verified on two markets and
+   three users: root `invested`, `YES`, and `NO` exactly equal the sum of the
+   answer rows. That makes the checksum in `MarketPositions::checksum_ok` a
+   reliable truncation detector.
+4. **Dry run works.** `POST /v0/bet` with `"dryRun": true` returns
+   `betId: "dry-run"`, `id: null`, `isFilled: true`, real simulated `shares`,
+   `probBefore`/`probAfter`, and it creates **no position**. YES and NO both
+   work with `answerId` on both mechanisms. One code change is required before
+   dry-run can be used: `BetResult.id` is a `String` and serde rejects `null`;
+   it must become `Option<String>` (or accept null as empty).
+5. **Bot account.** `/v0/me` resolves; balance at probe time `715.48` mana.
+6. **Synthetic hedge legs (still open).** A real single-answer YES bet on the
+   sum-to-one Israel market was *not* placed. Whether Manifold creates NO legs
+   for the account remains unproven. The YES-only design for sum-to-one markets
+   stays until the Phase 3 canary answers it.
 
-Gate: findings recorded in this plan; no code started until 1, 2, 3 and 5 pass.
+Gate: passed. No mana spent.
 
-### Phase 1 — Read-only answer sync (no trading)
+### Phase 1 — Read-only answer sync (no trading) — **DONE 2026-11-06**
 
-- Migration, types, snapshot answers, `answer_positions`, MCQ `sync_market`,
-  aggregate invariants, `/status` display.
-- Fix the root-position wipe for MCQ.
-- Tests: parsing, grouping, column-scoped updates, aggregate invariant.
+Shipped:
 
-Gate: 24 hours of ticks with answer prices tracking Manifold, zero rows
-clobbered, `invested` still `0`, invariants clean in the log.
+- Migration 005 (`outcome_type`, `should_answers_sum_to_one`, per-answer
+  `invested_mana`, answer index).
+- `MarketSnapshot` answers and `MarketPositions` parsing with the root checksum.
+- `TradeExecutor::sync_market` MCQ branch: new-answer discovery, price-only
+  updates, per-answer reconciliation, aggregate budget invariant.
+- Shared sell accounting (`settle_sell`) used by binary and per-answer paths.
+- MCQ liquidation so `/untrack` cannot silently report `NoPosition` while
+  answer shares exist.
+- `/status` shows answer count in the overview and the top answer lines for one
+  market.
+- The root-position wipe is gone; MCQ never reconciles the root contract.
+- `evaluate_market` intentionally returns `Ok(None)` for MCQ until the planner
+  lands.
+
+Gate: 24 hours of ticks with answer prices tracking Manifold, zero clobbered
+belief rows, invested still `0`, invariants clean. **Requires a restart onto the
+new binary.**
+
 
 ### Phase 2 — Decision layer, dry-run only
 
 - `AnswerView`, `plan_actions`, normalization, caps, exits.
 - `evaluate_market` MCQ branch; execution behind `TRADING_DRY_RUN`.
+- `BetResult` accepts a null `id` so the dry-run response parses.
 - Refactor `ManifoldClient` behind an `async_trait ManifoldApi` so the executor
   can be driven by a fake in tests (the crate already depends on `async-trait`).
 - Log every planned action with `answer`, `edge`, `size`, `reason`.
