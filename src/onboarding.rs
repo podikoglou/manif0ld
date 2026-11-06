@@ -93,6 +93,13 @@ modifier    = "+" | "~" | "*" ;
    "donald" "trump", or use a single distinctive token ("trump").
 2. A case-sensitive `!` literal containing uppercase letters ("SEC"!) fails
    to compile: patterns are scanned on the case-folded stream. Drop `!`.
+3. A program may use at most 64 distinct atom groups. One atom group is a
+   parenthesised alternation of literals and macros, or a single bare
+   literal. `(("a" | "b") &..8 ("c" | "d"))` is 2 groups, so 32 arms of that
+   shape is the ceiling and arm 33 fails to compile. Identical groups are
+   shared, including reordered or repeated alternatives, so define a
+   `@macro` once and reference it instead of respelling the same group. When
+   you run out, widen existing groups instead of adding new arms.
 
 ### 6. WRITING RULES THAT DO NOT MISFIRE
 1. `&..N` and `..N` bind TIGHTER than `|`. Parenthesize the group a window
