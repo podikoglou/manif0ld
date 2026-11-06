@@ -1,17 +1,17 @@
-//! Discord control plane: slash commands, autocomplete, and event embeds.
+//! Discord adapter for the operator control plane: slash commands,
+//! autocomplete, and event embeds.
 //!
-//! The bot is a thin rendering and control layer. It never performs trading or
-//! triage itself: commands call into [`OnboardingService`], the database, the
-//! market cache, and [`TradeExecutor`], while background consumers render
-//! [`PipelineEvent`] and [`TradeEvent`] messages into Discord threads.
+//! The bot is a thin rendering layer. It never performs trading, triage, or a
+//! lifecycle transition itself: every mutating command calls one
+//! [`ControlPlane`] method and renders the report it returns, while `/status`,
+//! autocomplete, and the background consumers read the store, the database, and
+//! the pipeline directly.
 //!
 //! # Scope
 //!
-//! This module implements the full control plane: the seven slash commands
-//! (`/track`, `/untrack`, `/budget`, `/status`, `/override`, `/panic`),
-//! the Pause / Liquidate action buttons on the ONBOARDED embed, autocomplete,
-//! and the signal/trade/error consumers. [`status`] and the consumers were the
-//! foundation; everything else here is the mutating half of the plane.
+//! Six slash commands (`/track`, `/untrack`, `/budget`, `/status`, `/override`,
+//! `/panic`), the Pause / Liquidate action buttons on the ONBOARDED embed,
+//! autocomplete, and the signal/trade/error consumers.
 //!
 //! # Authorization
 //!
