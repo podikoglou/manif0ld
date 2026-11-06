@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use crate::error::{anyhow, bail, AppResult, Context};
 
 const DEFAULT_JETSTREAM_URL: &str = "wss://jetstream2.us-east.bsky.network/subscribe";
-const DEFAULT_DB_PATH: &str = "./data/arb.db";
+const DEFAULT_DB_PATH: &str = "./data/manif0ld.db";
 const DEFAULT_MARKET_BUDGET: f64 = 100.0;
 const DEFAULT_KELLY_FRACTION: f64 = 0.25;
 const DEFAULT_ENTRY_EDGE_THRESHOLD: f64 = 0.05;
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(config.belief_kappa, 1.1);
         assert_eq!(config.belief_halflife_hours, 4.0);
         assert_eq!(config.triage_min_evidence, 0.7);
-        assert_eq!(config.db_path, PathBuf::from("./data/arb.db"));
+        assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
     #[test]
