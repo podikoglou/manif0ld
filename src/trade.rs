@@ -32,6 +32,7 @@
 //! The API key is stored in [`ManifoldClient`] and sent in the `Authorization`
 //! header. It never appears in an error, a log line, or the `Debug` output.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,8 +50,8 @@ use crate::db::Db;
 use crate::error::{bail, AppResult, Context};
 use crate::pipeline::{MarketCache, PipelineEvent};
 use crate::types::{
-    available_budget, MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision,
-    TradeRecord,
+    available_budget, MarketId, MarketStatus, TrackedAnswer, TrackedMarket, TradeAction,
+    TradeDecision, TradeRecord,
 };
 
 /// Public Manifold API base URL.
@@ -192,6 +193,20 @@ impl ManifoldClient {
         let request = self.http.get(self.url(&path));
         let value: Value = self.send(request, "GET /v0/market/{id}/positions").await?;
         Ok(parse_position(&value, &self.bot_user_id))
+    }
+
+    /// Fetches the root summary and every per-answer position in one request.
+    ///
+    /// Use this for multiple choice markets. [`MarketPositions::checksum_ok`]
+    /// tells the caller whether the response was complete.
+    pub async fn positions(&self, market_id: &str) -> AppResult<MarketPositions> {
+        let path = format!(
+            "/v0/market/{}/positions?userId={}",
+            market_id, self.bot_user_id
+        );
+        let request = self.http.get(self.url(&path));
+        let value: Value = self.send(request, "GET /v0/market/{id}/positions").await?;
+        Ok(parse_market_positions(&value, &self.bot_user_id))
     }
 
     /// Buys `amount` mana of `outcome` shares at the best available price.
@@ -351,12 +366,14 @@ fn validate_outcome(outcome: &str) -> AppResult<&str> {
 pub struct MarketSnapshot {
     pub id: String,
     pub question: String,
-    /// `None` on non-BINARY markets (e.g. `MULTIPLE_CHOICE`). Tracked markets
-    /// are always BINARY, but the field is optional for API robustness.
+    /// `None` on non-BINARY markets (e.g. `MULTIPLE_CHOICE`).
     #[serde(default)]
     pub probability: Option<f64>,
     #[serde(rename = "outcomeType")]
     pub outcome_type: String,
+    /// True when exactly one answer can win and answer prices sum to one.
+    #[serde(rename = "shouldAnswersSumToOne", default)]
+    pub should_answers_sum_to_one: bool,
     #[serde(rename = "isResolved")]
     pub is_resolved: bool,
     #[serde(rename = "closeTime")]
@@ -512,12 +529,105 @@ pub(crate) fn parse_answer_position(
         return PositionSnapshot::default();
     };
 
+    position_from_entry(entry)
+}
+
+/// One row of a `ContractMetric` as a [`PositionSnapshot`].
+fn position_from_entry(entry: &Value) -> PositionSnapshot {
     PositionSnapshot {
         yes_shares: number_at(entry.pointer("/totalShares/YES")),
         no_shares: number_at(entry.pointer("/totalShares/NO")),
         invested: number_at(entry.get("invested")),
         profit: number_at(entry.get("profit")),
     }
+}
+
+/// Every position the bot holds in one market, split by answer.
+///
+/// Manifold returns one root summary row (`answerId` null) plus one row per
+/// answer the user has ever bet on. The root row is not a position of its own:
+/// its totals equal the sum of the answer rows. A mismatch means the response
+/// was truncated, which [`MarketPositions::checksum_ok`] reports.
+#[derive(Debug, Clone, Default)]
+pub struct MarketPositions {
+    /// The market-level summary row. Zero when Manifold returned no rows.
+    pub root: PositionSnapshot,
+    /// Positions keyed by answer ID, for multiple choice markets.
+    pub answers: HashMap<String, PositionSnapshot>,
+    /// Whether the response included a root summary row.
+    pub saw_root: bool,
+}
+
+impl MarketPositions {
+    /// The position for one answer, or a zero position when never traded.
+    pub fn answer(&self, answer_id: &str) -> PositionSnapshot {
+        self.answers.get(answer_id).cloned().unwrap_or_default()
+    }
+
+    /// Sum of every per-answer row.
+    pub fn totals(&self) -> PositionSnapshot {
+        self.answers.values().fold(PositionSnapshot::default(), |mut sum, row| {
+            sum.yes_shares += row.yes_shares;
+            sum.no_shares += row.no_shares;
+            sum.invested += row.invested;
+            sum.profit += row.profit;
+            sum
+        })
+    }
+
+    /// Whether the root summary still equals the sum of the answer rows.
+    ///
+    /// A response without a root row (no positions at all) is consistent.
+    pub fn checksum_ok(&self) -> bool {
+        if !self.saw_root {
+            return true;
+        }
+        let totals = self.totals();
+        (self.root.yes_shares - totals.yes_shares).abs() <= POSITION_EPSILON
+            && (self.root.no_shares - totals.no_shares).abs() <= POSITION_EPSILON
+            && (self.root.invested - totals.invested).abs() <= POSITION_EPSILON
+    }
+}
+
+/// Parses `GET /v0/market/{id}/positions` into root and per-answer positions.
+///
+/// Entries for other users are ignored. When the payload carries no `userId`
+/// at all (a test fixture), every entry is accepted.
+pub(crate) fn parse_market_positions(value: &Value, bot_user_id: &str) -> MarketPositions {
+    let entries: &[Value] = match value {
+        Value::Array(items) => items.as_slice(),
+        Value::Object(map) => map
+            .get("positions")
+            .and_then(Value::as_array)
+            .map(|items| items.as_slice())
+            .unwrap_or(&[]),
+        _ => &[],
+    };
+
+    let has_user_ids = entries.iter().any(|entry| entry.get("userId").is_some());
+    let mut positions = MarketPositions::default();
+
+    for entry in entries {
+        let user_matches = entry.get("userId").and_then(Value::as_str) == Some(bot_user_id);
+        if has_user_ids && !user_matches {
+            continue;
+        }
+
+        match entry.get("answerId").and_then(Value::as_str) {
+            Some(answer_id) => {
+                positions
+                    .answers
+                    .entry(answer_id.to_owned())
+                    .or_insert_with(|| position_from_entry(entry));
+            }
+            None => {
+                positions.root = position_from_entry(entry);
+                positions.saw_root = true;
+            }
+        }
+    }
+
+    positions
 }
 
 /// Reads a JSON number, defaulting to zero for missing or non-numeric fields.
@@ -728,6 +838,84 @@ pub fn decide_trade_for_answer(
 // Position accounting
 // -----------------------------------------------------------------------------
 
+/// Mutable position fields shared by a market and one of its answers.
+///
+/// Keeping the accounting in one place is what makes binary and per-answer
+/// positions behave identically: only the owner of the fields differs.
+struct PositionFields<'a> {
+    yes: &'a mut f64,
+    no: &'a mut f64,
+    invested: &'a mut f64,
+}
+
+/// Records a filled buy on any position.
+fn apply_buy_at(
+    position: PositionFields<'_>,
+    action: TradeAction,
+    cost: f64,
+    shares: f64,
+) -> AppResult<()> {
+    match action {
+        TradeAction::BuyYes => *position.yes += shares,
+        TradeAction::BuyNo => *position.no += shares,
+        other => bail!("apply_buy called with non-buy action {other}"),
+    }
+    *position.invested += cost;
+    Ok(())
+}
+
+/// What one sell did to a position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SellSettlement {
+    /// Shares actually sold, clamped to the held amount.
+    sold: f64,
+    /// Cost basis released by the sale.
+    basis: f64,
+    /// Proceeds minus basis.
+    realized: f64,
+}
+
+/// Records a filled sell on any position and returns the settlement.
+///
+/// The cost basis is proportional: with `sold` of `held` shares sold,
+/// `basis = invested * sold / held`. Every value is clamped at zero so rounding
+/// can never produce a negative position.
+fn settle_sell(
+    position: PositionFields<'_>,
+    action: TradeAction,
+    shares_sold: f64,
+    proceeds: f64,
+) -> AppResult<SellSettlement> {
+    let held = match action {
+        TradeAction::SellYes => *position.yes,
+        TradeAction::SellNo => *position.no,
+        other => bail!("apply_sell called with non-sell action {other}"),
+    };
+
+    if !shares_sold.is_finite() || shares_sold <= 0.0 {
+        bail!("sell must dispose of a positive finite share count, got {shares_sold}");
+    }
+    if held <= 0.0 {
+        bail!("cannot {action}: the position holds no shares on that side");
+    }
+
+    let sold = shares_sold.min(held);
+    let basis = (*position.invested * sold / held).max(0.0);
+    let realized = proceeds - basis;
+
+    *position.invested = (*position.invested - basis).max(0.0);
+    match action {
+        TradeAction::SellYes => *position.yes = (held - sold).max(0.0),
+        _ => *position.no = (held - sold).max(0.0),
+    }
+
+    Ok(SellSettlement {
+        sold,
+        basis,
+        realized,
+    })
+}
+
 /// Records a filled buy on the local market snapshot.
 ///
 /// Adds the mana actually paid (fees included) to `invested_mana` and the
@@ -739,22 +927,22 @@ pub fn apply_buy(
     cost: f64,
     shares: f64,
 ) -> AppResult<()> {
-    match action {
-        TradeAction::BuyYes => market.yes_shares += shares,
-        TradeAction::BuyNo => market.no_shares += shares,
-        other => bail!("apply_buy called with non-buy action {other}"),
-    }
-    market.invested_mana += cost;
-    Ok(())
+    apply_buy_at(
+        PositionFields {
+            yes: &mut market.yes_shares,
+            no: &mut market.no_shares,
+            invested: &mut market.invested_mana,
+        },
+        action,
+        cost,
+        shares,
+    )
 }
 
 /// Records a filled sell on the local market snapshot.
 ///
-/// The cost basis is proportional: with `sold` of `held` shares sold,
-/// `basis = invested * sold / held`. Realized PnL grows by `proceeds - basis`,
-/// `invested_mana` shrinks by `basis`, and the matching share count falls by
-/// `sold`. Every value is clamped at zero so rounding can never produce a
-/// negative position.
+/// `realized_pnl_mana` grows by `proceeds - basis`, `invested_mana` shrinks by
+/// `basis`, and the matching share count falls by the sold amount.
 ///
 /// Rejects buy actions and rejects a sell when the market holds no shares of
 /// that side, which indicates a decision bug rather than a market condition.
@@ -764,28 +952,17 @@ pub fn apply_sell(
     shares_sold: f64,
     proceeds: f64,
 ) -> AppResult<()> {
-    let held = match action {
-        TradeAction::SellYes => market.yes_shares,
-        TradeAction::SellNo => market.no_shares,
-        other => bail!("apply_sell called with non-sell action {other}"),
-    };
-
-    if !shares_sold.is_finite() || shares_sold <= 0.0 {
-        bail!("sell must dispose of a positive finite share count, got {shares_sold}");
-    }
-    if held <= 0.0 {
-        bail!("cannot {action}: the market holds no shares on that side");
-    }
-
-    let sold = shares_sold.min(held);
-    let basis = (market.invested_mana * sold / held).max(0.0);
-
-    market.realized_pnl_mana += proceeds - basis;
-    market.invested_mana = (market.invested_mana - basis).max(0.0);
-    match action {
-        TradeAction::SellYes => market.yes_shares = (held - sold).max(0.0),
-        _ => market.no_shares = (held - sold).max(0.0),
-    }
+    let settlement = settle_sell(
+        PositionFields {
+            yes: &mut market.yes_shares,
+            no: &mut market.no_shares,
+            invested: &mut market.invested_mana,
+        },
+        action,
+        shares_sold,
+        proceeds,
+    )?;
+    market.realized_pnl_mana += settlement.realized;
     Ok(())
 }
 
@@ -944,6 +1121,18 @@ impl TradeExecutor {
             return Ok(None);
         }
 
+        self.refresh_market_kind(&mut market, &snapshot)?;
+        if market.is_multiple_choice() {
+            // Phase 1 of the per-answer trading plan is read-only: the sync
+            // ticker keeps prices and positions current, and no decision is
+            // made until the planner is wired in.
+            tracing::debug!(
+                market_id = %market_id,
+                "multiple-choice trading is not enabled yet"
+            );
+            return Ok(None);
+        }
+
         let p_market = snapshot
             .probability
             .unwrap_or(market.p_market_last)
@@ -1011,6 +1200,176 @@ impl TradeExecutor {
         Ok(Some(record))
     }
 
+    /// Refreshes the stored outcome type and sum-to-one flag from Manifold.
+    ///
+    /// Rows created before migration 005 default to `BINARY`, so this runs on
+    /// every sync and reports a change once.
+    fn refresh_market_kind(
+        &self,
+        market: &mut TrackedMarket,
+        snapshot: &MarketSnapshot,
+    ) -> AppResult<()> {
+        if market.outcome_type == snapshot.outcome_type
+            && market.should_answers_sum_to_one == snapshot.should_answers_sum_to_one
+        {
+            return Ok(());
+        }
+
+        self.db.update_market_kind(
+            &market.id,
+            &snapshot.outcome_type,
+            snapshot.should_answers_sum_to_one,
+        )?;
+        tracing::info!(
+            market_id = %market.id,
+            previous_outcome_type = %market.outcome_type,
+            outcome_type = %snapshot.outcome_type,
+            should_answers_sum_to_one = snapshot.should_answers_sum_to_one,
+            "market kind updated from Manifold"
+        );
+        market.outcome_type = snapshot.outcome_type.clone();
+        market.should_answers_sum_to_one = snapshot.should_answers_sum_to_one;
+        Ok(())
+    }
+
+    /// Refreshes local answer rows from a market snapshot.
+    ///
+    /// New answers (an `addAnswersMode = ANYONE` market can grow) are inserted
+    /// with their belief anchored at the current price. Existing answers get a
+    /// price refresh only: belief columns belong to triage and must not be
+    /// overwritten by a sync.
+    fn sync_answers(
+        &self,
+        market: &TrackedMarket,
+        snapshot: &MarketSnapshot,
+        now: i64,
+    ) -> AppResult<Vec<TrackedAnswer>> {
+        let mut answers = self.db.list_answers(&market.id)?;
+
+        for remote in snapshot.answers.as_deref().unwrap_or(&[]) {
+            let price = remote
+                .probability
+                .unwrap_or(0.5)
+                .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
+
+            match answers.iter_mut().find(|answer| answer.id == remote.id) {
+                Some(answer) => {
+                    if !remote.text.trim().is_empty() && answer.text != remote.text {
+                        self.db
+                            .update_answer_text(&market.id, &answer.id, &remote.text)?;
+                        answer.text = remote.text.clone();
+                    }
+                    if (answer.p_market_last - price).abs() > POSITION_EPSILON {
+                        self.db
+                            .update_answer_market_price(&market.id, &answer.id, price)?;
+                        answer.p_market_last = price;
+                    }
+                }
+                None => {
+                    let answer = TrackedAnswer {
+                        id: remote.id.clone(),
+                        market_id: market.id.clone(),
+                        text: remote.text.clone(),
+                        p_internal_log_odds: belief::logit(price),
+                        p_market_last: price,
+                        belief_updated_at: now,
+                        yes_shares: 0.0,
+                        no_shares: 0.0,
+                        created_at: now,
+                        invested_mana: 0.0,
+                    };
+                    if self.db.insert_answer_if_missing(&answer)? {
+                        tracing::info!(
+                            market_id = %market.id,
+                            answer_id = %answer.id,
+                            answer = %answer.text,
+                            "discovered a new multiple-choice answer"
+                        );
+                        answers.push(answer);
+                    }
+                }
+            }
+        }
+
+        answers.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(answers)
+    }
+
+    /// Matches local answer positions to Manifold and refreshes the aggregate.
+    ///
+    /// Manifold is the truth for shares and cost basis. For a multiple-choice
+    /// market the root row is only a checksum: the budget lives in
+    /// `tracked_markets.invested_mana`, which becomes the sum of the answers.
+    fn reconcile_answers(
+        &self,
+        market: &mut TrackedMarket,
+        answers: &mut [TrackedAnswer],
+        positions: &MarketPositions,
+    ) -> AppResult<()> {
+        if !positions.checksum_ok() {
+            let totals = positions.totals();
+            tracing::warn!(
+                market_id = %market.id,
+                root_invested = positions.root.invested,
+                answer_invested = totals.invested,
+                root_yes_shares = positions.root.yes_shares,
+                answer_yes_shares = totals.yes_shares,
+                root_no_shares = positions.root.no_shares,
+                answer_no_shares = totals.no_shares,
+                "per-answer positions do not add up to the root summary; trusting the answer rows"
+            );
+        }
+
+        let mut invested = 0.0;
+        let mut yes_shares = 0.0;
+        let mut no_shares = 0.0;
+
+        for answer in answers.iter_mut() {
+            let remote = positions.answer(&answer.id);
+            if (answer.yes_shares - remote.yes_shares).abs() > POSITION_EPSILON
+                || (answer.no_shares - remote.no_shares).abs() > POSITION_EPSILON
+                || (answer.invested_mana - remote.invested).abs() > POSITION_EPSILON
+            {
+                tracing::warn!(
+                    market_id = %market.id,
+                    answer_id = %answer.id,
+                    local_yes_shares = answer.yes_shares,
+                    remote_yes_shares = remote.yes_shares,
+                    local_no_shares = answer.no_shares,
+                    remote_no_shares = remote.no_shares,
+                    local_invested = answer.invested_mana,
+                    remote_invested = remote.invested,
+                    "local answer position differs from Manifold; trusting Manifold"
+                );
+            }
+
+            answer.yes_shares = remote.yes_shares.max(0.0);
+            answer.no_shares = remote.no_shares.max(0.0);
+            answer.invested_mana = remote.invested.max(0.0);
+
+            self.db.update_answer_position(
+                &market.id,
+                &answer.id,
+                answer.yes_shares,
+                answer.no_shares,
+                answer.invested_mana,
+            )?;
+
+            invested += answer.invested_mana;
+            yes_shares += answer.yes_shares;
+            no_shares += answer.no_shares;
+        }
+
+        market.invested_mana = invested;
+        market.yes_shares = yes_shares;
+        market.no_shares = no_shares;
+        Ok(())
+    }
+
     /// Reconciles one market with Manifold without trading.
     ///
     /// Updates `p_market_last`, shares, and invested mana from the remote
@@ -1028,6 +1387,27 @@ impl TradeExecutor {
             .market(market_id)
             .await
             .with_context(|| format!("fetching Manifold market {market_id}"))?;
+        self.refresh_market_kind(&mut market, &snapshot)?;
+
+        if market.is_multiple_choice() {
+            let now = Utc::now().timestamp();
+            let mut answers = self.sync_answers(&market, &snapshot, now)?;
+            let positions = self
+                .client
+                .positions(market_id)
+                .await
+                .with_context(|| format!("fetching the Manifold positions for {market_id}"))?;
+            self.reconcile_answers(&mut market, &mut answers, &positions)?;
+            self.persist_market(&market)?;
+            tracing::debug!(
+                market_id = %market_id,
+                answers = answers.len(),
+                invested = market.invested_mana,
+                "synced multiple-choice answers"
+            );
+            return Ok(market);
+        }
+
         let position = self
             .client
             .position(market_id)
@@ -1092,6 +1472,11 @@ impl TradeExecutor {
             .market(market_id)
             .await
             .with_context(|| format!("fetching Manifold market {market_id} for liquidation"))?;
+        self.refresh_market_kind(&mut market, &snapshot)?;
+        if market.is_multiple_choice() {
+            return self.liquidate_answers(&mut market, &snapshot).await;
+        }
+
         let position = self
             .client
             .position(market_id)
@@ -1144,6 +1529,124 @@ impl TradeExecutor {
         }
 
         Ok(LiquidationOutcome::Sold)
+    }
+
+    /// Sells every answer position in a multiple-choice market.
+    ///
+    /// The same idempotence rules as the binary path apply: remote positions are
+    /// fetched first, a resolved market is left alone, and each side is recorded
+    /// and persisted before the next is attempted.
+    async fn liquidate_answers(
+        &self,
+        market: &mut TrackedMarket,
+        snapshot: &MarketSnapshot,
+    ) -> AppResult<LiquidationOutcome> {
+        let market_id = market.id.clone();
+        let positions = self
+            .client
+            .positions(&market_id)
+            .await
+            .with_context(|| format!("fetching the Manifold positions for {market_id}"))?;
+        let mut answers = self.db.list_answers(&market_id)?;
+        self.reconcile_answers(market, &mut answers, &positions)?;
+        self.persist_market(market)?;
+
+        if snapshot.is_resolved {
+            tracing::info!(
+                market_id = %market_id,
+                "market is resolved on Manifold; answer positions settle automatically"
+            );
+            return Ok(LiquidationOutcome::AlreadyResolved);
+        }
+
+        let now = Utc::now().timestamp();
+        let mut sold = false;
+
+        for answer in &mut answers {
+            let remote = positions.answer(&answer.id);
+            for (action, held) in liquidation_sides(remote.yes_shares, remote.no_shares, false) {
+                let p_market = answer
+                    .p_market_last
+                    .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
+                let p_internal = belief::current_p_internal(
+                    answer.p_internal_log_odds,
+                    answer.belief_updated_at,
+                    p_market,
+                    now,
+                    self.halflife_hours,
+                );
+
+                let result = self
+                    .client
+                    .sell(&market_id, action.outcome(), held, Some(&answer.id))
+                    .await
+                    .with_context(|| {
+                        format!("selling {action} on answer {} of {market_id}", answer.id)
+                    })?;
+                ensure_filled(&result, &market_id)?;
+
+                let requested = if result.shares.is_finite() && result.shares.abs() > 0.0 {
+                    result.shares.abs()
+                } else {
+                    held
+                };
+                let proceeds = result.net_proceeds();
+                let settlement = settle_sell(
+                    PositionFields {
+                        yes: &mut answer.yes_shares,
+                        no: &mut answer.no_shares,
+                        invested: &mut answer.invested_mana,
+                    },
+                    action,
+                    requested,
+                    proceeds,
+                )?;
+
+                market.realized_pnl_mana += settlement.realized;
+                market.invested_mana = (market.invested_mana - settlement.basis).max(0.0);
+                match action {
+                    TradeAction::SellYes => {
+                        market.yes_shares = (market.yes_shares - settlement.sold).max(0.0)
+                    }
+                    _ => market.no_shares = (market.no_shares - settlement.sold).max(0.0),
+                }
+
+                self.db.update_answer_position(
+                    &market_id,
+                    &answer.id,
+                    answer.yes_shares,
+                    answer.no_shares,
+                    answer.invested_mana,
+                )?;
+
+                let record = TradeRecord {
+                    id: 0,
+                    market_id: market_id.clone(),
+                    answer_id: Some(answer.id.clone()),
+                    action,
+                    mana_amount: proceeds,
+                    shares_delta: -settlement.sold,
+                    p_internal,
+                    p_market,
+                    trigger_post_uri: None,
+                    manifold_bet_id: optional_id(result.bet_id()),
+                    created_at: now,
+                };
+                let id = self.db.insert_trade(&record)?;
+                let record = TradeRecord { id, ..record };
+
+                self.persist_market(market)?;
+                self.emit_trade(market, &record);
+                sold = true;
+            }
+        }
+
+        if sold {
+            Ok(LiquidationOutcome::Sold)
+        } else {
+            tracing::info!(market_id = %market_id, "no answer shares to liquidate");
+            Ok(LiquidationOutcome::NoPosition)
+        }
     }
 
     /// Liquidates every market that is not already closed.
@@ -1993,6 +2496,81 @@ mod tests {
         });
         let position = parse_position(&raw, "bot-1");
         assert_close(position.yes_shares, 5.0);
+    }
+
+    #[test]
+    fn market_positions_split_the_root_row_from_the_answers() {
+        let raw = json!([
+            {
+                "userId": "bot-1",
+                "answerId": null,
+                "totalShares": {"YES": 10.0, "NO": 7.0},
+                "invested": 11.0
+            },
+            {"userId": "bot-1", "answerId": "ans-a", "totalShares": {"YES": 10.0}, "invested": 6.0},
+            {"userId": "bot-1", "answerId": "ans-b", "totalShares": {"NO": 7.0}, "invested": 5.0},
+            {"userId": "other", "answerId": "ans-a", "totalShares": {"YES": 99.0}, "invested": 50.0}
+        ]);
+
+        let positions = parse_market_positions(&raw, "bot-1");
+
+        assert!(positions.saw_root);
+        assert!(positions.checksum_ok());
+        assert_eq!(positions.answers.len(), 2);
+        assert_close(positions.answer("ans-a").yes_shares, 10.0);
+        assert_close(positions.answer("ans-b").no_shares, 7.0);
+        assert_close(positions.totals().invested, 11.0);
+        assert_close(positions.answer("missing").invested, 0.0);
+    }
+
+    #[test]
+    fn market_positions_checksum_detects_a_truncated_response() {
+        let raw = json!([
+            {"userId": "bot-1", "totalShares": {"YES": 18.0}, "invested": 11.0},
+            {"userId": "bot-1", "answerId": "ans-a", "totalShares": {"YES": 10.0}, "invested": 6.0}
+        ]);
+
+        let positions = parse_market_positions(&raw, "bot-1");
+
+        assert!(positions.saw_root);
+        assert!(!positions.checksum_ok());
+    }
+
+    #[test]
+    fn market_positions_without_a_root_row_are_consistent() {
+        let raw = json!([
+            {"userId": "bot-1", "answerId": "ans-a", "totalShares": {"YES": 10.0}, "invested": 6.0}
+        ]);
+
+        let positions = parse_market_positions(&raw, "bot-1");
+
+        assert!(!positions.saw_root);
+        assert!(positions.checksum_ok());
+        assert_close(positions.totals().invested, 6.0);
+    }
+
+    #[test]
+    fn market_snapshot_reads_answers_and_the_sum_to_one_flag() {
+        let raw = json!({
+            "id": "mc-market",
+            "question": "Who wins?",
+            "outcomeType": "MULTIPLE_CHOICE",
+            "shouldAnswersSumToOne": true,
+            "isResolved": false,
+            "answers": [
+                {"id": "a1", "text": "Candidate A", "probability": 0.6},
+                {"id": "a2", "text": "Candidate B", "probability": 0.4}
+            ]
+        });
+
+        let snapshot: MarketSnapshot =
+            serde_json::from_value(raw).expect("MC snapshot should deserialize");
+
+        assert_eq!(snapshot.outcome_type, "MULTIPLE_CHOICE");
+        assert!(snapshot.should_answers_sum_to_one);
+        let answers = snapshot.answers.expect("answers are present");
+        assert_eq!(answers.len(), 2);
+        assert_close(answers[0].probability.expect("price"), 0.6);
     }
 
     #[test]

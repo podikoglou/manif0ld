@@ -1303,4 +1303,95 @@ mod tests {
         db.delete_answers_for_market("m1").expect("delete");
         assert!(db.list_answers("m1").expect("empty list").is_empty());
     }
+
+    fn answer_row(id: &str, text: &str) -> TrackedAnswer {
+        TrackedAnswer {
+            id: id.to_owned(),
+            market_id: "m1".to_owned(),
+            text: text.to_owned(),
+            p_internal_log_odds: 0.0,
+            p_market_last: 0.5,
+            belief_updated_at: 100,
+            yes_shares: 0.0,
+            no_shares: 0.0,
+            created_at: 100,
+            invested_mana: 0.0,
+        }
+    }
+
+    #[test]
+    fn answer_price_sync_leaves_belief_and_position_alone() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        db.insert_market(&sample_market("m1", 1)).expect("market");
+        db.upsert_answer(&answer_row("ans1", "Candidate A"))
+            .expect("answer");
+
+        db.update_answer_belief("m1", "ans1", 1.0, 0.73, 200)
+            .expect("belief");
+        db.update_answer_position("m1", "ans1", 12.0, 3.0, 9.5)
+            .expect("position");
+        db.update_answer_market_price("m1", "ans1", 0.61)
+            .expect("price");
+
+        let answer = db.get_answer("m1", "ans1").expect("get").expect("found");
+        assert_eq!(answer.p_market_last, 0.61);
+        assert_eq!(answer.p_internal_log_odds, 1.0);
+        assert_eq!(answer.belief_updated_at, 200);
+        assert_eq!(answer.yes_shares, 12.0);
+        assert_eq!(answer.no_shares, 3.0);
+        assert_eq!(answer.invested_mana, 9.5);
+    }
+
+    #[test]
+    fn insert_answer_if_missing_preserves_an_existing_row() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        db.insert_market(&sample_market("m1", 1)).expect("market");
+
+        let mut existing = answer_row("ans1", "Candidate A");
+        existing.p_internal_log_odds = 2.0;
+        existing.invested_mana = 4.0;
+        db.upsert_answer(&existing).expect("answer");
+
+        let mut replacement = answer_row("ans1", "Renamed");
+        replacement.p_internal_log_odds = -1.0;
+        replacement.invested_mana = 99.0;
+        assert!(
+            !db.insert_answer_if_missing(&replacement)
+                .expect("insert existing answer"),
+            "an existing answer must not be replaced"
+        );
+
+        let unchanged = db.get_answer("m1", "ans1").expect("get").expect("found");
+        assert_eq!(unchanged.text, "Candidate A");
+        assert_eq!(unchanged.p_internal_log_odds, 2.0);
+        assert_eq!(unchanged.invested_mana, 4.0);
+
+        assert!(
+            db.insert_answer_if_missing(&answer_row("ans2", "Candidate B"))
+                .expect("insert new answer"),
+            "a new answer must be inserted"
+        );
+        assert_eq!(db.list_answers("m1").expect("list").len(), 2);
+    }
+
+    #[test]
+    fn answer_position_update_leaves_belief_alone() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        db.insert_market(&sample_market("m1", 1)).expect("market");
+        db.upsert_answer(&answer_row("ans1", "Candidate A"))
+            .expect("answer");
+        db.update_answer_belief("m1", "ans1", 1.5, 0.8, 300)
+            .expect("belief");
+
+        db.update_answer_position("m1", "ans1", 20.0, 4.0, 12.5)
+            .expect("position");
+
+        let answer = db.get_answer("m1", "ans1").expect("get").expect("found");
+        assert_eq!(answer.yes_shares, 20.0);
+        assert_eq!(answer.no_shares, 4.0);
+        assert_eq!(answer.invested_mana, 12.5);
+        assert_eq!(answer.p_market_last, 0.8);
+        assert_eq!(answer.p_internal_log_odds, 1.5);
+        assert_eq!(answer.belief_updated_at, 300);
+    }
 }
