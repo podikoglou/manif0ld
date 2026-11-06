@@ -866,4 +866,146 @@ mod tests {
         assert_eq!(format_timestamp(None), "unknown");
         assert_eq!(format_timestamp(Some(0)), "1970-01-01T00:00:00+00:00");
     }
+
+    // -------------------------------------------------------------------
+    // Live calls. Run with `cargo test -- --ignored --nocapture`
+    // -------------------------------------------------------------------
+
+    /// Configuration with placeholder credentials, except the live OpenRouter
+    /// key, which the decisions client needs.
+    fn live_config() -> Config {
+        dotenvy::dotenv().ok();
+        // The decisions client reads OPENROUTER_API_KEY itself; fail early.
+        let _key = std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+            .expect("OPENROUTER_API_KEY must be set for the live probe");
+        Config {
+            jetstream_url: "wss://jetstream2.us-east.bsky.network/subscribe".to_owned(),
+            cloudflare_account_id: None,
+            triage_model: "openrouter-decisions/baseten/joey-1".to_owned(),
+            onboarding_model: "openrouter/anthropic/claude".to_owned(),
+            firecrawl_api_key: "fc-".to_owned(),
+            manifold_api_key: "m-".to_owned(),
+            discord_bot_token: "d-".to_owned(),
+            discord_guild_id: 1,
+            discord_control_channel_id: 1,
+            discord_operator_user_id: 1,
+            default_market_budget: 100.0,
+            kelly_fraction: 0.25,
+            entry_edge_threshold: 0.05,
+            exit_edge_threshold: 0.01,
+            min_trade_size: 1.0,
+            belief_kappa: 1.1,
+            belief_halflife_hours: 4.0,
+            triage_min_evidence: 0.7,
+            db_path: std::path::PathBuf::from("/tmp/opencode/arb-live.db"),
+        }
+    }
+
+    fn live_market(question: &str, criteria: &str) -> TrackedMarket {
+        TrackedMarket {
+            id: "live".into(),
+            slug: "live".into(),
+            market_url: String::new(),
+            question: question.into(),
+            description: String::new(),
+            resolution_criteria: criteria.into(),
+            close_time: None,
+            status: crate::types::MarketStatus::Active,
+            budget_mana: 100.0,
+            invested_mana: 0.0,
+            realized_pnl_mana: 0.0,
+            yes_shares: 0.0,
+            no_shares: 0.0,
+            p_internal_log_odds: 0.0,
+            p_market_last: 0.34,
+            belief_updated_at: 0,
+            sieve_source: String::new(),
+            discord_thread_id: String::new(),
+            created_at: 0,
+            deleted_at: None,
+        }
+    }
+
+    fn live_post(text: &str) -> ExtractedPost {
+        ExtractedPost {
+            uri: "at://live/app.bsky.feed.post/1".into(),
+            did: "did:plc:live".into(),
+            handle: "nasawatch.bsky.social".into(),
+            text: text.into(),
+            created_at: 1_770_000_000,
+        }
+    }
+
+    fn assert_assessment_sane(assessment: &TriageAssessment, label: &str) {
+        let outcome = &assessment.outcome;
+        println!(
+            "{label}: evidence {:.3} target {:.3} strength {:.2} priced {:.3} scale {:?}",
+            outcome.p_evidence,
+            outcome.p_target,
+            outcome.strength,
+            outcome.p_priced,
+            assessment.impulse_scale,
+        );
+        assert!(
+            (0.0..=1.0).contains(&outcome.p_evidence),
+            "p_evidence {}",
+            outcome.p_evidence
+        );
+        assert!(
+            (0.0..=1.0).contains(&outcome.p_target),
+            "p_target {}",
+            outcome.p_target
+        );
+        assert!(
+            (0.0..=1.0).contains(&outcome.p_priced),
+            "p_priced {}",
+            outcome.p_priced
+        );
+        assert!(
+            (0.0..=3.0).contains(&outcome.strength),
+            "strength {}",
+            outcome.strength
+        );
+    }
+
+    #[test]
+    #[ignore = "network call; needs OPENROUTER_API_KEY"]
+    fn evaluates_a_live_binary_market() {
+        let client = TriageClient::new(&live_config()).expect("client builds");
+        let market = live_market(
+            "Will the Artemis III crewed landing happen before 2028?",
+            "Resolves YES if NASA lands humans on the Moon before 2028-01-01.",
+        );
+        let post = live_post(
+            "NASA officially confirms Artemis III is slipping to 2028. \
+             The associate administrator said the lander will not be ready.",
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
+        let assessment = runtime.block_on(client.evaluate(&market, &[], &post, Some(48_210), 0.34));
+        assert_assessment_sane(&assessment.expect("live call"), "binary");
+    }
+
+    #[test]
+    #[ignore = "network call; needs OPENROUTER_API_KEY"]
+    fn evaluates_a_live_multiple_choice_market() {
+        let client = TriageClient::new(&live_config()).expect("client builds");
+        let market = live_market(
+            "When will the next Artemis crewed landing happen?",
+            "Resolves to the year NASA next lands humans on the Moon.",
+        );
+        let answers = [
+            tracked_answer("a1", "2028"),
+            tracked_answer("a2", "2029"),
+            tracked_answer("a3", "2030 or later"),
+        ];
+        let post = live_post(
+            "NASA officially confirms Artemis III is slipping to 2028. \
+             The associate administrator said the lander will not be ready.",
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
+        let assessment = runtime.block_on(client.evaluate(&market, &answers, &post, None, 0.34));
+        assert_assessment_sane(&assessment.expect("live call"), "multiple-choice");
+    }
 }
