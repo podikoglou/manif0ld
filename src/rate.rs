@@ -86,12 +86,14 @@ pub enum Priority {
     /// Manifold writes (bet, sell, cancel): always wins. May spend down to the
     /// trade floor and no further.
     Trade,
-    /// Slow reconciliation reads: yields when the bucket is at or below the
-    /// reserve. TODO(phase-2): wired by the reconcile swap.
-    #[allow(dead_code)]
+    /// Slow reconciliation reads: the batched price refresh and the portfolio
+    /// position snapshot in `TradeExecutor`'s 5-minute backstop. Yields when
+    /// the bucket is at or below the reserve so a trade burst can always get
+    /// through.
     Reconcile,
     /// Discovery sweeps: lowest class, same reserve behaviour as
-    /// [`Priority::Reconcile`]. TODO(phase-2): wired by the reconcile swap.
+    /// [`Priority::Reconcile`]. Reserved for the discovery sweeps of
+    /// `docs/ALGO.md` §2; no call site spends it yet.
     #[allow(dead_code)]
     Discovery,
 }

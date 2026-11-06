@@ -24,6 +24,7 @@ use crate::db::Db;
 use crate::discord::{self, DiscordState};
 use crate::error::{AppResult, Context};
 use crate::ingest;
+use crate::manifold_ws;
 use crate::market_store::MarketStore;
 use crate::onboarding::OnboardingService;
 use crate::pipeline::{Pipeline, PipelineEvent};
@@ -127,7 +128,8 @@ impl App {
         })
     }
 
-    /// Subscribes every broadcast receiver, then starts the six tasks.
+    /// Subscribes every broadcast receiver, then starts the long-running tasks
+    /// (six, plus the websocket client when `MANIFOLD_WS_ENABLED=1`).
     ///
     /// The two blocks are ordered on purpose and must stay in this function: see
     /// the module doc.
@@ -148,13 +150,16 @@ impl App {
         // Every receiver is created here, before the first task below. `broadcast`
         // keeps no history, so a subscription made after a producer starts would
         // silently miss the events it already published. Keep this block whole and
-        // keep its order.
+        // keep its order. The manifold event channel is an mpsc (never-drop),
+        // created here so the receiver exists before both the socket task and the
+        // trade executor are spawned.
         let mut pipeline_events = pipeline.events().subscribe();
         let trade_events = pipeline.events().subscribe();
         let discord_pipeline_events = pipeline.events().subscribe();
         let discord_trade_events = executor.events().subscribe();
         let post_tx = ingest::channel();
         let post_rx = post_tx.subscribe();
+        let (manifold_event_tx, manifold_event_rx) = manifold_ws::channel();
 
         let discord_state = DiscordState {
             config: Arc::clone(&config),
@@ -209,11 +214,28 @@ impl App {
         let trade_task = tokio::spawn({
             let executor = Arc::clone(&executor);
             async move {
-                if let Err(error) = executor.run(trade_events).await {
+                if let Err(error) = executor.run(trade_events, manifold_event_rx).await {
                     tracing::error!(error = %error, "trade executor stopped");
                 }
             }
         });
+
+        // The websocket client is part of the live-price path; the legacy
+        // polling loop (`MANIFOLD_WS_ENABLED=0`) runs without it and the
+        // unconsumed sender just drops.
+        let manifold_ws_task = if config.manifold_ws_enabled {
+            Some(tokio::spawn({
+                let config = (*config).clone();
+                async move {
+                    if let Err(error) = manifold_ws::run(config, manifold_event_tx).await {
+                        tracing::error!(error = %error, "manifold websocket stopped");
+                    }
+                }
+            }))
+        } else {
+            drop(manifold_event_tx);
+            None
+        };
 
         let ingest_task = tokio::spawn(async move {
             if let Err(error) = ingest::run((*config).clone(), post_tx).await {
@@ -248,11 +270,12 @@ impl App {
             ingest: ingest_task,
             discord: discord_task,
             event: event_task,
+            manifold_ws: manifold_ws_task,
         }
     }
 }
 
-/// The six long-running tasks this process owns.
+/// The long-running tasks this process owns.
 pub struct Tasks {
     pipeline: JoinHandle<()>,
     heartbeat: JoinHandle<()>,
@@ -260,6 +283,9 @@ pub struct Tasks {
     ingest: JoinHandle<()>,
     discord: JoinHandle<()>,
     event: JoinHandle<()>,
+    /// The websocket client task, absent while `MANIFOLD_WS_ENABLED=0` runs
+    /// the legacy polling loop.
+    manifold_ws: Option<JoinHandle<()>>,
 }
 
 impl Tasks {
@@ -279,6 +305,9 @@ impl Tasks {
         self.ingest.abort();
         self.event.abort();
         self.discord.abort();
+        if let Some(manifold_ws) = self.manifold_ws {
+            manifold_ws.abort();
+        }
 
         Ok(())
     }

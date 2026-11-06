@@ -13,19 +13,27 @@
 //! # Column ownership
 //!
 //! `Book` keeps the loaded [`TrackedMarket`] for identity, lifecycle,
-//! `budget_mana`, `realized_pnl_mana`, and the kind flags. Its **position and
-//! price columns are inputs only**: after [`Book::load`], nothing reads
-//! `market.yes_shares`, `market.no_shares`, `market.invested_mana`, or
-//! `market.p_market_last` again. The legs are the truth and [`Book::persist`]
-//! is the only writer of those columns. That rule is what stops a second source
-//! of truth from reappearing inside the book.
+//! `budget_mana`, `realized_pnl_mana`, and the kind flags. Its **position
+//! columns are inputs only**: after [`Book::load`], nothing reads
+//! `market.yes_shares`, `market.no_shares`, or `market.invested_mana` again.
+//! The legs are the truth and [`Book::persist`] is the only writer of those
+//! columns. That rule is what stops a second source of truth from reappearing
+//! inside the book.
+//!
+//! Price columns are deliberately more open: the book is one of three writers.
+//! The trade path (`Book::observe_prices`) writes prices from a REST snapshot;
+//! the live mirror (`MarketStore::market_prices_observed`, called from
+//! `trade.rs` for websocket events and the batched reconcile refresh) writes
+//! prices without touching any book; and [`Book::persist`]'s price write is a
+//! re-observation of the loaded legs evaluated here before it is persisted.
+//! Positions, invested, and PnL are never written by the mirror.
 //!
 //! | Fact | Owned by | Written by |
 //! |---|---|---|
 //! | `yes_shares`, `no_shares`, `invested_mana` per leg | [`Leg`] | [`Book::apply_buy`], [`Book::apply_sell`], [`Book::reconcile`] |
 //! | root `invested_mana`, `yes_shares`, `no_shares` | [`Book::aggregate`] | `MarketStore::record_position` via [`Book::persist`] |
 //! | `realized_pnl_mana` | `Book.market` | [`Book::apply_sell`] |
-//! | `p_market_last` | [`Leg`] | [`Book::observe_prices`] |
+//! | `p_market_last` | [`Leg`] | [`Book::observe_prices`]; `MarketStore::market_prices_observed` (ws mirror + reconcile, outside the book) |
 //! | answer rows' positions | [`Leg`] | [`Book::persist`] via `Db::update_answer_position` |
 //! | answer rows' belief and text | triage / [`Book::observe_prices`] text only | unchanged from today |
 //!
@@ -45,10 +53,10 @@ use std::collections::HashMap;
 use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
-use crate::error::{anyhow, bail, AppResult};
+use crate::error::{AppResult, anyhow, bail};
 use crate::market_store::MarketStore;
 use crate::types::{
-    available_budget, MarketStatus, TrackedAnswer, TrackedMarket, TradeAction, TradeDecision,
+    MarketStatus, TrackedAnswer, TrackedMarket, TradeAction, TradeDecision, available_budget,
 };
 
 /// Kelly fractions are capped at half of the available budget.
@@ -719,17 +727,21 @@ impl Book {
     /// Replaces leg positions from Manifold, warns on a mismatch, and (for the
     /// answers shape) checks the root summary against the answer totals.
     ///
-    /// Pure: no IO. [`Book::persist`] writes the result.
-    pub fn reconcile(&mut self, positions: &MarketPositions) {
+    /// Pure: no IO. [`Book::persist`] writes the result. Returns the number of
+    /// legs whose saved position differed from the remote one, so a reconcile
+    /// caller can summarize without re-implementing the comparison.
+    pub fn reconcile(&mut self, positions: &MarketPositions) -> usize {
         let market_id = self.market.id.clone();
+        let mut mismatches = 0;
 
         match self.shape {
             Shape::Binary => {
                 let Some(leg) = self.legs.first_mut() else {
-                    return;
+                    return 0;
                 };
                 let remote = positions.root;
                 if leg_differs(leg, &remote) {
+                    mismatches += 1;
                     tracing::warn!(
                         market_id = %market_id,
                         local_yes_shares = leg.yes_shares,
@@ -746,6 +758,7 @@ impl Book {
             Shape::Answers => {
                 if !positions.checksum_ok() {
                     let totals = positions.totals();
+                    mismatches += 1;
                     tracing::warn!(
                         market_id = %market_id,
                         root_invested = positions.root.invested,
@@ -761,6 +774,7 @@ impl Book {
                 for leg in &mut self.legs {
                     let remote = positions.answer(leg.answer_id.as_deref().unwrap_or_default());
                     if leg_differs(leg, &remote) {
+                        mismatches += 1;
                         tracing::warn!(
                             market_id = %market_id,
                             answer_id = ?leg.answer_id,
@@ -777,6 +791,8 @@ impl Book {
                 }
             }
         }
+
+        mismatches
     }
 
     /// Answer rows first, then the root aggregate and price.
@@ -1149,9 +1165,11 @@ mod tests {
         assert_eq!(book.legs().len(), 1);
         assert_eq!(book.leg(0).answer_id, None);
         assert_eq!(book.leg(0).text, "");
-        assert!(Book::load(&store, &db, "missing")
-            .expect("load missing")
-            .is_none());
+        assert!(
+            Book::load(&store, &db, "missing")
+                .expect("load missing")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1845,10 +1863,12 @@ mod tests {
         assert_eq!(decisions[0].action, TradeAction::SellYes);
         assert_eq!(decisions[0].answer_id.as_deref(), Some("held"));
         assert_eq!(decisions[0].shares, Some(10.0));
-        assert!(decisions
-            .iter()
-            .any(|decision| decision.action == TradeAction::BuyYes
-                && decision.answer_id.as_deref() == Some("fresh")));
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.action == TradeAction::BuyYes
+                    && decision.answer_id.as_deref() == Some("fresh"))
+        );
     }
 
     #[test]
@@ -1860,9 +1880,11 @@ mod tests {
         let decisions = actions_for(&views, false, limits(6, 2, 0.25));
 
         assert_eq!(decisions.len(), 2);
-        assert!(decisions
-            .iter()
-            .all(|decision| decision.action == TradeAction::BuyYes));
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.action == TradeAction::BuyYes)
+        );
     }
 
     #[test]

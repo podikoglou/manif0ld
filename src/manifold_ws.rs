@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::config::Config;
 use crate::error::{AppResult, Context};
@@ -109,8 +109,8 @@ pub fn channel() -> (mpsc::Sender<ManifoldEvent>, mpsc::Receiver<ManifoldEvent>)
 ///
 /// The [`Config`] parameter is currently unused — the verified endpoint is
 /// the [`ENDPOINT`] constant and the topics need no auth — but stays in the
-/// signature so the phase-3 wiring can call `manifold_ws::run(config, tx)`
-/// without call sites changing.
+/// signature so the `App::spawn` wiring keeps a stable call shape for future
+/// topic or endpoint configuration.
 ///
 /// The function returns when no receiver of the event channel is left;
 /// reconnecting to nobody would only churn.
@@ -123,7 +123,10 @@ pub async fn run(_config: Config, tx: mpsc::Sender<ManifoldEvent>) -> AppResult<
             return Ok(());
         }
 
-        tracing::info!(endpoint = ENDPOINT, "connecting to manifold broadcast socket");
+        tracing::info!(
+            endpoint = ENDPOINT,
+            "connecting to manifold broadcast socket"
+        );
 
         match connect_async(ENDPOINT).await {
             Ok((websocket, _response)) => {
@@ -290,7 +293,10 @@ pub struct NewContractEvent {
 /// broadcasts into `tx` while pinging every [`KEEPALIVE_INTERVAL`]. An ack
 /// timeout or a nack returns cleanly so the caller reconnects; transport
 /// errors surface as errors.
-async fn consume<T>(websocket: WebSocketStream<T>, tx: &mpsc::Sender<ManifoldEvent>) -> AppResult<()>
+async fn consume<T>(
+    websocket: WebSocketStream<T>,
+    tx: &mpsc::Sender<ManifoldEvent>,
+) -> AppResult<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -395,7 +401,7 @@ where
             None => return AckState::Lost("the stream ended before the subscribe ack".to_owned()),
             Some(Err(error)) => return AckState::Lost(format!("websocket error: {error}")),
             Some(Ok(Message::Close(_))) => {
-                return AckState::Lost("the socket closed before the subscribe ack".to_owned())
+                return AckState::Lost("the socket closed before the subscribe ack".to_owned());
             }
             Some(Ok(Message::Text(text))) => {
                 let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
@@ -621,7 +627,10 @@ struct RateLimited {
 impl RateLimited {
     /// Builds a throttle with no statement recorded; its first call is due.
     fn new(interval: Duration) -> Self {
-        Self { interval, last: None }
+        Self {
+            interval,
+            last: None,
+        }
     }
 
     /// Reports whether a log statement is due now, recording it if so.
@@ -924,9 +933,11 @@ mod tests {
     #[tokio::test]
     async fn acks_and_foreign_topics_are_skipped_silently() {
         // Acks arrive once per connection and carry no data.
-        assert!(events(r#"{"type":"ack","txid":1,"success":true}"#)
-            .await
-            .is_empty());
+        assert!(
+            events(r#"{"type":"ack","txid":1,"success":true}"#)
+                .await
+                .is_empty()
+        );
         // Topics this module does not queue, including a per-market one.
         assert!(
             events(r#"{"type":"broadcast","topic":"global/new-comment","data":{"comment":{}}}"#)

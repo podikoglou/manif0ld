@@ -17,9 +17,17 @@
 //! | `status`, `deleted_at` | [`MarketStore::close`], [`MarketStore::untrack`], [`MarketStore::record_status`] |
 //! | `budget_mana` | [`MarketStore::record_budget`] |
 //! | `p_internal_log_odds`, `belief_updated_at` | [`MarketStore::record_belief`] |
-//! | `p_market_last` | [`MarketStore::record_price`] |
+//! | `p_market_last` | [`MarketStore::record_price`], [`MarketStore::market_prices_observed`] |
 //! | `invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares` | [`MarketStore::record_position`] |
 //! | `outcome_type`, `should_answers_sum_to_one` | [`MarketStore::record_kind`] |
+//! | `market_answers.p_market_last` | [`MarketStore::market_prices_observed`] |
+//!
+//! [`MarketStore::market_prices_observed`] is the price mirror for live
+//! observations: the broadcast websocket and the batched reconcile pass both
+//! write probabilities through it, so the two sources cannot disagree in the
+//! way two ad-hoc writers would. Positions, invested mana, and PnL remain
+//! owned by `Book::persist` and `Book::reconcile`; the mirror never touches
+//! them.
 //!
 //! Belief and price are deliberately separate. The belief engine decays toward
 //! the current market price, which it reads as a parameter at read time, so a
@@ -48,9 +56,9 @@
 use std::collections::HashMap;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
-use crate::db::{ensure_updated, invalid_text, Db};
+use crate::db::{Db, ensure_updated, invalid_text};
 use crate::error::{AppResult, Context};
 use crate::types::{MarketId, MarketStatus, TrackedMarket};
 
@@ -58,8 +66,7 @@ use crate::types::{MarketId, MarketStatus, TrackedMarket};
 ///
 /// [`market_from_row`] maps by position, so a change here must be mirrored
 /// there.
-const MARKET_COLUMNS: &str =
-    "id, slug, market_url, question, description, resolution_criteria, close_time, \
+const MARKET_COLUMNS: &str = "id, slug, market_url, question, description, resolution_criteria, close_time, \
      status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, no_shares, \
      p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, discord_thread_id, \
      created_at, deleted_at, outcome_type, should_answers_sum_to_one";
@@ -323,6 +330,58 @@ impl MarketStore {
             id,
         )?;
         self.patch_cached(id, |market| market.p_market_last = p_market);
+        Ok(())
+    }
+
+    /// Mirrors prices observed live from one market into the price columns.
+    ///
+    /// This is the single writer for the mirrored probabilities: both the
+    /// broadcast websocket and the batched reconcile refresh hand their
+    /// observations here. It stores the root probability (part of
+    /// [`MarketStore::record_price`]'s column group, cache included) and the
+    /// per-answer prices it knows about. Answer IDs that are not tracked in
+    /// `market_answers` are silently skipped rather than rejected: a brand-new
+    /// answer exists on Manifold before anything inserts our row, and answer
+    /// discovery is `Book::observe_prices`' job during the slow reconcile.
+    ///
+    /// Never touches anything but price columns — belief, positions, and
+    /// lifecycle state stay with their own intents.
+    pub fn market_prices_observed(
+        &self,
+        id: &str,
+        root_price: Option<f64>,
+        answer_prices: &[(MarketId, f64)],
+    ) -> AppResult<()> {
+        if let Some(price) = root_price {
+            self.update(
+                "UPDATE tracked_markets SET p_market_last = ?2 WHERE id = ?1",
+                params![id, price],
+                || format!("updating mirrored market price for {id}"),
+                id,
+            )?;
+            self.patch_cached(id, |market| market.p_market_last = price);
+        }
+
+        if answer_prices.is_empty() {
+            return Ok(());
+        }
+
+        let known: Vec<MarketId> = self
+            .db
+            .list_answers(id)?
+            .into_iter()
+            .map(|answer| answer.id)
+            .collect();
+
+        for (answer_id, price) in answer_prices {
+            if !known.iter().any(|known_id| known_id == answer_id) {
+                continue;
+            }
+            self.db
+                .update_answer_market_price(id, answer_id, *price)
+                .with_context(|| format!("mirroring the price of answer {answer_id}"))?;
+        }
+
         Ok(())
     }
 
@@ -787,6 +846,64 @@ mod tests {
     }
 
     #[test]
+    fn market_prices_observed_writes_the_root_price_and_cached_row() {
+        let (_db, store) = store_with(&[sample_market("m1", 1)]);
+        store.record_belief("m1", 1.25, 800).expect("record belief");
+
+        store
+            .market_prices_observed("m1", Some(0.81), &[])
+            .expect("mirror root price");
+
+        let row = store.load("m1").expect("load").expect("row");
+        assert_eq!(row.p_market_last, 0.81);
+        assert_eq!(
+            row.belief_updated_at, 800,
+            "the mirror must not touch belief"
+        );
+        assert_eq!(store.cached("m1").expect("cached").p_market_last, 0.81);
+    }
+
+    #[test]
+    fn market_prices_observed_updates_known_answers_and_skips_unknown_ones() {
+        let (db, store) = store_with(&[sample_market("m1", 1)]);
+        let mut answer = sample_answer("m1");
+        answer.id = "known".to_owned();
+        db.upsert_answer(&answer).expect("answer");
+        let mut other = sample_answer("m1");
+        other.id = "other".to_owned();
+        db.upsert_answer(&other).expect("answer");
+
+        store
+            .market_prices_observed(
+                "m1",
+                None,
+                &[("known".to_owned(), 0.6), ("stranger".to_owned(), 0.9)],
+            )
+            .expect("mirror answers");
+
+        let known = db.get_answer("m1", "known").expect("load").expect("row");
+        assert_eq!(known.p_market_last, 0.6);
+        assert_eq!(known.belief_updated_at, 1, "belief untouched");
+        // An answer Manifold knows but we do not cannot be repriced here; it
+        // must not fail the mirror (answer discovery is the reconcile's job).
+        let other = db.get_answer("m1", "other").expect("load").expect("row");
+        assert_eq!(other.p_market_last, 0.5);
+        let root = store.load("m1").expect("load").expect("row");
+        assert_eq!(root.p_market_last, 0.5, "no root price means no root write");
+    }
+
+    #[test]
+    fn market_prices_observed_on_an_unknown_market_reports_an_error() {
+        let (_db, store) = store_with(&[]);
+        assert!(
+            store
+                .market_prices_observed("ghost", Some(0.5), &[])
+                .is_err(),
+            "the durable write must fail an untracked market like every intent"
+        );
+    }
+
+    #[test]
     fn a_stale_position_write_does_not_revert_a_newer_belief() {
         let (_db, store) = store_with(&[sample_market("m1", 1)]);
 
@@ -910,15 +1027,19 @@ mod tests {
     fn an_intent_on_a_missing_market_reports_an_error_and_changes_nothing() {
         let (_db, store) = store_with(&[]);
 
-        assert!(store
-            .record_status("missing", MarketStatus::Active)
-            .is_err());
+        assert!(
+            store
+                .record_status("missing", MarketStatus::Active)
+                .is_err()
+        );
         assert!(store.record_budget("missing", 10.0).is_err());
         assert!(store.record_belief("missing", 1.0, 1).is_err());
         assert!(store.record_price("missing", 0.6).is_err());
-        assert!(store
-            .record_position("missing", 1.0, 0.0, 1.0, 0.0)
-            .is_err());
+        assert!(
+            store
+                .record_position("missing", 1.0, 0.0, 1.0, 0.0)
+                .is_err()
+        );
         assert!(store.record_kind("missing", "BINARY", false).is_err());
         assert!(store.close("missing").is_err());
         assert!(store.untrack("missing", 1).is_err());

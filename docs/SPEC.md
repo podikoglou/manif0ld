@@ -96,6 +96,9 @@ TRIAGE_MIN_EVIDENCE=0.7                                # probability of evidence
 # Manifold
 MANIFOLD_API_KEY=...
 # The bot user ID is fetched from GET /v0/me at startup.
+# Live prices come from the broadcast websocket; REST is demoted to a slow
+# batched reconcile. 0 restores the legacy 60-second polling loop.
+MANIFOLD_WS_ENABLED=1
 
 # Discord
 DISCORD_BOT_TOKEN=...
@@ -466,8 +469,9 @@ available_budget = budget_mana + realized_pnl_mana − invested_mana
 For an answer entry the target is additionally capped at
 `MC_MAX_ANSWER_FRACTION × budget_mana`.
 
-**Binary decision (called after each belief update and on a 60s ticker per
-active market):**
+**Binary decision (called after each belief update, on every debounced
+websocket price update, and — with `MANIFOLD_WS_ENABLED=0` — on the legacy 60s
+ticker per active market):**
 
 ```
 edge = p_internal − p_market
@@ -531,10 +535,23 @@ nothing is persisted. The canary phase flips it to `false` with tiny caps.
 Using `limitProb=0.99` (YES) / `0.01` (NO) emulates a market buy that fills at
 the current price, sweeping the AMM if needed.
 
-**Position sync:** Every 60 seconds, `evaluate_market` fetches the market and the
-positions for each active market and reconciles local state. Binary markets use
-the root `ContractMetric`; multiple-choice markets use the per-answer rows with
-the root checksum. If they disagree, trust Manifold and log a `warn!`.
+**Position sync (phase 1 of `docs/ALGO.md`, websocket live prices):** Prices
+arrive live over the Manifold broadcast websocket
+(`global/updated-contract`, coalesced into one evaluation per market per
+2 s — `WS_DEBOUNCE_SECS`) and are written through
+`MarketStore::market_prices_observed`. REST is demoted to a slow 5-minute
+reconcile pass in `TradeExecutor`: batched probabilities
+(`GET /v0/market-probs`, 100 IDs per call) through the same mirror, plus one
+paginated portfolio snapshot
+(`GET /v0/get-user-contract-metrics-with-contracts?userId={bot}&perAnswer=true`)
+that replaces the per-market `/positions` sync. Rows map through
+`Book::reconcile` with the same semantics. Every reconcile read spends a
+Reconcile-class token from `rate.rs` and yields below the housekeeping
+reserve. A shape disagreement (market kind, a never-recorded answer) or an
+incomplete snapshot falls back to the full per-market `evaluate_market`/`sync_market`
+REST path, which still owns kind refresh and answer discovery. A price patch
+pinned exactly at 0/1 skips evaluation — the price-patch stand-in for the
+snapshot's `isResolved` check.
 
 **Ledger:** Every successful bet writes a row to `trade_ledger`, including
 `answer_id` for a multiple-choice market, and updates

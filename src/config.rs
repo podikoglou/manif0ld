@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::error::{anyhow, bail, AppResult, Context};
+use crate::error::{AppResult, Context, anyhow, bail};
 
 const DEFAULT_JETSTREAM_URL: &str = "wss://jetstream2.us-east.bsky.network/subscribe";
 const DEFAULT_DB_PATH: &str = "./data/manif0ld.db";
@@ -25,6 +25,10 @@ const DEFAULT_MC_MAX_NEW_PER_TICK: usize = 2;
 const DEFAULT_MC_MAX_ANSWER_FRACTION: f64 = 0.25;
 /// Manifold allows 500 requests/minute per IP; the bucket starts at that.
 const DEFAULT_RATE_LIMIT_PER_MIN: usize = 500;
+/// Live prices come from the broadcast websocket; REST is demoted to the slow
+/// reconcile backstop. Setting the flag to `0` restores the legacy 60-second
+/// per-market polling loop until the canary proves the websocket path.
+const DEFAULT_MANIFOLD_WS_ENABLED: bool = true;
 
 /// Runtime configuration for the bot.
 ///
@@ -65,6 +69,9 @@ pub struct Config {
     /// Manifold REST requests per minute shared by every consumer, refilled
     /// continuously; trade writes have priority over housekeeping.
     pub rate_limit_per_min: usize,
+    /// Whether live prices stream from the Manifold broadcast websocket.
+    /// Disabling this restores the legacy 60-second REST polling loop.
+    pub manifold_ws_enabled: bool,
     pub db_path: PathBuf,
 }
 
@@ -140,8 +147,7 @@ impl Config {
         let belief_kappa = f64_or(&get, "BELIEF_KAPPA", DEFAULT_BELIEF_KAPPA)?;
         let belief_halflife_hours =
             f64_or(&get, "BELIEF_HALFLIFE_HOURS", DEFAULT_BELIEF_HALFLIFE_HOURS)?;
-        let triage_min_evidence =
-            f64_or(&get, "TRIAGE_MIN_EVIDENCE", DEFAULT_TRIAGE_MIN_EVIDENCE)?;
+        let triage_min_evidence = f64_or(&get, "TRIAGE_MIN_EVIDENCE", DEFAULT_TRIAGE_MIN_EVIDENCE)?;
         let trading_dry_run = bool_or(&get, "TRADING_DRY_RUN", DEFAULT_TRADING_DRY_RUN)?;
         let mc_max_positions = usize_or(&get, "MC_MAX_POSITIONS", DEFAULT_MC_MAX_POSITIONS)?;
         let mc_max_new_per_tick =
@@ -152,15 +158,16 @@ impl Config {
             DEFAULT_MC_MAX_ANSWER_FRACTION,
         )?;
         if !(mc_max_answer_fraction > 0.0 && mc_max_answer_fraction <= 1.0) {
-            bail!(
-                "MC_MAX_ANSWER_FRACTION must be in (0, 1], got {mc_max_answer_fraction}"
-            );
+            bail!("MC_MAX_ANSWER_FRACTION must be in (0, 1], got {mc_max_answer_fraction}");
         }
 
         let rate_limit_per_min = usize_or(&get, "RATE_LIMIT_PER_MIN", DEFAULT_RATE_LIMIT_PER_MIN)?;
         if rate_limit_per_min == 0 {
             bail!("RATE_LIMIT_PER_MIN must be a positive number of requests per minute");
         }
+
+        let manifold_ws_enabled =
+            bool_or(&get, "MANIFOLD_WS_ENABLED", DEFAULT_MANIFOLD_WS_ENABLED)?;
 
         let db_path = optional(&get, "DB_PATH")
             .map(PathBuf::from)
@@ -190,6 +197,7 @@ impl Config {
             mc_max_new_per_tick,
             mc_max_answer_fraction,
             rate_limit_per_min,
+            manifold_ws_enabled,
             db_path,
         };
 
@@ -219,7 +227,8 @@ impl ModelProvider {
 /// Matches an ASCII prefix without splitting a multi-byte character.
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let head = text.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 /// Parses a model name prefix to determine the provider and underlying model name.
@@ -382,6 +391,10 @@ mod tests {
         assert_eq!(config.mc_max_new_per_tick, 2);
         assert_eq!(config.mc_max_answer_fraction, 0.25);
         assert_eq!(config.rate_limit_per_min, DEFAULT_RATE_LIMIT_PER_MIN);
+        assert!(
+            config.manifold_ws_enabled,
+            "the websocket path must default to on"
+        );
         assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
@@ -402,6 +415,7 @@ mod tests {
             ("MC_MAX_NEW_PER_TICK", "1"),
             ("MC_MAX_ANSWER_FRACTION", "0.5"),
             ("RATE_LIMIT_PER_MIN", "400"),
+            ("MANIFOLD_WS_ENABLED", "0"),
             ("DB_PATH", "/tmp/test.db"),
         ]);
 
@@ -423,7 +437,22 @@ mod tests {
         assert_eq!(config.mc_max_new_per_tick, 1);
         assert_eq!(config.mc_max_answer_fraction, 0.5);
         assert_eq!(config.rate_limit_per_min, 400);
+        assert!(!config.manifold_ws_enabled, "0 disables the websocket path");
         assert_eq!(config.db_path, PathBuf::from("/tmp/test.db"));
+    }
+
+    #[test]
+    fn parses_the_websocket_flag_in_both_spellings() {
+        for (raw, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            let mut vars = required_vars();
+            vars.push(("MANIFOLD_WS_ENABLED", raw));
+
+            let config = config_from(&vars).expect("config should load");
+            assert_eq!(
+                config.manifold_ws_enabled, expected,
+                "MANIFOLD_WS_ENABLED={raw}"
+            );
+        }
     }
 
     #[test]
@@ -507,7 +536,10 @@ mod tests {
     fn stores_cloudflare_account_id_and_models() {
         let config = config_from(&required_vars()).expect("config should load");
 
-        assert_eq!(config.cloudflare_account_id.as_deref(), Some("test-account"));
+        assert_eq!(
+            config.cloudflare_account_id.as_deref(),
+            Some("test-account")
+        );
         assert_eq!(config.triage_model, "cloudflare/@cf/google/gemini-test");
         assert_eq!(config.onboarding_model, "cloudflare/@cf/deepseek/test");
     }
@@ -516,7 +548,9 @@ mod tests {
     fn parses_openrouter_configuration() {
         let mut vars = required_vars();
         vars.retain(|(name, _)| {
-            *name != "CLOUDFLARE_ACCOUNT_ID" && *name != "TRIAGE_MODEL" && *name != "ONBOARDING_MODEL"
+            *name != "CLOUDFLARE_ACCOUNT_ID"
+                && *name != "TRIAGE_MODEL"
+                && *name != "ONBOARDING_MODEL"
         });
         vars.push(("TRIAGE_MODEL", "openrouter/google/gemini-2.0-flash-001"));
         vars.push(("ONBOARDING_MODEL", "openrouter/anthropic/claude-3.5-sonnet"));
@@ -524,8 +558,14 @@ mod tests {
 
         let config = config_from(&vars).expect("openrouter config should load");
         assert_eq!(config.cloudflare_account_id, None);
-        assert_eq!(config.triage_model, "openrouter/google/gemini-2.0-flash-001");
-        assert_eq!(config.onboarding_model, "openrouter/anthropic/claude-3.5-sonnet");
+        assert_eq!(
+            config.triage_model,
+            "openrouter/google/gemini-2.0-flash-001"
+        );
+        assert_eq!(
+            config.onboarding_model,
+            "openrouter/anthropic/claude-3.5-sonnet"
+        );
     }
 
     #[test]
@@ -609,7 +649,10 @@ mod tests {
         vars.push(("CLOUDFLARE_ACCOUNT_ID", "{account_id}"));
 
         let error = config_from(&vars).expect_err("placeholder should fail");
-        assert!(error.to_string().contains("CLOUDFLARE_ACCOUNT_ID"), "{error}");
+        assert!(
+            error.to_string().contains("CLOUDFLARE_ACCOUNT_ID"),
+            "{error}"
+        );
     }
 
     #[test]

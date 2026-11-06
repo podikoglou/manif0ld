@@ -3,10 +3,20 @@
 //! The module has two layers:
 //!
 //! 1. [`ManifoldClient`] wraps the REST API (`/v0/me`, `/v0/market/{id}`,
-//!    `/v0/market/{id}/positions`, `/v0/bet`, `/v0/market/{id}/sell`).
-//! 2. [`TradeExecutor`] is the control flow: it loads a [`Book`], prepares it
-//!    from Manifold, asks the book for a plan, executes each action, and
-//!    persists the result.
+//!    `/v0/market/{id}/positions`, `/v0/market-probs`,
+//!    `/v0/get-user-contract-metrics-with-contracts`, `/v0/bet`,
+//!    `/v0/market/{id}/sell`).
+//! 2. [`TradeExecutor`] is the control flow: it keeps the price columns
+//!    current from two observation sources — the broadcast websocket
+//!    ([`crate::manifold_ws`], live) and a batched REST refresh (the slow
+//!    reconcile backstop) — then runs the same book-plan-execute cycle the
+//!    old 60-second ticker ran, per price update instead of per minute.
+//!
+//! Prices arrive live; REST is demoted to housekeeping (`docs/ALGO.md` §1):
+//! a 5-minute `Priority::Reconcile` pass chunks `GET /v0/market-probs` and
+//! replaces the old per-market `/positions` sync with one paginated portfolio
+//! snapshot. `MANIFOLD_WS_ENABLED=0` restores the legacy polling loop for the
+//! duration of the canary — see [`TradeExecutor::run`].
 //!
 //! Positions, accounting, and the trading policy live in [`crate::book`]. The
 //! dependency edge is one-way: `trade` uses `book`, and `book` never imports
@@ -15,13 +25,17 @@
 //!
 //! # Positions, not bets, for reconciliation
 //!
-//! Position sync uses `GET /v0/market/{id}/positions?userId=...` and not the
+//! Position sync uses the authoritative `ContractMetric` rows and not the
 //! bet history. A bet response cannot reliably distinguish shares that are
 //! still held from shares sold later (sell rows carry negative deltas and the
 //! history endpoint is paginated), so summing `/v0/bets` rows drifts after the
 //! first exit. Manifold's `ContractMetric` reports `totalShares`, `invested`,
 //! and `profit` for the current position directly; that is the authoritative
 //! source, and any mismatch is resolved in Manifold's favour with a `warn!`.
+//! Since the reconcile swap the whole portfolio is one paginated call to
+//! `GET /v0/get-user-contract-metrics-with-contracts`; the legacy per-market
+//! `/positions` call only survives in `evaluate_market`/`sync_market`, which
+//! the legacy loop and liquidation still drive.
 //!
 //! # Timestamps
 //!
@@ -35,39 +49,42 @@
 //! buy, a sell, and a dry-run buy (which sends a real `dryRun: true` request)
 //! each spend one Trade-class token before the call. When the bucket cannot
 //! spare the trade floor, the write is skipped exactly like a kill-switch
-//! refusal — the next material signal or the 60-second ticker re-runs the
-//! decision. Reads are not metered yet; phase 2 replaces them with the
-//! websocket stream.
+//! refusal — the next material signal or price update re-runs the decision.
+//! Live prices are free (websocket); REST reads in the reconcile backstop
+//! spend Reconcile-class tokens and yield to trades below the housekeeping
+//! reserve (`docs/ALGO.md` §2).
 //!
 //! # Secrets
 //!
 //! The API key is stored in [`ManifoldClient`] and sent in the `Authorization`
 //! header. It never appears in an error, a log line, or the `Debug` output.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 use crate::book::{
-    AnswerObservation, Book, MarketPositions, PlannedTrade, Position, Shape, TradePolicy,
-    BUDGET_EPSILON,
+    AnswerObservation, BUDGET_EPSILON, Book, MAX_TRADING_PROB, MIN_TRADING_PROB, MarketPositions,
+    PlannedTrade, Position, Shape, TradePolicy,
 };
 use crate::config::Config;
 use crate::db::Db;
-use crate::error::{anyhow, bail, AppResult, Context};
+use crate::error::{AppResult, Context, anyhow, bail};
+use crate::manifold_ws::{ContractProbs, ManifoldEvent};
 use crate::market_store::MarketStore;
 use crate::pipeline::PipelineEvent;
 use crate::rate::{Priority, RateLimiter, SystemClock, WRITE_COST_TOKENS};
 use crate::types::{
-    available_budget, MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision,
-    TradeRecord,
+    MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision, TradeRecord,
+    available_budget,
 };
 
 /// Public Manifold API base URL.
@@ -79,8 +96,39 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest response snippet included in an error message.
 const ERROR_SNIPPET_CHARS: usize = 500;
 
-/// How often [`TradeExecutor::run`] reconciles every active market.
-const SYNC_INTERVAL: Duration = Duration::from_secs(60);
+/// LEGACY: the 60-second per-market REST trade check of the polling loop.
+/// `MANIFOLD_WS_ENABLED=0` runs it in `TradeExecutor::run_legacy`; delete it
+/// after the websocket canary has proved out.
+const LEGACY_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Interval of the slow REST reconcile backstop that replaces the legacy
+/// ticker's freshness role: batched probabilities, one portfolio position
+/// snapshot, and a single summary line (`docs/ALGO.md` §1, §2).
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Markets per `GET /v0/market-probs` call. Manifold documents a maximum of
+/// 100 IDs per request.
+const PROB_CHUNK_SIZE: usize = 100;
+
+/// Contracts per page of `GET /v0/get-user-contract-metrics-with-contracts`.
+/// The portfolio of a bot is small; one page is the steady state, more pages
+/// are the pagination safety valve.
+const PORTFOLIO_PAGE_SIZE: usize = 500;
+
+/// Hard cap on portfolio pages per reconcile pass. With `limit=500`, one
+/// rounded pass covers far more contracts than a bot can accumulate; the cap
+/// only exists so a server-side pagination bug cannot loop forever.
+const PORTFOLIO_MAX_PAGES: usize = 20;
+
+/// Coalescing window for websocket price updates, in seconds.
+///
+/// The live probe (`docs/ALGO.md` §6.1) measured `global/updated-contract` at
+/// ~0.5 msg/s average with bursts to ~1.7/s, and bursts of bets can fire
+/// several updates for one market within a few hundred milliseconds. Folding
+/// two seconds of updates into one evaluation still offers ~5× the decision
+/// opportunities of the 60-second ticker it replaces, and bounds the
+/// Book::load + plan churn per market instead of tracking every burst tick.
+const WS_DEBOUNCE_SECS: u64 = 2;
 
 /// Key in the `kv` table holding the panic switch.
 ///
@@ -199,6 +247,52 @@ impl ManifoldClient {
         let request = self.http.get(self.url(&path));
         let value: Value = self.send(request, "GET /v0/market/{id}/positions").await?;
         Ok(parse_market_positions(&value, &self.bot_user_id))
+    }
+
+    /// Fetches probabilities for a batch of markets in one request
+    /// (`GET /v0/market-probs?ids=a&ids=b…`).
+    ///
+    /// The caller keeps each batch at [`PROB_CHUNK_SIZE`] IDs, the documented
+    /// per-request maximum. The endpoint has a cache of up to 1 s, so even the
+    /// largest call is one token of the batch budget.
+    ///
+    /// Markets missing from the map (unknown ID, closed, or a shape the parser
+    /// does not recognize) are simply absent: the caller refreshes what it
+    /// gets and relies on the next pass or the websocket for the rest.
+    pub async fn market_probs(
+        &self,
+        market_ids: &[String],
+    ) -> AppResult<HashMap<MarketId, MarketProbs>> {
+        let ids: Vec<(&str, &str)> = market_ids.iter().map(|id| ("ids", id.as_str())).collect();
+        let request = self.http.get(self.url("/v0/market-probs")).query(&ids);
+        let value: Value = self.send(request, "GET /v0/market-probs").await?;
+        Ok(parse_market_probs(&value))
+    }
+
+    /// Fetches one page of the bot's portfolio as the Manifold frontend does
+    /// (`GET /v0/get-user-contract-metrics-with-contracts`).
+    ///
+    /// One entry per held position: a root row without an `answerId` plus one
+    /// row per answer of a multiple-choice market, exactly the row shapes the
+    /// per-market `/positions` parser accepts. `complete` is false whenever
+    /// the page came back full, meaning callers must not infer "no metrics for
+    /// a market" as "the bot holds nothing there".
+    pub async fn portfolio_page(
+        &self,
+        offset: usize,
+    ) -> AppResult<(HashMap<MarketId, Vec<Value>>, bool)> {
+        let path = format!(
+            "/v0/get-user-contract-metrics-with-contracts?userId={}&perAnswer=true&limit={}&offset={}",
+            self.bot_user_id, PORTFOLIO_PAGE_SIZE, offset
+        );
+        let request = self.http.get(self.url(&path));
+        let value: Value = self
+            .send(request, "GET /v0/get-user-contract-metrics-with-contracts")
+            .await?;
+
+        let by_contract = parse_metrics_by_contract(&value);
+        let entries: usize = by_contract.values().map(Vec::len).sum();
+        Ok((by_contract, entries < PORTFOLIO_PAGE_SIZE))
     }
 
     /// Buys `amount` mana of `outcome` shares at the best available price.
@@ -386,6 +480,23 @@ pub struct MarketAnswerSnapshot {
     pub probability: Option<f64>,
 }
 
+/// One market's probability payload from `GET /v0/market-probs`.
+///
+/// The same two shapes the websocket patch parser detects structurally: a
+/// bare `prob` is a binary market, an `answerProbs` dictionary is a
+/// multiple-choice one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MarketProbs {
+    Binary {
+        /// The binary market's consensus probability.
+        prob: f64,
+    },
+    Answers {
+        /// `(answer_id, probability)` pairs.
+        answers: Vec<(MarketId, f64)>,
+    },
+}
+
 /// Fees charged on a bet, in mana.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BetFees {
@@ -488,6 +599,15 @@ pub(crate) fn parse_market_positions(value: &Value, bot_user_id: &str) -> Market
         _ => &[],
     };
 
+    parse_position_entries(entries, bot_user_id)
+}
+
+/// Builds a [`MarketPositions`] from raw `ContractMetric` entry values.
+///
+/// Shared by the per-market `/positions` parser above and the portfolio page
+/// parser: both carry the same row shapes — a root summary without an
+/// `answerId` plus one row per answer, attributed to a user.
+fn parse_position_entries(entries: &[Value], bot_user_id: &str) -> MarketPositions {
     let has_user_ids = entries.iter().any(|entry| entry.get("userId").is_some());
     let mut positions = MarketPositions::default();
 
@@ -514,6 +634,63 @@ pub(crate) fn parse_market_positions(value: &Value, bot_user_id: &str) -> Market
     positions
 }
 
+/// Parses `GET /v0/market-probs`: a map of market ID to its probability
+/// payload (`{"prob": …}` for a binary market, `{"answerProbs": {…}}` for a
+/// multiple-choice one).
+///
+/// Unrecognized shapes are skipped rather than rejected: the batched refresh
+/// must tolerate a new response variant without losing the whole pass.
+fn parse_market_probs(value: &Value) -> HashMap<MarketId, MarketProbs> {
+    let mut probs = HashMap::new();
+    let Some(by_market) = value.as_object() else {
+        return probs;
+    };
+
+    for (market_id, entry) in by_market {
+        let parsed = if let Some(prob) = entry.get("prob").and_then(Value::as_f64) {
+            MarketProbs::Binary { prob }
+        } else if let Some(answers) = entry.get("answerProbs").and_then(Value::as_object) {
+            let answers: Vec<(MarketId, f64)> = answers
+                .iter()
+                .filter_map(|(id, prob)| prob.as_f64().map(|prob| (id.clone(), prob)))
+                .collect();
+            if answers.is_empty() {
+                continue;
+            }
+            MarketProbs::Answers { answers }
+        } else {
+            continue;
+        };
+
+        probs.insert(market_id.clone(), parsed);
+    }
+
+    probs
+}
+
+/// Parses `metricsByContract` out of one portfolio page.
+///
+/// `{"metricsByContract": {"<contractId>": [<ContractMetric>…]}, …}` — the
+/// entries keep their raw JSON because the shared position parser below reads
+/// them straight off.
+fn parse_metrics_by_contract(value: &Value) -> HashMap<MarketId, Vec<Value>> {
+    let mut by_contract = HashMap::new();
+    let Some(metrics) = value.get("metricsByContract").and_then(Value::as_object) else {
+        return by_contract;
+    };
+
+    for (contract_id, entries) in metrics {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        if !entries.is_empty() {
+            by_contract.insert(contract_id.clone(), entries.clone());
+        }
+    }
+
+    by_contract
+}
+
 /// Reads a JSON number, defaulting to zero for missing or non-numeric fields.
 fn number_at(value: Option<&Value>) -> f64 {
     value.and_then(Value::as_f64).unwrap_or(0.0)
@@ -533,6 +710,136 @@ pub fn optional_millis_to_seconds(millis: Option<i64>) -> Option<i64> {
 // -----------------------------------------------------------------------------
 // Executor
 // -----------------------------------------------------------------------------
+
+/// A probability observation in the price-mirror's terms.
+///
+/// Both observation channels (websocket patch and batched REST refresh)
+/// convert into this before writing, so [`TradeExecutor`]'s mirroring code has
+/// exactly one shape to handle.
+#[derive(Debug, Clone, PartialEq)]
+struct ProbPatch {
+    /// Root probability for a binary market; `None` for multiple-choice
+    /// markets, where the per-answer rows are the price.
+    root: Option<f64>,
+    /// `(answer_id, probability)` pairs for multiple-choice markets.
+    answers: Vec<(MarketId, f64)>,
+}
+
+impl From<ContractProbs> for ProbPatch {
+    fn from(probs: ContractProbs) -> Self {
+        match probs {
+            ContractProbs::Binary { prob } => Self {
+                root: Some(prob),
+                answers: Vec::new(),
+            },
+            ContractProbs::Multi { answers } => Self {
+                root: None,
+                answers: answers.into_iter().map(|a| (a.id, a.prob)).collect(),
+            },
+        }
+    }
+}
+
+impl From<MarketProbs> for ProbPatch {
+    fn from(probs: MarketProbs) -> Self {
+        match probs {
+            MarketProbs::Binary { prob } => Self {
+                root: Some(prob),
+                answers: Vec::new(),
+            },
+            MarketProbs::Answers { answers } => Self {
+                root: None,
+                answers,
+            },
+        }
+    }
+}
+
+/// Whether every probability in one patch sits exactly at an extreme.
+///
+/// A CPMM market cannot pin at exactly 0 or 1 while it is open, so an
+/// all-extreme patch is the practical signature of a resolution broadcast.
+/// Price patches carry no `isResolved` flag, so the legacy loop's snapshot
+/// check (`evaluate_market`) is replaced by this guard: a resolved market
+/// must not trade — its positions settle automatically — and the evaluation
+/// resumes by itself only if the probability ever moves off the extreme.
+fn patch_is_terminal(patch: &ProbPatch) -> bool {
+    let at_extreme = |prob: f64| prob <= 0.0 || prob >= 1.0;
+    if let Some(root) = patch.root {
+        return at_extreme(root);
+    }
+    !patch.answers.is_empty() && patch.answers.iter().all(|(_, prob)| at_extreme(*prob))
+}
+
+/// Per-market evaluation throttle for websocket price bursts.
+///
+/// A market evaluated inside the window is skipped: its price has already
+/// been mirrored, so the next due evaluation still sees it fresh — the price
+/// mirror and the evaluation throttle are deliberately kept one map, not a
+/// queue (no per-market buffers, no extra tasks; `docs/ALGO.md` phase 1).
+#[derive(Debug)]
+struct EvaluationDebouncer {
+    window: Duration,
+    last_evaluated: HashMap<MarketId, Instant>,
+}
+
+impl EvaluationDebouncer {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last_evaluated: HashMap::new(),
+        }
+    }
+
+    /// Reports whether `key` is due for evaluation now, recording a fresh
+    /// timestamp exactly when it is.
+    fn due(&mut self, now: Instant, key: &MarketId) -> bool {
+        let fresh = self
+            .last_evaluated
+            .get(key)
+            .is_some_and(|last| now.saturating_duration_since(*last) < self.window);
+        if !fresh {
+            self.last_evaluated.insert(key.clone(), now);
+        }
+        !fresh
+    }
+}
+
+/// Accumulated counters of one reconcile pass.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReconcileSummary {
+    /// Tracked markets the pass attempted to refresh.
+    markets_seen: usize,
+    /// Position mismatches reconciled in Manifold's favour plus shape drifts
+    /// that needed the full per-market sync.
+    mismatches: usize,
+    /// Reconcile-class tokens spent.
+    tokens_spent: u64,
+    /// Read calls skipped because the bucket was at the housekeeping reserve.
+    tokens_skipped: u64,
+}
+
+impl ReconcileSummary {
+    /// Spends one Reconcile-class token, recording grant or skip.
+    fn acquire(&mut self, rate: &RateLimiter, label: &str) -> bool {
+        match rate.try_acquire(Priority::Reconcile, WRITE_COST_TOKENS) {
+            Ok(_) => {
+                self.tokens_spent += 1;
+                true
+            }
+            Err(denied) => {
+                self.tokens_skipped += 1;
+                tracing::warn!(
+                    label,
+                    remaining_tokens = denied.remaining,
+                    reserve_tokens = denied.threshold,
+                    "rate bucket is at the housekeeping reserve; skipping a reconcile read"
+                );
+                false
+            }
+        }
+    }
+}
 
 /// Events published by the trading layer for downstream consumers.
 ///
@@ -603,10 +910,14 @@ pub struct TradeExecutor {
     policy: TradePolicy,
     dry_run: bool,
     halflife_hours: f64,
-    /// Global Manifold token bucket; writes spend Trade-class tokens.
+    /// Global Manifold token bucket; writes spend Trade-class tokens, the
+    /// reconcile backstop spends Reconcile-class tokens.
     rate: RateLimiter,
     execution_lock: Mutex<()>,
     events: broadcast::Sender<TradeEvent>,
+    /// Whether live prices stream from the websocket. `false` selects the
+    /// legacy 60-second REST loop in [`TradeExecutor::run`].
+    ws_enabled: bool,
 }
 
 impl TradeExecutor {
@@ -630,6 +941,7 @@ impl TradeExecutor {
             rate: RateLimiter::per_minute(config.rate_limit_per_min, Box::new(SystemClock)),
             execution_lock: Mutex::new(()),
             events,
+            ws_enabled: config.manifold_ws_enabled,
         })
     }
 
@@ -644,12 +956,17 @@ impl TradeExecutor {
         &self.client
     }
 
-    /// Runs one trade check for a market.
+    /// Runs one trade check for a market, with a fresh REST snapshot first.
     ///
     /// Steps: load the book from the database, skip non-active markets, fetch a
     /// fresh market snapshot, prepare the book (kind, positions, prices, and
     /// reconciliation), plan one decision cycle, then execute and persist
     /// every action it returned.
+    ///
+    /// This is the legacy path (the 60-second ticker, and the operator's
+    /// explicit recheck), and it is what the live operate mode keeps for
+    /// liquidation. The live-price loop calls [`TradeExecutor::evaluate_cached`]
+    /// instead because the price columns are already mirrored.
     ///
     /// Returns `Ok(None)` when no trade happens. A resolved market, a paused
     /// market, an edge inside the thresholds, and a buy blocked by the kill
@@ -681,6 +998,52 @@ impl TradeExecutor {
         let now = Utc::now().timestamp();
         self.prepare(&mut book, &snapshot, now).await?;
 
+        self.decide(&mut book, trigger_post_uri, kill_switch, now)
+            .await
+    }
+
+    /// Runs one trade check against the already-mirrored state: no REST.
+    ///
+    /// The websocket and the slow reconcile write the price columns through
+    /// `MarketStore::market_prices_observed` and the position columns through
+    /// `Book::reconcile`, so loading the book is enough to decide on. The
+    /// gating is exactly the legacy path's: status `ACTIVE`, kill switch,
+    /// budget invariant (asserted per planned buy), and `TRADING_DRY_RUN`.
+    ///
+    /// Kind changes and brand-new answers are not caught here by design — the
+    /// slow reconcile detects them (`docs/ALGO.md` phase 1).
+    async fn evaluate_cached(
+        &self,
+        market_id: &str,
+        trigger_post_uri: Option<&str>,
+    ) -> AppResult<Option<TradeRecord>> {
+        let _guard = self.execution_lock.lock().await;
+
+        let mut book = self.load_book(market_id)?;
+        if book.status() != MarketStatus::Active {
+            return Ok(None);
+        }
+
+        let kill_switch = self.kill_switch_on()?;
+        let now = Utc::now().timestamp();
+        self.decide(&mut book, trigger_post_uri, kill_switch, now)
+            .await
+    }
+
+    /// Plans one decision cycle over a prepared book and executes every
+    /// action it produced.
+    ///
+    /// Shared by [`TradeExecutor::evaluate_market`] and
+    /// [`TradeExecutor::evaluate_cached`]; the decision logic is not forked.
+    async fn decide(
+        &self,
+        book: &mut Book,
+        trigger_post_uri: Option<&str>,
+        kill_switch: bool,
+        now: i64,
+    ) -> AppResult<Option<TradeRecord>> {
+        let market_id = book.id().to_owned();
+
         let planned = book.plan(now, self.halflife_hours, &self.policy);
         let mut first: Option<TradeRecord> = None;
         for planned_trade in &planned {
@@ -708,20 +1071,14 @@ impl TradeExecutor {
             }
 
             let Some(record) = self
-                .execute(
-                    &mut book,
-                    planned_trade,
-                    trigger_post_uri,
-                    now,
-                    self.dry_run,
-                )
+                .execute(book, planned_trade, trigger_post_uri, now, self.dry_run)
                 .await?
             else {
                 continue;
             };
 
             book.persist(&self.store, &self.db)?;
-            self.emit_trade(&book, &record);
+            self.emit_trade(book, &record);
             first.get_or_insert(record);
         }
 
@@ -929,19 +1286,219 @@ impl TradeExecutor {
         let _ = self.events.send(TradeEvent::Error { market_id, message });
     }
 
-    /// Consumes pipeline signals and runs a 60-second sync ticker.
+    /// Runs the trade executor.
     ///
-    /// Material signals trigger an immediate trade check for their market. The
-    /// ticker reconciles every active market and then evaluates it, which is
-    /// what catches exits caused by belief decay between posts.
+    /// With `MANIFOLD_WS_ENABLED` (the default) the loop has three arms:
+    /// material pipeline signals (a trade check against the mirrored prices),
+    /// websocket `ManifoldEvent`s (price mirror + debounced trade check), and
+    /// a 5-minute reconcile ticker (batched REST backstop). The legacy branch
+    /// below restores the old polling loop when the flag is `0`.
     ///
-    /// No single failure stops the loop: trade errors are logged, broadcast lag
-    /// is logged, and a closed channel ends the loop.
+    /// No single failure stops the loop: trade errors are logged, broadcast
+    /// lag is logged, and a closed pipeline channel ends the loop.
     pub async fn run(
         self: Arc<Self>,
         mut events: broadcast::Receiver<PipelineEvent>,
+        mut manifold_events: mpsc::Receiver<ManifoldEvent>,
     ) -> AppResult<()> {
-        let mut ticker = tokio::time::interval(SYNC_INTERVAL);
+        if !self.ws_enabled {
+            // LEGACY: delete after the websocket canary has proved out.
+            tracing::info!("MANIFOLD_WS_ENABLED=0; running the legacy 60-second REST loop");
+            drop(manifold_events);
+            return self.run_legacy(events).await;
+        }
+
+        tracing::info!("MANIFOLD_WS_ENABLED=1; live prices from the websocket");
+
+        let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately and is deliberately kept: the
+        // boot pass re-establishes price truth right after startup, which
+        // matters because the websocket never replays missed events.
+        let mut debouncer = EvaluationDebouncer::new(Duration::from_secs(WS_DEBOUNCE_SECS));
+        let mut ws_open = true;
+        let mut ws_closed_at: Option<Instant> = None;
+        let mut ws_down_warned = false;
+
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    match event {
+                        Ok(PipelineEvent::Signal {
+                            material: true,
+                            market_id,
+                            post_uri,
+                            ..
+                        }) => {
+                            if let Err(error) = self
+                                .evaluate_cached(&market_id, Some(&post_uri))
+                                .await
+                            {
+                                tracing::error!(
+                                    market_id = %market_id,
+                                    error = %error,
+                                    "trade check failed after a material signal"
+                                );
+                                self.emit_error(Some(market_id), error.to_string());
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            tracing::warn!(
+                                dropped,
+                                "trade event consumer lagged; some signals were skipped"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
+                }
+                maybe = manifold_events.recv(), if ws_open => {
+                    match maybe {
+                        Some(ManifoldEvent::ContractUpdate(update)) => {
+                            // Untracked markets are broadcast to everyone at
+                            // once; mirroring is only meaningful for ours.
+                            if self.store.cached(&update.contract_id).is_none() {
+                                continue;
+                            }
+
+                            let patch = ProbPatch::from(update.probs);
+                            if let Err(error) =
+                                self.mirror_prices(&update.contract_id, &patch)
+                            {
+                                tracing::error!(
+                                    market_id = %update.contract_id,
+                                    error = %error,
+                                    "mirroring a websocket price update failed"
+                                );
+                                continue;
+                            }
+
+                            // The resolution signature (see `patch_is_terminal`):
+                            // settled positions resolve automatically, so any
+                            // trade attempt would fail against Manifold.
+                            if patch_is_terminal(&patch) {
+                                tracing::debug!(
+                                    market_id = %update.contract_id,
+                                    "probability patch is at an outcome extreme; \
+                                     skipping evaluation"
+                                );
+                                continue;
+                            }
+
+                            // Paused or closed markets keep their fresh
+                            // mirrored price but are never evaluated.
+                            if self
+                                .store
+                                .cached(&update.contract_id)
+                                .is_some_and(|market| market.status != MarketStatus::Active)
+                            {
+                                continue;
+                            }
+
+                            if !debouncer.due(Instant::now(), &update.contract_id) {
+                                continue;
+                            }
+                            // Circular-safety: a fill moves the market toward
+                            // our belief, so re-evaluating right after our own
+                            // buy sees the edge collapse. The planner's exit
+                            // branch no-ops unless edge < EXIT threshold and
+                            // entry needs |edge| ≥ ENTRY; belief only moves on
+                            // triage impulses (never on our bets), so the
+                            // sequence converges and at most one action fires
+                            // per evaluation. No other feedback state was
+                            // added.
+                            tracing::debug!(
+                                market_id = %update.contract_id,
+                                "evaluating after a websocket price update"
+                            );
+                            let market_id = update.contract_id;
+                            if let Err(error) = self.evaluate_cached(&market_id, None).await {
+                                tracing::error!(
+                                    market_id = %market_id,
+                                    error = %error,
+                                    "trade check failed after a price update"
+                                );
+                                self.emit_error(Some(market_id), error.to_string());
+                            }
+                        }
+                        // S2 (new-market sniping) and S3 (copy-trading) are
+                        // later phases of `docs/ALGO.md`; both events are
+                        // parsed but intentionally inert here.
+                        Some(ManifoldEvent::NewContract(event)) => {
+                            tracing::debug!(
+                                contract_id = %event.contract.id,
+                                slug = ?event.contract.slug,
+                                outcome_type = ?event.contract.outcome_type,
+                                "new contract broadcast; sniping is a later phase"
+                            );
+                        }
+                        Some(ManifoldEvent::Bet(bet)) => {
+                            tracing::debug!(
+                                contract_id = %bet.contract_id,
+                                "bet broadcast; copy-trading is a later phase"
+                            );
+                        }
+                        // The channel closes only when the socket task is
+                        // gone (all senders dropped). From here the 5-minute
+                        // reconcile alone keeps the bot conservative.
+                        None => {
+                            ws_open = false;
+                            ws_closed_at = Some(Instant::now());
+                            tracing::info!(
+                                "manifold event stream closed; running on the reconcile backstop"
+                            );
+                        }
+                    }
+                }
+                _ = reconcile.tick() => {
+                    // One-line warning once the websocket has been gone for a
+                    // full reconcile cycle. Reconnects are invisible here (the
+                    // channel just starts delivering again), which is fine:
+                    // mirror prices resume with the next event.
+                    if !ws_down_warned {
+                        if let Some(closed_at) = ws_closed_at {
+                            if closed_at.elapsed() >= RECONCILE_INTERVAL {
+                                tracing::warn!(
+                                    "manifold websocket has been closed for a reconcile cycle; \
+                                     running on the 5-minute REST backstop"
+                                );
+                                ws_down_warned = true;
+                            }
+                        }
+                    }
+
+                    let summary = self.reconcile_pass().await;
+                    tracing::info!(
+                        markets_seen = summary.markets_seen,
+                        mismatches = summary.mismatches,
+                        tokens_spent = summary.tokens_spent,
+                        tokens_skipped = summary.tokens_skipped,
+                        "reconcile pass complete"
+                    );
+                    if summary.tokens_skipped > 0 {
+                        tracing::warn!(
+                            skipped = summary.tokens_skipped,
+                            "some reconcile reads were skipped for the trade reserve"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Consumes pipeline signals and runs a 60-second REST sync ticker.
+    ///
+    /// LEGACY: the pre-websocket control flow, selected by
+    /// `MANIFOLD_WS_ENABLED=0` while the websocket path canaries. Material
+    /// signals trigger an immediate trade check for their market. The ticker
+    /// reconciles every active market and then evaluates it, which is what
+    /// catches exits caused by belief decay between posts. Delete it with the
+    /// flag after canary.
+    async fn run_legacy(
+        self: Arc<Self>,
+        mut events: broadcast::Receiver<PipelineEvent>,
+    ) -> AppResult<()> {
+        let mut ticker = tokio::time::interval(LEGACY_SYNC_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first interval tick completes immediately. Consume it so startup
         // does not race the first real 60-second reconciliation.
@@ -993,6 +1550,231 @@ impl TradeExecutor {
                     }
                 }
             }
+        }
+    }
+
+    /// Mirrors one observed probability patch into the store (cache + rows).
+    ///
+    /// Probabilities are clamped into the trading range exactly as
+    /// [`Book::observe_prices`] clamps a REST snapshot, so both observation
+    /// channels store comparable values.
+    fn mirror_prices(&self, market_id: &str, patch: &ProbPatch) -> AppResult<()> {
+        let answers: Vec<(MarketId, f64)> = patch
+            .answers
+            .iter()
+            .map(|(answer_id, prob)| {
+                (
+                    answer_id.clone(),
+                    prob.clamp(MIN_TRADING_PROB, MAX_TRADING_PROB),
+                )
+            })
+            .collect();
+        self.store.market_prices_observed(
+            market_id,
+            patch
+                .root
+                .map(|prob| prob.clamp(MIN_TRADING_PROB, MAX_TRADING_PROB)),
+            &answers,
+        )
+    }
+
+    /// The slow REST reconcile backstop (every [`RECONCILE_INTERVAL`]).
+    ///
+    /// Three parts, each of which may skip on a rate refusal:
+    ///
+    /// 1. **Batched probabilities** — `GET /v0/market-probs` in 100-ID chunks
+    ///    for every active market, written through the same price mirror as
+    ///    websocket updates. A response whose shape disagrees with the stored
+    ///    market kind, or announces an answer we have never recorded, runs
+    ///    the full per-market sync for that one market (kind refresh, answer
+    ///    discovery with text).
+    /// 2. **One portfolio snapshot** — the paginated
+    ///    `get-user-contract-metrics-with-contracts` call replaces the legacy
+    ///    per-market `/positions` sync. Every tracked market present in the
+    ///    snapshot is reconciled through [`Book::reconcile`] (the same
+    ///    warn-on-mismatch-trust-remote comparison), and when the pagination
+    ///    is complete, tracked markets *absent* from it are treated as flat.
+    /// 3. A single summary line, logged by the caller of this method.
+    ///
+    /// Per-market failures are logged and emitted so one broken market cannot
+    /// stall the pass.
+    async fn reconcile_pass(&self) -> ReconcileSummary {
+        let mut summary = ReconcileSummary::default();
+        let markets = self.store.active();
+        summary.markets_seen = markets.len();
+
+        // 1. Batched probability refresh.
+        for chunk in markets.chunks(PROB_CHUNK_SIZE) {
+            let ids: Vec<String> = chunk.iter().map(|market| market.id.clone()).collect();
+            if !summary.acquire(&self.rate, "market-probs chunk") {
+                continue;
+            }
+            for (market_id, probs) in match self.client.market_probs(&ids).await {
+                Ok(probs) => probs,
+                Err(error) => {
+                    tracing::error!(error = %error, "batched probability refresh failed");
+                    continue;
+                }
+            } {
+                if self.store.cached(&market_id).is_none() {
+                    continue;
+                }
+                if self.price_sync_needed(&market_id, &probs).await {
+                    summary.mismatches += 1;
+                    // The full sync spends one token per REST request it
+                    // makes (market snapshot + positions).
+                    if !summary.acquire(&self.rate, "full state sync (market)") {
+                        continue;
+                    }
+                    if !summary.acquire(&self.rate, "full state sync (positions)") {
+                        continue;
+                    }
+                    if let Err(error) = self.sync_market(&market_id).await {
+                        tracing::error!(
+                            market_id = %market_id,
+                            error = %error,
+                            "full state sync failed"
+                        );
+                        self.emit_error(Some(market_id.clone()), error.to_string());
+                        continue;
+                    }
+                    continue;
+                }
+
+                let patch = ProbPatch::from(probs);
+                if let Err(error) = self.mirror_prices(&market_id, &patch) {
+                    tracing::error!(
+                        market_id = %market_id,
+                        error = %error,
+                        "writing reconciled probabilities failed"
+                    );
+                    self.emit_error(Some(market_id.clone()), error.to_string());
+                }
+            }
+        }
+
+        // 2. One portfolio snapshot for position truth.
+        let mut by_contract: HashMap<MarketId, Vec<Value>> = HashMap::new();
+        let mut offset = 0;
+        let mut complete = false;
+        let mut pages = 0;
+        while pages < PORTFOLIO_MAX_PAGES {
+            if pages == 0 && !summary.acquire(&self.rate, "portfolio") {
+                break;
+            }
+            let (page, final_page) = match self.client.portfolio_page(offset).await {
+                Ok((page, final_page)) => (page, final_page),
+                Err(error) => {
+                    tracing::error!(error = %error, "portfolio snapshot fetch failed");
+                    break;
+                }
+            };
+            let page_size: usize = page.values().map(Vec::len).sum();
+            by_contract.extend(page);
+            complete = final_page;
+            offset += page_size;
+            pages += 1;
+            if final_page {
+                break;
+            }
+            if !summary.acquire(&self.rate, "portfolio page") {
+                break;
+            }
+        }
+        if pages == PORTFOLIO_MAX_PAGES && !complete {
+            tracing::warn!(
+                pages,
+                "portfolio pagination hit the page cap; positions stay as-is"
+            );
+        }
+
+        for (market_id, entries) in &by_contract {
+            if self.store.cached(market_id).is_none() {
+                continue;
+            }
+            let positions = parse_position_entries(entries.as_slice(), self.client.bot_user_id());
+            if let Err(error) = self
+                .reconcile_book_position(market_id, &positions, &mut summary.mismatches)
+                .await
+            {
+                tracing::error!(
+                    market_id = %market_id,
+                    error = %error,
+                    "portfolio position reconciliation failed"
+                );
+                self.emit_error(Some(market_id.clone()), error.to_string());
+            }
+        }
+
+        // Only a fully paginated snapshot may declare a tracked market flat:
+        // a truncated one would wrongly zero real positions.
+        if complete {
+            for market in &markets {
+                if by_contract.contains_key(&market.id) {
+                    continue;
+                }
+                let positions = MarketPositions::default();
+                if let Err(error) = self
+                    .reconcile_book_position(&market.id, &positions, &mut summary.mismatches)
+                    .await
+                {
+                    tracing::error!(
+                        market_id = %market.id,
+                        error = %error,
+                        "position reconciliation for a flat market failed"
+                    );
+                    self.emit_error(Some(market.id.clone()), error.to_string());
+                }
+            }
+        } else if pages > 0 {
+            tracing::warn!("portfolio snapshot did not finish; reconciled what was fetched only");
+        }
+
+        summary
+    }
+
+    /// Reconciles one market's position through the book, counting mismatches.
+    async fn reconcile_book_position(
+        &self,
+        market_id: &str,
+        positions: &MarketPositions,
+        mismatches: &mut usize,
+    ) -> AppResult<()> {
+        let mut book = self.load_book(market_id)?;
+        if book.status() != MarketStatus::Active {
+            return Ok(());
+        }
+
+        *mismatches += book.reconcile(positions);
+        book.persist(&self.store, &self.db)
+    }
+
+    /// Whether one batched price reading disagrees with the tracked market's
+    /// stored shape: a multiple-choice market with a bare probability, a
+    /// binary market with answer probabilities, or an answer ID we have never
+    /// recorded (a brand-new answer, which needs its text from the full
+    /// snapshot).
+    ///
+    /// These need the full per-market sync, which refreshes the kind,
+    /// discovers new answers with their text, and re-syncs positions.
+    async fn price_sync_needed(&self, market_id: &str, probs: &MarketProbs) -> bool {
+        let is_multiple_choice = self
+            .store
+            .cached(market_id)
+            .is_some_and(|market| market.is_multiple_choice());
+
+        match (probs, is_multiple_choice) {
+            (MarketProbs::Binary { .. }, _) if !is_multiple_choice => false,
+            (MarketProbs::Answers { answers }, true) => {
+                let known: Vec<MarketId> = match self.db.list_answers(market_id) {
+                    Ok(list) => list.into_iter().map(|answer| answer.id).collect(),
+                    Err(_) => return true,
+                };
+                answers
+                    .iter()
+                    .any(|(answer_id, _)| !known.iter().any(|id| id == answer_id))
+            }
+            _ => true,
         }
     }
 
@@ -1265,7 +2047,7 @@ mod tests {
     use serde_json::json;
 
     use crate::belief;
-    use crate::book::{TradeLimits, TradeParams, MAX_TRADING_PROB, MIN_TRADING_PROB};
+    use crate::book::{MAX_TRADING_PROB, MIN_TRADING_PROB, TradeLimits, TradeParams};
 
     fn params() -> TradeParams {
         TradeParams {
@@ -1616,6 +2398,196 @@ mod tests {
         assert_close(answers[0].probability.expect("price"), 0.6);
     }
 
+    // -- Parsers ------------------------------------------------------------
+
+    #[test]
+    fn market_probs_response_parses_both_shapes() {
+        let raw = json!({
+            "binary-market": {"prob": 0.62},
+            "multi-market": {"answerProbs": {"a1": 0.67, "a2": 0.33}}
+        });
+
+        let probs = parse_market_probs(&raw);
+
+        assert_eq!(probs.len(), 2);
+        assert_eq!(
+            probs.get("binary-market"),
+            Some(&MarketProbs::Binary { prob: 0.62 })
+        );
+        assert_eq!(
+            probs.get("multi-market"),
+            Some(&MarketProbs::Answers {
+                answers: vec![("a1".to_owned(), 0.67), ("a2".to_owned(), 0.33)]
+            })
+        );
+    }
+
+    #[test]
+    fn market_probs_response_skips_unrecognized_and_empty_shapes() {
+        // A shape we do not know (or a market without probabilities) must be
+        // skipped, tolerated, and never lose the whole pass.
+        let raw = json!({
+            "known": {"prob": 0.1},
+            "broken": {"weird": 1},
+            "empty-answers": {"answerProbs": {}},
+            "null-prob": {"prob": null}
+        });
+
+        let probs = parse_market_probs(&raw);
+        assert_eq!(
+            probs.get("known"),
+            Some(&MarketProbs::Binary { prob: 0.1 }),
+            "the valid entry survives"
+        );
+        assert_eq!(probs.get("broken"), None);
+        assert_eq!(probs.get("empty-answers"), None);
+        assert_eq!(probs.get("null-prob"), None);
+        assert!(parse_market_probs(&json!([1, 2, 3])).is_empty());
+        assert!(parse_market_probs(&json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn metrics_by_contract_extracts_rentered_pages() {
+        let raw = json!({
+            "metricsByContract": {
+                "bin": [
+                    {"userId": "bot-1", "totalShares": {"YES": 3.0}, "invested": 2.0, "profit": 1.0}
+                ],
+                "mc": [
+                    {"userId": "bot-1", "totalShares": {"YES": 10.0, "NO": 4.0}, "invested": 8.0},
+                    {"userId": "bot-1", "answerId": "a1", "totalShares": {"YES": 10.0}, "invested": 6.0},
+                    {"userId": "bot-1", "answerId": "a2", "totalShares": {"NO": 4.0}, "invested": 2.0}
+                ],
+                "skipped": []
+            }
+        });
+
+        let by_contract = parse_metrics_by_contract(&raw);
+        assert_eq!(by_contract.len(), 2, "empty metric lists are dropped");
+
+        let positions = parse_position_entries(&by_contract["mc"], "bot-1");
+        assert!(positions.saw_root);
+        assert!(positions.checksum_ok());
+        assert_close(positions.root.yes_shares, 10.0);
+        assert_close(positions.root.invested, 8.0);
+        assert_close(positions.answer("a1").yes_shares, 10.0);
+        assert_close(positions.answer("a2").no_shares, 4.0);
+
+        let binary = parse_position_entries(&by_contract["bin"], "bot-1");
+        assert_close(binary.root.yes_shares, 3.0);
+    }
+
+    #[test]
+    fn metrics_by_contract_tolerates_a_missing_or_shapeless_key() {
+        assert!(parse_metrics_by_contract(&json!({})).is_empty());
+        assert!(parse_metrics_by_contract(&json!({"metricsByContract": null})).is_empty());
+        assert!(parse_metrics_by_contract(&json!({"metricsByContract": {"c": "no"}})).is_empty());
+    }
+
+    #[test]
+    fn terminal_patches_are_detected_across_both_shapes() {
+        // Binary at 0 or 1: the resolution signature of the legacy isResolved
+        // check, which a price patch cannot carry.
+        assert!(patch_is_terminal(&ProbPatch {
+            root: Some(1.0),
+            answers: Vec::new()
+        }));
+        assert!(patch_is_terminal(&ProbPatch {
+            root: Some(0.0),
+            answers: Vec::new()
+        }));
+        assert!(!patch_is_terminal(&ProbPatch {
+            root: Some(0.5),
+            answers: Vec::new()
+        }));
+        assert!(!patch_is_terminal(&ProbPatch {
+            root: Some(0.99),
+            answers: Vec::new()
+        }));
+
+        // A multiple-choice market counts only when every answer is settled:
+        // some answers of an open market may legitimately sit at the extremes.
+        assert!(patch_is_terminal(&ProbPatch {
+            root: None,
+            answers: vec![("a".to_owned(), 1.0), ("b".to_owned(), 0.0)]
+        }));
+        assert!(!patch_is_terminal(&ProbPatch {
+            root: None,
+            answers: vec![("a".to_owned(), 1.0), ("b".to_owned(), 0.3)]
+        }));
+        assert!(
+            !patch_is_terminal(&ProbPatch {
+                root: None,
+                answers: Vec::new()
+            }),
+            "an empty patch has no observation, hence no verdict"
+        );
+    }
+
+    // -- Debounce -----------------------------------------------------------
+
+    #[test]
+    fn the_debouncer_coalesces_a_burst_into_one_evaluation() {
+        let window = Duration::from_millis(2_000);
+        let mut debouncer = EvaluationDebouncer::new(window);
+        let t0 = Instant::now();
+
+        assert!(debouncer.due(t0, &"m1".to_owned()));
+        // Every update inside the window is folded into the mirror only.
+        assert!(!debouncer.due(t0 + Duration::from_millis(300), &"m1".to_owned()));
+        assert!(!debouncer.due(t0 + Duration::from_millis(1_999), &"m1".to_owned()));
+        // Just past the window the evaluation becomes due again.
+        assert!(debouncer.due(t0 + Duration::from_millis(2_001), &"m1".to_owned()));
+    }
+
+    #[test]
+    fn the_debouncer_throttles_markets_independently() {
+        let window = Duration::from_secs(1);
+        let mut debouncer = EvaluationDebouncer::new(window);
+        let t0 = Instant::now();
+
+        assert!(debouncer.due(t0, &"m1".to_owned()));
+        assert!(debouncer.due(t0 + Duration::from_millis(1), &"m2".to_owned()));
+        // m1 still throttled by its own timestamp, whatever m2 did.
+        assert!(!debouncer.due(t0 + Duration::from_millis(2), &"m1".to_owned()));
+    }
+
+    #[test]
+    fn probs_patch_converts_websocket_and_rest_shapes_the_same_way() {
+        let from_ws = ProbPatch::from(ContractProbs::Binary { prob: 0.7 });
+        assert_eq!(
+            from_ws,
+            ProbPatch {
+                root: Some(0.7),
+                answers: Vec::new()
+            }
+        );
+
+        let from_ws = ProbPatch::from(ContractProbs::Multi {
+            answers: vec![
+                crate::manifold_ws::AnswerProb {
+                    id: "a".to_owned(),
+                    prob: 0.6,
+                },
+                crate::manifold_ws::AnswerProb {
+                    id: "b".to_owned(),
+                    prob: 0.4,
+                },
+            ],
+        });
+        assert_eq!(from_ws.root, None);
+        assert_eq!(
+            from_ws.answers,
+            vec![("a".to_owned(), 0.6), ("b".to_owned(), 0.4)]
+        );
+
+        let from_rest = ProbPatch::from(MarketProbs::Answers {
+            answers: vec![("a".to_owned(), 0.6)],
+        });
+        assert_eq!(from_rest.root, None);
+        assert_eq!(from_rest.answers, vec![("a".to_owned(), 0.6)]);
+    }
+
     // -------------------------------------------------------------------
     // Live calls. Run with `cargo test -- --ignored --nocapture`
     // -------------------------------------------------------------------
@@ -1650,6 +2622,7 @@ mod tests {
             mc_max_new_per_tick: 2,
             mc_max_answer_fraction: 0.25,
             rate_limit_per_min: 500,
+            manifold_ws_enabled: true,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-mcq-live.db"),
         }
     }
