@@ -19,6 +19,7 @@ mod error;
 mod extract;
 mod ingest;
 mod llm;
+mod manifold_ws;
 mod market_store;
 mod onboarding;
 mod onboarding_agent;
