@@ -10,7 +10,7 @@
 //! Three ports keep the service in-process and testable:
 //!
 //! - [`Threads`] is the Discord thread lifecycle; its real adapter lives in
-//!   `discord.rs` so this module never imports `serenity`.
+//!   `discord.rs` so this module never imports the Discord client crate.
 //! - [`Onboarder`] is the onboarding transaction, implemented for
 //!   [`OnboardingService`].
 //! - [`Trading`] is the slice of [`TradeExecutor`] the control plane needs.

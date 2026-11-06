@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 use crate::config::Config;
+use crate::control::ControlPlane;
 use crate::db::Db;
 use crate::error::{anyhow, AppResult, Context};
 use crate::market_store::MarketStore;
@@ -122,14 +123,22 @@ async fn main() -> AppResult<()> {
     );
     let discord_trade_events = executor.events().subscribe();
 
+    // The control plane owns every operator-driven lifecycle transition. The
+    // two `Arc` coercions keep the dependency edges pointing at the services.
+    let control = Arc::new(ControlPlane::new(
+        db.clone(),
+        Arc::clone(&store),
+        Arc::clone(&pipeline.registry),
+        onboarding,
+        executor.clone(),
+    ));
+
     let discord_state = discord::DiscordState {
         config: Arc::clone(&config),
         db: db.clone(),
-        registry: Arc::clone(&pipeline.registry),
         store: Arc::clone(&store),
         pipeline: Arc::clone(&pipeline),
-        onboarding,
-        executor: Arc::clone(&executor),
+        control,
     };
 
     let post_tx = ingest::channel();

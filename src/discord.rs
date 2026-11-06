@@ -37,15 +37,15 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::belief;
 use crate::config::Config;
+use crate::control::{
+    resolve_market, CloseReport, ControlPlane, PanicReport, Sale, ThreadId, Threads, UntrackReport,
+};
 use crate::db::Db;
 use crate::error::{bail, AppResult, Context as AnyhowContext};
 use crate::market_store::MarketStore;
-use crate::onboarding::{
-    OnboardUpdate, OnboardingDraft, OnboardingService, ResearchStep, SieveAttempt,
-};
+use crate::onboarding::{OnboardUpdate, OnboardingDraft, ResearchStep, SieveAttempt};
 use crate::pipeline::{Pipeline, PipelineEvent};
-use crate::sieve::EngineRegistry;
-use crate::trade::{LiquidationOutcome, TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
+use crate::trade::TradeEvent;
 use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket};
 
 /// Maximum number of autocomplete choices Discord accepts.
@@ -118,11 +118,43 @@ const TRACK_ATTEMPT_RESERVE: usize = 320;
 pub struct DiscordState {
     pub config: Arc<Config>,
     pub db: Db,
-    pub registry: Arc<EngineRegistry>,
     pub store: Arc<MarketStore>,
     pub pipeline: Arc<Pipeline>,
-    pub onboarding: Arc<OnboardingService>,
-    pub executor: Arc<TradeExecutor>,
+    pub control: Arc<ControlPlane>,
+}
+
+/// The Discord adapter for the control plane's thread port.
+///
+/// The adapter owns the Discord API and the thread name; the control plane owns
+/// only the ordering (create → activate → archive on failure).
+struct DiscordThreads {
+    http: Arc<Http>,
+    control_channel: ChannelId,
+}
+
+#[serenity::async_trait]
+impl Threads for DiscordThreads {
+    async fn create_for_market(&self, budget: f64, question: &str) -> AppResult<ThreadId> {
+        let thread_name = format!("[M{budget}] {}", shorten_question(question, 50));
+        let thread = self
+            .control_channel
+            .create_thread(
+                &self.http,
+                CreateThread::new(thread_name).kind(ChannelType::PublicThread),
+            )
+            .await
+            .context("creating the market thread under the control channel")?;
+        Ok(ThreadId(thread.id.get()))
+    }
+
+    async fn archive(&self, thread: ThreadId) {
+        if let Err(error) = ChannelId::new(thread.0)
+            .edit_thread(&self.http, EditThread::new().archived(true))
+            .await
+        {
+            tracing::warn!(thread_id = thread.0, error = %error, "failed to archive the thread");
+        }
+    }
 }
 
 /// Builds the HTTP client, spawns the event consumers, and runs the gateway.
@@ -664,60 +696,6 @@ fn answer_lines(answers: &[TrackedAnswer], now: i64, halflife_hours: f64) -> Vec
         .collect()
 }
 
-/// Resolves an operator-provided market reference.
-///
-/// The market ID or slug must match case-insensitively. A unique slug prefix is
-/// accepted as a convenience. Ambiguous or missing references resolve to
-/// `None` rather than guessing.
-pub(crate) fn resolve_market<'a>(
-    markets: &'a [TrackedMarket],
-    query: &str,
-) -> Option<&'a TrackedMarket> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let needle = trimmed.to_lowercase();
-    let url_slug = crate::onboarding::parse_slug(trimmed)
-        .or_else(|_| crate::onboarding::parse_slug(&format!("https://{trimmed}")))
-        .ok()
-        .map(|s| s.to_lowercase());
-
-    let exact: Vec<&TrackedMarket> = markets
-        .iter()
-        .filter(|market| {
-            let id = market.id.to_lowercase();
-            let slug = market.slug.to_lowercase();
-            id == needle
-                || slug == needle
-                || url_slug.as_deref() == Some(&slug)
-                || url_slug.as_deref() == Some(&id)
-        })
-        .collect();
-    if exact.len() == 1 {
-        return exact.first().copied();
-    }
-    if !exact.is_empty() {
-        return None;
-    }
-
-    let prefixes: Vec<&TrackedMarket> = markets
-        .iter()
-        .filter(|market| {
-            let slug = market.slug.to_lowercase();
-            slug.starts_with(&needle)
-                || url_slug
-                    .as_deref()
-                    .is_some_and(|url_s| slug.starts_with(url_s))
-        })
-        .collect();
-    if prefixes.len() == 1 {
-        return prefixes.first().copied();
-    }
-
-    None
-}
-
 /// One compact line for the recent-signal history.
 fn signal_line(signal: &SignalRecord) -> String {
     format!(
@@ -1150,52 +1128,28 @@ async fn onboard(
     initial_prob: Option<u8>,
     updates: mpsc::Sender<OnboardUpdate>,
 ) -> AppResult<()> {
-    let draft = state
-        .onboarding
-        .prepare(url, budget, initial_prob, &updates)
+    let threads = DiscordThreads {
+        http: Arc::clone(&ctx.http),
+        control_channel: ChannelId::new(state.config.discord_control_channel_id),
+    };
+    let onboarded = state
+        .control
+        .track(url, budget, initial_prob, updates, &threads)
         .await?;
 
-    if let Some(existing) = state.store.load(&draft.market.id)? {
-        if existing.status != MarketStatus::Closed {
-            bail!(
-                "market {} is already tracked (see /status or /untrack)",
-                draft.market.id
-            );
-        }
-    }
-
-    let thread_name = format!(
-        "[M{budget}] {}",
-        shorten_question(&draft.market.question, 50)
-    );
-    let thread = ChannelId::new(state.config.discord_control_channel_id)
-        .create_thread(
-            &ctx.http,
-            CreateThread::new(thread_name).kind(ChannelType::PublicThread),
-        )
-        .await
-        .context("creating the market thread under the control channel")?;
-    let thread_id = thread.id.get();
-
-    if let Err(error) = state
-        .onboarding
-        .activate(draft.clone(), &thread_id.to_string())
-    {
-        let _ = ChannelId::new(thread_id)
-            .edit_thread(&ctx.http, EditThread::new().archived(true))
-            .await;
-        return Err(error).context("activating the prepared draft");
-    }
-
-    let mut message = CreateMessage::new().embed(onboarded_embed(&draft));
-    for button in onboarded_buttons(&draft.market.id) {
+    let mut message = CreateMessage::new().embed(onboarded_embed(&onboarded.draft));
+    for button in onboarded_buttons(&onboarded.draft.market.id) {
         message = message.button(button);
     }
-    if let Err(error) = ChannelId::new(thread_id)
+    if let Err(error) = ChannelId::new(onboarded.thread.0)
         .send_message(&ctx.http, message)
         .await
     {
-        tracing::error!(thread_id, error = %error, "failed to post the [ONBOARDED] embed");
+        tracing::error!(
+            thread_id = onboarded.thread.0,
+            error = %error,
+            "failed to post the [ONBOARDED] embed"
+        );
     }
 
     Ok(())
@@ -1224,8 +1178,13 @@ async fn untrack(state: &DiscordState, ctx: &Context, interaction: &CommandInter
         return;
     }
 
-    match untrack_market(state, ctx, &query, liquidate).await {
-        Ok(summary) => send_followup(ctx, interaction, &summary).await,
+    let threads = DiscordThreads {
+        http: Arc::clone(&ctx.http),
+        control_channel: ChannelId::new(state.config.discord_control_channel_id),
+    };
+
+    match state.control.untrack(&query, liquidate, &threads).await {
+        Ok(report) => send_followup(ctx, interaction, &render_untrack(&report)).await,
         Err(error) => {
             tracing::warn!(error = %error, "/untrack failed");
             send_followup(
@@ -1238,73 +1197,41 @@ async fn untrack(state: &DiscordState, ctx: &Context, interaction: &CommandInter
     }
 }
 
-/// Tears down one market: optional liquidation, soft delete, archive.
-///
-/// The market row is kept with `status = CLOSED` and a `deleted_at` timestamp,
-/// so its answers and ledger history stay auditable. It disappears from every
-/// listing and from the match path, the Sieve engine is unregistered, and the
-/// thread is archived.
-///
-/// The call is validated and idempotent: an already-untracked market is
-/// reported without selling or archiving anything a second time.
-async fn untrack_market(
-    state: &DiscordState,
-    ctx: &Context,
-    query: &str,
-    liquidate: bool,
-) -> AppResult<String> {
-    let market = resolve_any_market(state, query)?;
-    let market_id = market.id.clone();
-    let thread_id = market.discord_thread_id.clone();
-
-    if market.is_deleted() {
-        return Ok(format!(
-            "**{}** (`{market_id}`) is already untracked. Nothing was changed.",
-            market.question
-        ));
-    }
-
-    // Liquidation runs before the cleanup, but its failure must not stop the
-    // cleanup: a market that stays tracked keeps its Sieve engine and crashes
-    // the trade executor again. The failure is reported instead of aborting.
-    let mut sell_failure = None;
-    if liquidate && market.status != MarketStatus::Closed {
-        if let Err(error) = state.executor.liquidate(&market_id).await {
-            tracing::error!(market_id = %market_id, error = %error, "liquidation during /untrack failed");
-            sell_failure = Some(error);
-        }
-    }
-
-    state.registry.unregister(&market_id);
-    state.store.untrack(&market_id, Utc::now().timestamp())?;
-
-    if let Ok(channel_id) = thread_id.trim().parse::<u64>() {
-        if let Err(error) = ChannelId::new(channel_id)
-            .edit_thread(&ctx.http, EditThread::new().archived(true))
-            .await
-        {
-            tracing::warn!(thread_id = channel_id, error = %error, "failed to archive the thread");
-        }
-    }
-
-    let positions_msg = match sell_failure {
-        Some(error) => format!(
-            " Untracking continued because liquidation failed: `{error}`. The \
-                                position was not sold; handle it on Manifold directly."
+/// Renders an `/untrack` report. Every string is copied from the pre-service
+/// handler so the operator sees the same output.
+fn render_untrack(report: &UntrackReport) -> String {
+    match report {
+        UntrackReport::AlreadyUntracked {
+            question,
+            market_id,
+        } => format!(
+            "**{question}** (`{market_id}`) is already untracked. Nothing was changed."
         ),
-        None if liquidate && market.status != MarketStatus::Closed => {
+        UntrackReport::Untracked {
+            question,
+            market_id,
+            sale,
+        } => format!(
+            "Untracked **{question}** (`{market_id}`).{} The row and its history were kept; the \
+             thread was archived.",
+            render_sale(sale),
+        ),
+    }
+}
+
+/// The position clause of an `/untrack` reply.
+fn render_sale(sale: &Sale) -> String {
+    match sale {
+        Sale::Failed(error) => format!(
+            " Untracking continued because liquidation failed: `{error}`. The \
+             position was not sold; handle it on Manifold directly."
+        ),
+        Sale::Liquidated | Sale::Resolved | Sale::NoPosition => {
             " Positions were liquidated.".to_owned()
         }
-        None if market.status != MarketStatus::Closed => {
-            " Positions were left untouched.".to_owned()
-        }
-        None => " The position was already closed.".to_owned(),
-    };
-    Ok(format!(
-        "Untracked **{}** (`{market_id}`).{positions_msg} The row and its history were kept; the \
-         thread was archived.",
-        market.question,
-    ))
+        Sale::Untouched => " Positions were left untouched.".to_owned(),
+        Sale::AlreadyClosed => " The position was already closed.".to_owned(),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1339,15 +1266,12 @@ async fn budget(state: &DiscordState, ctx: &Context, interaction: &CommandIntera
         return;
     }
 
-    let result = (|| -> AppResult<String> {
-        let market = resolve_single_market(state, &query)?;
-        let before = market.budget_mana;
-        state.store.record_budget(&market.id, new_budget)?;
-        Ok(format!(
-            "Budget for **{}** (`{}`): {before:.2} mana → {new_budget:.2} mana.",
-            market.question, market.id
-        ))
-    })();
+    let result = state.control.set_budget(&query, new_budget).map(|change| {
+        format!(
+            "Budget for **{}** (`{}`): {:.2} mana → {:.2} mana.",
+            change.question, change.market_id, change.before, change.after
+        )
+    });
 
     finish_sync(ctx, interaction, result, "Failed to change the budget").await;
 }
@@ -1377,31 +1301,20 @@ async fn override_belief(state: &DiscordState, ctx: &Context, interaction: &Comm
     let probability = probability.clamp(1, 99) as f64 / 100.0;
 
     let result = (|| -> AppResult<String> {
-        let market = resolve_single_market(state, &query)?;
-        let (log_odds, clamped_p) = belief::override_probability(probability);
-        let now = Utc::now().timestamp();
-        // Only the belief columns move. `p_market_last` belongs to the trade
-        // sync, so the next decay uses whatever price the market last reported.
-        state.store.record_belief(&market.id, log_odds, now)?;
+        let change = state.control.set_probability(&query, probability)?;
 
         // Trigger one trade check off the interaction path: it makes network
         // calls and must not block the response.
-        let executor = Arc::clone(&state.executor);
-        let checked_id = market.id.clone();
+        let control = Arc::clone(&state.control);
+        let checked_id = change.market_id.clone();
         tokio::spawn(async move {
-            if let Err(error) = executor.evaluate_market(&checked_id, None).await {
-                tracing::error!(
-                    market_id = %checked_id,
-                    error = %error,
-                    "trade check after /override failed"
-                );
-            }
+            control.check_now(&checked_id).await;
         });
 
         Ok(format!(
-            "**{}** (`{}`) internal probability set to {clamped_p:.3} (log-odds {log_odds:.4}). \
+            "**{}** (`{}`) internal probability set to {:.3} (log-odds {:.4}). \
              One trade check was triggered.",
-            market.question, market.id
+            change.question, change.market_id, change.clamped_p, change.log_odds
         ))
     })();
 
@@ -1433,38 +1346,8 @@ async fn panic_mode(state: &DiscordState, ctx: &Context, interaction: &CommandIn
     }
 
     let result = (async || -> AppResult<String> {
-        state
-            .db
-            .set_kv(KILL_SWITCH_KEY, "true")
-            .context("setting the global kill switch")?;
-
-        let mut summary = String::from(
-            "Global kill switch is **ON**. Future buys are blocked; sells remain allowed.\n\
-             To disable it, edit the `global_kill_switch` kv entry (or hand off to an operator); \
-             there is no un-panic command.",
-        );
-
-        if liquidate_all {
-            let errors = state.executor.liquidate_all().await;
-            let attempted = state
-                .store
-                .list()?
-                .iter()
-                .filter(|market| market.status != MarketStatus::Closed)
-                .count();
-            let liquidated = attempted.saturating_sub(errors.len());
-            summary.push_str(&format!(
-                "\n\nLiquidate-all: {liquidated}/{attempted} market(s) liquidated."
-            ));
-            for (market_id, error) in &errors {
-                summary.push_str(&format!(
-                    "\n- `{market_id}`: {}",
-                    truncate_chars(&error.to_string(), 400)
-                ));
-            }
-        }
-
-        Ok(summary)
+        let report = state.control.panic(liquidate_all).await?;
+        Ok(render_panic(&report))
     })()
     .await;
 
@@ -1479,6 +1362,31 @@ async fn panic_mode(state: &DiscordState, ctx: &Context, interaction: &CommandIn
             .await;
         }
     }
+}
+
+/// Renders a `/panic` report. The prose and the kill-switch header are copied
+/// from the pre-service handler; only the error text is truncated here.
+fn render_panic(report: &PanicReport) -> String {
+    let mut summary = String::from(
+        "Global kill switch is **ON**. Future buys are blocked; sells remain allowed.\n\
+         To disable it, edit the `global_kill_switch` kv entry (or hand off to an operator); \
+         there is no un-panic command.",
+    );
+
+    if let Some(attempted) = report.attempted {
+        summary.push_str(&format!(
+            "\n\nLiquidate-all: {}/{attempted} market(s) liquidated.",
+            report.liquidated
+        ));
+        for (market_id, error) in &report.errors {
+            summary.push_str(&format!(
+                "\n- `{market_id}`: {}",
+                truncate_chars(error, 400)
+            ));
+        }
+    }
+
+    summary
 }
 
 // -----------------------------------------------------------------------------
@@ -1709,24 +1617,7 @@ async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: Comp
         return;
     }
 
-    let result = (|| -> AppResult<MarketStatus> {
-        let Some(market) = state.store.load(&market_id)? else {
-            bail!("market {market_id} is not tracked");
-        };
-        if market.is_deleted() {
-            bail!("market {market_id} was untracked and cannot be resumed");
-        }
-        if market.status == MarketStatus::Closed {
-            bail!("market {market_id} is closed and cannot be resumed");
-        }
-        let new_status = match market.status {
-            MarketStatus::Active => MarketStatus::Paused,
-            MarketStatus::Paused => MarketStatus::Active,
-            MarketStatus::Closed => bail!("market {market_id} is closed and cannot be resumed"),
-        };
-        state.store.record_status(&market_id, new_status)?;
-        Ok(new_status)
-    })();
+    let result = state.control.set_paused(&market_id);
 
     match result {
         Ok(new_status) => {
@@ -1788,12 +1679,17 @@ async fn liquidate_button(
         return;
     }
 
-    match liquidate_market(state, ctx, &market_id).await {
-        Ok(summary) => {
+    let threads = DiscordThreads {
+        http: Arc::clone(&ctx.http),
+        control_channel: ChannelId::new(state.config.discord_control_channel_id),
+    };
+
+    match state.control.close(&market_id, &threads).await {
+        Ok(report) => {
             // The market is closed or gone, so this embed is stale. Disable the
             // buttons before the followup so a second press does nothing.
             disable_action_buttons(ctx, &mut interaction.message, &market_id).await;
-            respond_component_followup(ctx, &interaction, &summary).await
+            respond_component_followup(ctx, &interaction, &render_close(&report)).await
         }
         Err(error) => {
             tracing::warn!(error = %error, "liquidate button failed");
@@ -1807,86 +1703,60 @@ async fn liquidate_button(
     }
 }
 
-/// Sells out, closes, unregisters, and archives one tracked market.
-///
-/// The market status is checked first: a closed market and an untracked market
-/// return a report without selling anything. Cleanup proceeds even when a sell
-/// fails; each failure is logged so the operator can see what remained
-/// unfinished.
-async fn liquidate_market(
-    state: &DiscordState,
-    ctx: &Context,
-    market_id: &str,
-) -> AppResult<String> {
-    let Some(market) = state.store.load(market_id)? else {
-        return Ok(format!(
+/// Renders a Liquidate-button report. Every string is copied from the
+/// pre-service handler.
+fn render_close(report: &CloseReport) -> String {
+    match report {
+        CloseReport::NotTracked { market_id } => format!(
             "Market `{market_id}` is no longer tracked. Nothing was liquidated."
-        ));
-    };
-    let question = market.question.clone();
-    let thread_id = market.discord_thread_id.clone();
-
-    if market.is_deleted() {
-        return Ok(format!(
-            "**{}** (`{market_id}`) was untracked already. Nothing was liquidated.",
-            market.question
-        ));
-    }
-    if market.status == MarketStatus::Closed {
-        return Ok(format!(
+        ),
+        CloseReport::AlreadyUntracked {
+            question,
+            market_id,
+        } => format!(
+            "**{question}** (`{market_id}`) was untracked already. Nothing was liquidated."
+        ),
+        CloseReport::AlreadyClosed {
+            question,
+            market_id,
+        } => format!(
             "**{question}** (`{market_id}`) is already closed. Nothing was liquidated."
-        ));
-    }
-
-    let outcome = state.executor.liquidate(market_id).await;
-    if let Err(error) = &outcome {
-        tracing::error!(market_id = %market_id, error = %error, "liquidation failed");
-    }
-    if matches!(outcome, Ok(LiquidationOutcome::AlreadyClosed)) {
-        // Another action closed the market while this one waited for the
-        // execution lock. Do not repeat the cleanup or the archiving.
-        return Ok(format!(
+        ),
+        CloseReport::ClosedByAnotherAction {
+            question,
+            market_id,
+        } => format!(
             "**{question}** (`{market_id}`) was already closed by another action. Nothing was \
              liquidated."
-        ));
-    }
-
-    // Closing the market, unregistering the engine, and archiving the thread
-    // are best-effort cleanup of a market the operator asked to remove. Their
-    // failures do not abort the sequence.
-    if let Err(error) = state.store.close(market_id) {
-        tracing::error!(market_id = %market_id, error = %error, "failed to close the market");
-    }
-    state.registry.unregister(market_id);
-
-    if let Ok(channel_id) = thread_id.trim().parse::<u64>() {
-        if let Err(error) = ChannelId::new(channel_id)
-            .edit_thread(&ctx.http, EditThread::new().archived(true))
-            .await
-        {
-            tracing::warn!(thread_id = channel_id, error = %error, "failed to archive the thread");
-        }
-    }
-
-    match outcome {
-        Ok(LiquidationOutcome::Sold) => Ok(format!(
-            "**{question}** (`{market_id}`) liquidated, closed, and archived."
-        )),
-        Ok(LiquidationOutcome::AlreadyResolved) => Ok(format!(
-            "**{question}** (`{market_id}`) is resolved on Manifold, so its positions settled \
-             automatically. The market is now closed and archived."
-        )),
-        Ok(LiquidationOutcome::NoPosition) => Ok(format!(
-            "**{question}** (`{market_id}`) had no open position. The market is now closed and \
-             archived."
-        )),
-        Ok(LiquidationOutcome::AlreadyClosed) => Ok(format!(
-            "**{question}** (`{market_id}`) is already closed. Nothing was liquidated."
-        )),
-        Err(error) => Ok(format!(
-            "**{question}** (`{market_id}`) was closed and archived, but liquidation had \
-             errors: {error}"
-        )),
+        ),
+        CloseReport::Closed {
+            question,
+            market_id,
+            sale,
+        } => match sale {
+            Sale::Liquidated => format!(
+                "**{question}** (`{market_id}`) liquidated, closed, and archived."
+            ),
+            Sale::Resolved => format!(
+                "**{question}** (`{market_id}`) is resolved on Manifold, so its positions settled \
+                 automatically. The market is now closed and archived."
+            ),
+            Sale::NoPosition => format!(
+                "**{question}** (`{market_id}`) had no open position. The market is now closed and \
+                 archived."
+            ),
+            Sale::AlreadyClosed => format!(
+                "**{question}** (`{market_id}`) is already closed. Nothing was liquidated."
+            ),
+            Sale::Failed(error) => format!(
+                "**{question}** (`{market_id}`) was closed and archived, but liquidation had \
+                 errors: {error}"
+            ),
+            // The close path never asks for this end state.
+            Sale::Untouched => format!(
+                "**{question}** (`{market_id}`) is already closed. Nothing was liquidated."
+            ),
+        },
     }
 }
 
@@ -2188,30 +2058,6 @@ async fn send_text_message(http: &Http, channel: ChannelId, content: &str) {
 // -----------------------------------------------------------------------------
 // Pure helpers
 // -----------------------------------------------------------------------------
-
-/// Resolves an operator market reference (ID or unique slug) to an owned row.
-///
-/// Soft-deleted markets are excluded, so commands such as `/status` and
-/// `/override` only see markets that are still tracked.
-fn resolve_single_market(state: &DiscordState, query: &str) -> AppResult<TrackedMarket> {
-    let markets = state.store.list()?;
-    let Some(market) = resolve_market(&markets, query) else {
-        bail!("no unique tracked market matches {query:?}");
-    };
-    Ok(market.clone())
-}
-
-/// Resolves a reference against every row, including soft-deleted markets.
-///
-/// `/untrack` needs this so a repeated call reports "already untracked"
-/// instead of claiming the market never existed.
-fn resolve_any_market(state: &DiscordState, query: &str) -> AppResult<TrackedMarket> {
-    let markets = state.store.list_including_deleted()?;
-    let Some(market) = resolve_market(&markets, query) else {
-        bail!("no tracked or untracked market matches {query:?}");
-    };
-    Ok(market.clone())
-}
 
 /// Builds the `[ONBOARDED]` embed posted into a new market's thread.
 ///
@@ -2885,64 +2731,6 @@ mod tests {
         assert_eq!(choices.len(), 1);
         assert!(choices[0].0.chars().count() <= MAX_CHOICE_NAME_CHARS);
         assert!(choices[0].0.ends_with('…'));
-    }
-
-    // -- Market resolution --------------------------------------------------
-
-    #[test]
-    fn resolves_a_market_by_case_insensitive_id_or_slug() {
-        let markets = vec![
-            market("AbC123", "First?", "first-question"),
-            market("DeF456", "Second?", "second-question"),
-        ];
-
-        assert_eq!(
-            resolve_market(&markets, "abc123").map(|market| market.id.as_str()),
-            Some("AbC123")
-        );
-        assert_eq!(
-            resolve_market(&markets, "SECOND-QUESTION").map(|market| market.id.as_str()),
-            Some("DeF456")
-        );
-        assert_eq!(
-            resolve_market(&markets, "second").map(|market| market.id.as_str()),
-            Some("DeF456")
-        );
-        assert_eq!(
-            resolve_market(&markets, "https://manifold.markets/Alice/second-question")
-                .map(|market| market.id.as_str()),
-            Some("DeF456")
-        );
-        assert_eq!(
-            resolve_market(&markets, "https://manifold.markets/Alice/second-question/")
-                .map(|market| market.id.as_str()),
-            Some("DeF456")
-        );
-        assert_eq!(
-            resolve_market(
-                &markets,
-                "http://manifold.markets/Alice/second-question?ref=me"
-            )
-            .map(|market| market.id.as_str()),
-            Some("DeF456")
-        );
-        assert_eq!(
-            resolve_market(&markets, "manifold.markets/Alice/second-question")
-                .map(|market| market.id.as_str()),
-            Some("DeF456")
-        );
-        assert!(resolve_market(&markets, "missing").is_none());
-        assert!(resolve_market(&markets, "").is_none());
-    }
-
-    #[test]
-    fn ambiguous_slug_matches_resolve_to_none() {
-        let markets = vec![
-            market("M1", "First?", "shared-prefix-one"),
-            market("M2", "Second?", "shared-prefix-two"),
-        ];
-
-        assert!(resolve_market(&markets, "shared").is_none());
     }
 
     // -- Buttons ------------------------------------------------------------
