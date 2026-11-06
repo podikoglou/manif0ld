@@ -526,13 +526,43 @@ nothing is persisted. The canary phase flips it to `false` with tiny caps.
 
 | Action | Endpoint | Body |
 |---|---|---|
-| Buy | `POST /v0/bet` | `{contractId, answerId?, amount, outcome:"YES"\|"NO", limitProb: 0.99 for YES / 0.01 for NO, dryRun?}` |
+| Buy | `POST /v0/bet` | `{contractId, answerId?, amount, outcome:"YES"\|"NO", limitProb: fair-capped sweep (below), dryRun?}` |
 | Sell | `POST /v0/market/{id}/sell` | `{answerId?, outcome:"YES"\|"NO", shares: <amount>}`; `answerId` is required on a multiple-choice market |
 | Positions | `GET /v0/market/{id}/positions?userId={bot_user_id}` (bot ID from `GET /v0/me` at startup) | — |
 | Market | `GET /v0/market/{id}` (includes `answers[].probability`) | — |
 
-Using `limitProb=0.99` (YES) / `0.01` (NO) emulates a market buy that fills at
-the current price, sweeping the AMM if needed.
+Buys sweep the AMM with a **fair-capped limit**, not the old
+`limitProb=0.99` (YES) / `0.01` (NO) market-buy emulation that could sweep a
+thin book far past fair value (`docs/ALGO.md` §S1, `LIMIT_EPSILON`, default
+`0.01`). Manifold interprets `limitProb` as the market probability of YES for
+both outcomes — a YES sweep stops when the probability rises to it (the limit
+*is* the per-share price ceiling), a NO sweep stops when the probability
+falls to it (the per-NO-share ceiling is `1 − limitProb`) — so one expression
+caps both outcomes on the wire:
+
+```
+limitProb = clamp(p_internal, 0.01, 0.99) − ε
+```
+
+a YES buy then pays up to `p_internal − ε` per share and a NO buy up to
+`(1 − p_internal) + ε` per NO share; the bot never fills worse than its own
+believed fair price on either side. `p_internal` is the decayed belief the
+edge math computed on the same evaluation (`PlannedTrade.p_internal` from
+`Book::plan`; the binary market leg is the no-`answerId` leg). On sum-to-one
+multiple-choice markets the entry edge is a *normalized* share, so the cap is
+built from the normalized leg belief, mirroring the planner's edge
+computation. Manifold validates `limitProb` into `[0.01, 0.99]`, and the
+config validation keeps `ε` in `(0, 0.05)` — below the default entry-edge
+threshold, so a threshold-sized edge still crosses the market price and the
+order sweeps instead of resting unfilled.
+
+When the cap stops the sweep before the requested mana is spent, Manifold
+fills the first portion and **rests the remainder** as an open limit order at
+the cap. The executor logs the shortfall at `info!` (requested mana from
+`orderAmount` against the actual `amount`/`shares`), persists the ledger row
+with the *actual* shares and mana only, and neither retries nor cancels —
+placing the expiring resting order for that remainder is the next §S1 step,
+after a wire probe.
 
 **Position sync (phase 1 of `docs/ALGO.md`, websocket live prices):** Prices
 arrive live over the Manifold broadcast websocket

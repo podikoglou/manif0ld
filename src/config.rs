@@ -15,6 +15,9 @@ const DEFAULT_KELLY_FRACTION: f64 = 0.25;
 const DEFAULT_ENTRY_EDGE_THRESHOLD: f64 = 0.05;
 const DEFAULT_EXIT_EDGE_THRESHOLD: f64 = 0.01;
 const DEFAULT_MIN_TRADE_SIZE: f64 = 1.0;
+/// Slack allowed beyond the bot's own fair price in one buy's fill limit
+/// (`docs/ALGO.md` §S1): the capped `limitProb` becomes `p_internal − ε`.
+const DEFAULT_LIMIT_EPSILON: f64 = 0.01;
 const DEFAULT_BELIEF_KAPPA: f64 = 1.1;
 const DEFAULT_BELIEF_HALFLIFE_HOURS: f64 = 4.0;
 const DEFAULT_TRIAGE_MIN_EVIDENCE: f64 = 0.7;
@@ -49,6 +52,14 @@ pub struct Config {
     pub entry_edge_threshold: f64,
     pub exit_edge_threshold: f64,
     pub min_trade_size: f64,
+    /// The epsilon in the fair-capped buy sweep `limitProb = p_internal − ε`
+    /// (`docs/ALGO.md` §S1). Validated into the open interval `(0, 0.05)`:
+    /// strictly positive so the cap always undercuts the fair price, and
+    /// strictly below the *default* entry-edge threshold (0.05) so a
+    /// threshold-sized edge still crosses the market price after the cap;
+    /// an `ε ≥ ENTRY_EDGE_THRESHOLD` could only produce no-fill limit orders
+    /// resting on the book instead of sweeps.
+    pub limit_epsilon: f64,
     pub belief_kappa: f64,
     pub belief_halflife_hours: f64,
     /// Probability of evidence a post must reach before it moves belief.
@@ -137,6 +148,13 @@ impl Config {
             f64_or(&get, "ENTRY_EDGE_THRESHOLD", DEFAULT_ENTRY_EDGE_THRESHOLD)?;
         let exit_edge_threshold = f64_or(&get, "EXIT_EDGE_THRESHOLD", DEFAULT_EXIT_EDGE_THRESHOLD)?;
         let min_trade_size = f64_or(&get, "MIN_TRADE_SIZE", DEFAULT_MIN_TRADE_SIZE)?;
+        let limit_epsilon = f64_or(&get, "LIMIT_EPSILON", DEFAULT_LIMIT_EPSILON)?;
+        // Open interval: ε must stay strictly below the default entry-edge
+        // threshold so the fair-capped sweep (`p_internal − ε`) still crosses
+        // the market price even at a threshold-sized edge (see the field doc).
+        if !(limit_epsilon > 0.0 && limit_epsilon < 0.05) {
+            bail!("LIMIT_EPSILON must be within (0, 0.05), got {limit_epsilon}");
+        }
         let belief_kappa = f64_or(&get, "BELIEF_KAPPA", DEFAULT_BELIEF_KAPPA)?;
         let belief_halflife_hours =
             f64_or(&get, "BELIEF_HALFLIFE_HOURS", DEFAULT_BELIEF_HALFLIFE_HOURS)?;
@@ -179,6 +197,7 @@ impl Config {
             entry_edge_threshold,
             exit_edge_threshold,
             min_trade_size,
+            limit_epsilon,
             belief_kappa,
             belief_halflife_hours,
             triage_min_evidence,
@@ -372,6 +391,7 @@ mod tests {
         assert_eq!(config.entry_edge_threshold, 0.05);
         assert_eq!(config.exit_edge_threshold, 0.01);
         assert_eq!(config.min_trade_size, 1.0);
+        assert_eq!(config.limit_epsilon, 0.01);
         assert_eq!(config.belief_kappa, 1.1);
         assert_eq!(config.belief_halflife_hours, 4.0);
         assert_eq!(config.triage_min_evidence, 0.7);
@@ -393,6 +413,7 @@ mod tests {
             ("ENTRY_EDGE_THRESHOLD", "0.1"),
             ("EXIT_EDGE_THRESHOLD", "0.02"),
             ("MIN_TRADE_SIZE", "2.5"),
+            ("LIMIT_EPSILON", "0.02"),
             ("BELIEF_KAPPA", "2.0"),
             ("BELIEF_HALFLIFE_HOURS", "6.5"),
             ("TRADING_DRY_RUN", "false"),
@@ -414,6 +435,7 @@ mod tests {
         assert_eq!(config.entry_edge_threshold, 0.1);
         assert_eq!(config.exit_edge_threshold, 0.02);
         assert_eq!(config.min_trade_size, 2.5);
+        assert_eq!(config.limit_epsilon, 0.02);
         assert_eq!(config.belief_kappa, 2.0);
         assert_eq!(config.belief_halflife_hours, 6.5);
         assert!(!config.trading_dry_run);
@@ -476,6 +498,21 @@ mod tests {
 
         let error = config_from(&vars).expect_err("zero budget should fail");
         assert!(error.to_string().contains("RATE_LIMIT_PER_MIN"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_limit_epsilon_outside_the_open_unit_interval() {
+        // The interval is open: 0 would not undercut fair value, 0.05 and
+        // above sit at or past the default entry-edge threshold where a
+        // capped sweep can no longer cross the market price (see the field
+        // doc). NaN fails the `0 < ε < 0.05` check by construction.
+        for value in ["0", "-0.01", "0.05", "0.5", "NaN"] {
+            let mut vars = required_vars();
+            vars.push(("LIMIT_EPSILON", value));
+
+            let error = config_from(&vars).expect_err("out-of-range epsilon should fail");
+            assert!(error.to_string().contains("LIMIT_EPSILON"), "{error}");
+        }
     }
 
     #[test]

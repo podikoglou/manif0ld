@@ -54,6 +54,22 @@
 //! spend Reconcile-class tokens and yield to trades below the housekeeping
 //! reserve (`docs/ALGO.md` §2).
 //!
+//! # Fair-capped buys
+//!
+//! Every buy sweeps with `limitProb = clamp(p_internal) − ε`
+//! (`LIMIT_EPSILON`, default 0.01; `docs/ALGO.md` §S1) instead of the old
+//! market-buy emulation (`0.99` for YES / `0.01` for NO) that could sweep a
+//! thin book far past fair value. Manifold interprets `limitProb` as the
+//! market probability of YES for both outcomes — a YES sweep stops when the
+//! probability rises to it (the per-share price ceiling), a NO sweep stops
+//! when the probability falls to it (so the per-NO-share ceiling is
+//! `1 − limitProb`) — which is why one expression caps both sides. The
+//! probability source is the same decayed `p_internal` the edge math used in
+//! that evaluation (normalized on sum-to-one multiple-choice markets). When
+//! the cap stops the sweep before the budget is spent, Manifold fills the
+//! first portion and rests the remainder as an open limit order; only the
+//! actual shares and mana are recorded, and nothing retries or cancels.
+//!
 //! # Secrets
 //!
 //! The API key is stored in [`ManifoldClient`] and sent in the `Authorization`
@@ -137,12 +153,6 @@ pub(crate) const KILL_SWITCH_KEY: &str = "global_kill_switch";
 
 /// Capacity of the trade event stream consumed by the Discord layer.
 const EVENT_CAPACITY: usize = 256;
-
-/// Limit price that emulates a market buy of YES shares.
-const YES_LIMIT_PROB: f64 = 0.99;
-
-/// Limit price that emulates a market buy of NO shares.
-const NO_LIMIT_PROB: f64 = 0.01;
 
 // -----------------------------------------------------------------------------
 // HTTP client
@@ -298,38 +308,34 @@ impl ManifoldClient {
         Ok((by_contract, raw_entries, raw_entries < PORTFOLIO_PAGE_SIZE))
     }
 
-    /// Buys `amount` mana of `outcome` shares at the best available price.
+    /// Buys `amount` mana of `outcome` shares at up to `limit_prob`.
     ///
-    /// `limitProb` is placed far beyond the current price so the order behaves
-    /// like a market buy: `0.99` for YES and `0.01` for NO. Manifold interprets
-    /// the limit as a probability of YES, so a NO buy needs the low limit.
+    /// Manifold interprets `limitProb` as the market probability of YES for
+    /// *both* outcomes: a YES sweep stops when the probability rises to the
+    /// limit (that limit is the per-share price ceiling), while a NO sweep
+    /// stops when the probability falls to it (so the per-NO-share ceiling is
+    /// `1 − limitProb`, and `limit_prob = p_internal − ε` prices every NO
+    /// share at no more than `fair_NO + ε`). Manifold rejects limit values
+    /// outside `[0.01, 0.99]`; callers clamp with
+    /// [`fair_capped_limit_prob`].
     pub async fn buy(
         &self,
         market_id: &str,
         outcome: &str,
         amount: f64,
         answer_id: Option<&str>,
+        limit_prob: f64,
         dry_run: bool,
     ) -> AppResult<BetResult> {
         let outcome = validate_outcome(outcome)?;
         if !amount.is_finite() || amount <= 0.0 {
             bail!("buy amount must be a positive finite mana value, got {amount}");
         }
-
-        let limit_prob = match outcome {
-            "YES" => YES_LIMIT_PROB,
-            _ => NO_LIMIT_PROB,
-        };
-        let mut body = json!({
-            "contractId": market_id,
-            "amount": amount,
-            "outcome": outcome,
-            "limitProb": limit_prob,
-            "dryRun": dry_run,
-        });
-        if let Some(aid) = answer_id {
-            body["answerId"] = json!(aid);
+        if !limit_prob.is_finite() {
+            bail!("buy limitProb must be finite, got {limit_prob}");
         }
+
+        let body = bet_body(market_id, outcome, amount, answer_id, limit_prob, dry_run);
         let request = self
             .http
             .post(self.url("/v0/bet"))
@@ -440,6 +446,31 @@ fn validate_outcome(outcome: &str) -> AppResult<&str> {
     }
 }
 
+/// Builds the `POST /v0/bet` request body for one buy.
+///
+/// Pure so tests can pin the exact wire shape (`docs/SPEC.md` §6.6) without an
+/// HTTP round trip.
+fn bet_body(
+    market_id: &str,
+    outcome: &str,
+    amount: f64,
+    answer_id: Option<&str>,
+    limit_prob: f64,
+    dry_run: bool,
+) -> Value {
+    let mut body = json!({
+        "contractId": market_id,
+        "amount": amount,
+        "outcome": outcome,
+        "limitProb": limit_prob,
+        "dryRun": dry_run,
+    });
+    if let Some(aid) = answer_id {
+        body["answerId"] = json!(aid);
+    }
+    body
+}
+
 // -----------------------------------------------------------------------------
 // Wire types and position parsing
 // -----------------------------------------------------------------------------
@@ -539,6 +570,12 @@ pub struct BetResult {
     pub prob_before: Option<f64>,
     #[serde(rename = "probAfter", default)]
     pub prob_after: Option<f64>,
+    /// The original amount of a created limit order, reported on limit bets.
+    /// With a fair-capped sweep that fills part of the budget the unfilled
+    /// remainder is `orderAmount − amount`, and it rests on Manifold as an
+    /// open limit order at the cap.
+    #[serde(rename = "orderAmount")]
+    pub order_amount: Option<f64>,
     #[serde(rename = "isFilled", default)]
     pub is_filled: bool,
     #[serde(rename = "isCancelled", default)]
@@ -970,6 +1007,9 @@ pub struct TradeExecutor {
     policy: TradePolicy,
     dry_run: bool,
     halflife_hours: f64,
+    /// Slack over fair value in one buy's fill limit; see
+    /// [`fair_capped_limit_prob`].
+    limit_epsilon: f64,
     /// Global Manifold token bucket; writes spend Trade-class tokens, the
     /// reconcile backstop spends Reconcile-class tokens.
     rate: RateLimiter,
@@ -999,6 +1039,7 @@ impl TradeExecutor {
             policy: TradePolicy::from_config(config),
             dry_run: config.trading_dry_run,
             halflife_hours: config.belief_halflife_hours,
+            limit_epsilon: config.limit_epsilon,
             rate: RateLimiter::per_minute(config.rate_limit_per_min, Box::new(SystemClock)),
             execution_lock: Mutex::new(()),
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
@@ -1912,10 +1953,16 @@ impl TradeExecutor {
 
     /// Performs one planned action and writes its ledger row.
     ///
-    /// A buy keeps the budget invariant checks, sends `dryRun` when asked, and
-    /// records the fill on its leg. A sell sends the requested share count and
-    /// lets the book release the proportional cost basis. Neither branch writes
-    /// a position column: the caller calls [`Book::persist`] afterwards.
+    /// A buy keeps the budget invariant checks, sweeps with the fair-capped
+    /// limit ([`fair_capped_limit_prob`], fed by [`entry_fair_value`]), sends
+    /// `dryRun` when asked, and records the fill on its leg. A cap-stopped
+    /// short fill is logged with its shortfall, and the leg records the
+    /// *actual* shares and mana from the response — never the requested
+    /// amount; the unfilled remainder rests as a limit order for the
+    /// `TODO(S1-ladder)` expiry pass. A sell sends the requested share count
+    /// and lets the book release the proportional cost basis. Neither branch
+    /// writes a position column: the caller calls [`Book::persist`]
+    /// afterwards.
     async fn execute(
         &self,
         book: &mut Book,
@@ -1956,6 +2003,20 @@ impl TradeExecutor {
             }
 
             let outcome = decision.action.outcome();
+            // The fair value the cap must not fill past: the same decayed
+            // belief the entry edge was computed from on this evaluation
+            // (`Book::plan` produces every view at the same `now`), rotated
+            // into the normalized share on sum-to-one markets.
+            let leg_p_values: Vec<f64> = (0..book.legs().len())
+                .map(|index| book.view(index, now, self.halflife_hours).p_internal)
+                .collect();
+            let fair = entry_fair_value(
+                planned.p_internal,
+                &leg_p_values,
+                book.market().should_answers_sum_to_one,
+            );
+            let limit_prob = fair_capped_limit_prob(fair, self.limit_epsilon);
+
             let result = self
                 .client
                 .buy(
@@ -1963,19 +2024,18 @@ impl TradeExecutor {
                     outcome,
                     amount,
                     decision.answer_id.as_deref(),
+                    limit_prob,
                     dry_run,
                 )
                 .await
                 .with_context(|| format!("buying {outcome} on Manifold market {}", book.id()))?;
-            ensure_filled(&result, book.id())?;
-            if !result.shares.is_finite() || result.shares <= 0.0 {
-                bail!(
-                    "Manifold bet {} on market {} returned no shares",
-                    result.bet_id(),
-                    book.id()
-                );
-            }
 
+            // No retry and no resting-order layoff on a short fill (see
+            // analyze_buy_fill): the ledger records the ACTUAL shares and
+            // mana below.
+            if !analyze_buy_fill(&result, amount, book.id())? {
+                return Ok(None);
+            }
             if dry_run {
                 tracing::info!(
                     market_id = %book.id(),
@@ -1983,11 +2043,23 @@ impl TradeExecutor {
                     action = %decision.action,
                     amount,
                     shares = result.shares,
+                    limit_prob,
                     prob_before = ?result.prob_before,
                     prob_after = ?result.prob_after,
                     "dry run: simulated buy, nothing persisted"
                 );
                 return Ok(None);
+            }
+
+            if !result.shares.is_finite() || result.shares <= 0.0 {
+                // analyze_buy_fill only returns true with a positive,
+                // finite share count; this guard keeps that invariant
+                // explicit before the position columns are touched.
+                bail!(
+                    "Manifold bet {} on market {} returned no shares",
+                    result.bet_id(),
+                    book.id()
+                );
             }
 
             let cost = result.total_cost();
@@ -2141,6 +2213,10 @@ fn trade_event(market: &TrackedMarket, record: &TradeRecord) -> TradeEvent {
 }
 
 /// Rejects a bet response that Manifold did not fill.
+///
+/// Buy fills are analyzed separately by [`analyze_buy_fill`], which accepts
+/// the partial fills a fair-capped sweep produces; the sell path keeps the
+/// all-or-nothing contract.
 fn ensure_filled(result: &BetResult, market_id: &str) -> AppResult<()> {
     if result.is_cancelled {
         bail!(
@@ -2162,6 +2238,116 @@ fn optional_id(id: &str) -> Option<String> {
     Some(id.trim())
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
+}
+
+/// The wire `limitProb` of one fair-capped buy (`docs/ALGO.md` §S1).
+///
+/// The bot must never fill worse than its own believed fair price, plus one
+/// [`Config::limit_epsilon`] of slack. Manifold reads `limitProb` as the
+/// market probability of YES for both outcomes (see [`ManifoldClient::buy`]),
+/// so a single expression caps both sides:
+///
+/// - YES buy: pays up to `limitProb` per share ⇒ cap `= fair − ε`.
+/// - NO buy: pays up to `1 − limitProb` per NO share ⇒
+///   `limitProb = fair − ε` gives `1 − (fair − ε) = (1 − fair) + ε`, exactly
+///   the `limitProb(NO) = 1 − p_fair + ε` cap of §S1 expressed as the price
+///   of the NO share itself.
+///
+/// Both the fair value and the result are clamped into the trading range:
+/// the fair clamp keeps the cap inside Manifold's documented `[0.01, 0.99]`
+/// validation, and the result clamp keeps a boundary-probability belief
+/// (0.01 after the fair clamp) from sending `limitProb = 0.0`.
+///
+/// Because `entry_fair_value` supplies `fair` and the config validation
+/// bounds `ε` only against the *default* entry-edge threshold (0.05), an
+/// operator could theoretically configure `ENTRY_EDGE_THRESHOLD < ε`; an
+/// entry with `edge < ε` would then send a limit at or below the market
+/// price, which rests unfilled instead of sweeping (see [`analyze_buy_fill`]).
+/// That is the documented limit of the guard, not a special-cased rejection.
+fn fair_capped_limit_prob(fair: f64, epsilon: f64) -> f64 {
+    let fair = fair.clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
+    (fair - epsilon).clamp(MIN_TRADING_PROB, MAX_TRADING_PROB)
+}
+
+/// The internal fair probability one planned buy must not fill past.
+///
+/// On independent markets (binary legs and cpmm-multi-2 answers) that is the
+/// leg's own decayed belief — the exact `p_internal` the entry edge was
+/// computed from (`PlannedTrade.p_internal`). On sum-to-one multiple-choice
+/// markets the edge math (`sum_to_one` branch of the planner's edge
+/// computation) normalizes each belief by the sum over all legs, so the raw
+/// belief alone would place the cap *above* the fair value the trade actually
+/// bet on. The normalization here mirrors that computation leg-for-leg
+/// (`clamp(0, 1)` on every view, same sum) by taking the raw probabilities of
+/// every leg as `leg_p_values`. A degenerate sum (zero, non-finite) falls
+/// back to the raw belief: planner gating would have rejected the entry in
+/// that case anyway.
+fn entry_fair_value(p_raw: f64, leg_p_values: &[f64], sum_to_one: bool) -> f64 {
+    if !sum_to_one {
+        return p_raw;
+    }
+    let total: f64 = leg_p_values.iter().map(|p| p.clamp(0.0, 1.0)).sum();
+    if !total.is_finite() || total <= 0.0 {
+        return p_raw;
+    }
+    p_raw.clamp(0.0, 1.0) / total
+}
+
+/// Accepts a buy response and reports whether anything filled.
+///
+/// The buy path no longer demands a fully filled bet: the fair-capped sweep
+/// can stop short of the budget, and Manifold then fills what the cap allows
+/// and RESTS the remainder as an open limit order at the cap. Both short
+/// outcomes are logged at info with the requested mana against what the
+/// response actually reports (`orderAmount` for the request, `amount` and
+/// `shares` for the fill), never retried, and never laid off with an expiring
+/// resting order here — that resting-layoff is the next §S1 step, after a
+/// wire probe of the order fields:
+// TODO(S1-ladder): rest the remainder with an expiry
+/// so the leftover limit order cannot sit forever.
+///
+/// `Ok(false)` (nothing filled, no position to record) happens when the price
+/// moved past the cap before the fill - the order then rests waiting for a
+/// retrace past a belief that is no longer an edge. `Ok(true)` covers both a
+/// full fill and a partial one; the caller records the *actual* shares and
+/// mana either way.
+///
+/// Only a cancelled response is an error: resting money without any fill is
+/// a normal consequence of the cap, not a broken trade.
+fn analyze_buy_fill(result: &BetResult, requested_mana: f64, market_id: &str) -> AppResult<bool> {
+    if result.is_cancelled {
+        bail!(
+            "Manifold bet {} on market {market_id} was cancelled",
+            result.bet_id()
+        );
+    }
+
+    let filled = result.shares.is_finite() && result.shares > 0.0;
+    let requested = result.order_amount.unwrap_or(requested_mana);
+    if !filled {
+        tracing::info!(
+            market_id = %market_id,
+            bet_id = %result.bet_id(),
+            requested_mana = requested,
+            filled_mana = result.amount,
+            shares = result.shares,
+            "buy did not fill at the fair-capped limit; the order rests on Manifold"
+        );
+        return Ok(false);
+    }
+
+    if !result.is_filled {
+        tracing::info!(
+            market_id = %market_id,
+            bet_id = %result.bet_id(),
+            requested_mana = requested,
+            filled_mana = result.amount,
+            shares = result.shares,
+            "buy partially filled at the fair-capped limit; the remainder rests \
+             as a limit order"
+        );
+    }
+    Ok(true)
 }
 
 /// Truncates response text for an error message without splitting a character.
@@ -2340,6 +2526,26 @@ mod tests {
 
         assert_eq!(bet.bet_id(), "dry-run");
         assert!(bet.is_filled);
+    }
+
+    #[test]
+    fn bet_result_reads_order_amount_on_a_limit_bet() {
+        // A fair-capped sweep that runs out of liquidity reports `isFilled:
+        // false` with the partial fill in `amount`/`shares` and the original
+        // request in `orderAmount`; the shortfall log reads both.
+        let raw = json!({
+            "id": "limit-1",
+            "amount": 10.0,
+            "shares": 20.0,
+            "limitProb": 0.5,
+            "orderAmount": 100.0,
+            "isFilled": false
+        });
+        let bet: BetResult = serde_json::from_value(raw).expect("limit shape should deserialize");
+
+        assert_eq!(bet.order_amount, Some(100.0));
+        assert!(!bet.is_filled);
+        assert_close(bet.total_cost(), 10.0);
     }
 
     #[test]
@@ -2806,6 +3012,81 @@ mod tests {
         assert_eq!(from_rest.answers, vec![("a".to_owned(), 0.6)]);
     }
 
+    // -- Fair-capped buy limits --------------------------------------------
+
+    #[test]
+    fn bet_body_carries_the_capped_limit_prob() {
+        let body = bet_body("mkt", "YES", 10.0, None, 0.62, false);
+
+        assert_eq!(body["contractId"], "mkt");
+        assert_close(body["amount"].as_f64().unwrap(), 10.0);
+        assert_eq!(body["outcome"], "YES");
+        assert_close(body["limitProb"].as_f64().unwrap(), 0.62);
+        assert_eq!(body["dryRun"], false);
+        assert!(body.get("answerId").is_none(), "binary buys omit answerId");
+
+        let mc_body = bet_body("mkt", "YES", 10.0, Some("ans-a"), 0.49, true);
+        assert_eq!(mc_body["answerId"], "ans-a");
+        assert_eq!(mc_body["dryRun"], true);
+        assert_close(mc_body["limitProb"].as_f64().unwrap(), 0.49);
+    }
+
+    #[test]
+    fn fair_cap_for_a_yes_buy_is_fair_minus_epsilon() {
+        // The §S1 example: a belief of 63 on a YES entry buys at up to 62
+        // with the default ε = 0.01.
+        assert_close(fair_capped_limit_prob(0.63, 0.01), 0.62);
+        assert_close(fair_capped_limit_prob(0.5, 0.01), 0.49);
+    }
+
+    #[test]
+    fn fair_cap_for_a_no_buy_prices_fair_no_plus_epsilon() {
+        // The wire value equals the YES expression (Manifold reads
+        // limitProb as the market probability of YES for both outcomes), so
+        // the per-NO-share ceiling is 1 − cap = fair_NO + ε: for a belief of
+        // YES 0.30, NO shares never cost more than 0.71.
+        let cap = fair_capped_limit_prob(0.30, 0.01);
+        assert_close(cap, 0.29);
+        assert_close(1.0 - cap, (1.0 - 0.30) + 0.01);
+    }
+
+    #[test]
+    fn fair_cap_clamps_at_the_boundary_beliefs() {
+        // A boundary belief of 0.01 with ε = 0.01 would undercut the
+        // Manifold limitProb minimum (0.01), so the cap bottoms out there
+        // instead of going zero or negative.
+        assert_close(fair_capped_limit_prob(0.01, 0.01), 0.01);
+        // Defense at the top edge: 0.99 − 0.01 stays valid.
+        assert_close(fair_capped_limit_prob(0.99, 0.01), 0.98);
+        // A pathological ε past the clamp never produces an invalid limit.
+        assert_close(fair_capped_limit_prob(0.01, 0.05), 0.01);
+    }
+
+    #[test]
+    fn entry_fair_value_is_the_raw_belief_off_sum_to_one_markets() {
+        // Binary legs (the "no-answer" case, answer_id None) and independent
+        // cpmm-multi-2 answers keep their own belief: exactly the value the
+        // edge math used.
+        assert_close(entry_fair_value(0.63, &[0.63], false), 0.63);
+        assert_close(entry_fair_value(0.2, &[0.2, 0.4, 0.3], false), 0.2);
+    }
+
+    #[test]
+    fn entry_fair_value_normalizes_sum_to_one_legs_like_the_planner() {
+        // The edge math divides each belief by the sum over all legs; the
+        // cap must be built from that same normalized share, not the raw
+        // belief (which sits above the fair value the bet was sized on).
+        assert_close(entry_fair_value(0.9, &[0.9, 0.9], true), 0.5);
+        assert_close(entry_fair_value(0.2, &[0.2, 0.4, 0.4], true), 0.2);
+
+        let mc_cap = fair_capped_limit_prob(entry_fair_value(0.9, &[0.9, 0.9], true), 0.01);
+        assert_close(mc_cap, 0.49);
+
+        // A degenerate sum cannot happen after planner gating; the fallback
+        // is the raw belief rather than a division by zero.
+        assert_close(entry_fair_value(0.7, &[0.0, 0.0], true), 0.7);
+    }
+
     // -------------------------------------------------------------------
     // Live calls. Run with `cargo test -- --ignored --nocapture`
     // -------------------------------------------------------------------
@@ -2832,6 +3113,7 @@ mod tests {
             entry_edge_threshold: 0.05,
             exit_edge_threshold: 0.01,
             min_trade_size: 1.0,
+            limit_epsilon: 0.01,
             belief_kappa: 1.1,
             belief_halflife_hours: 4.0,
             triage_min_evidence: 0.7,
