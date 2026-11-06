@@ -229,7 +229,7 @@ impl Pipeline {
     /// Post-stream lag is logged and skipped: those posts were already dropped
     /// by the ingest broadcast channel, so there is nothing to replay. Every
     /// received post advances [`Pipeline::processed_posts`], which the
-    /// heartbeat in `main` reports as throughput.
+    /// heartbeat in [`crate::app`] reports as throughput.
     pub async fn run(
         self: Arc<Self>,
         mut posts: broadcast::Receiver<ExtractedPost>,
