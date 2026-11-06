@@ -549,25 +549,7 @@ fn status_for_market(state: &DiscordState, query: &str) -> AppResult<CreateEmbed
         )
         .field("Thread", truncate_chars(&thread, MAX_FIELD_CHARS), false);
 
-    // Sieve source is potentially large; split it into bounded fields rather
-    // than letting the embed request fail validation.
-    let chunks = chunk_chars(&market.sieve_source, SIEVE_CHUNK_CHARS);
-    let shown = chunks.len().min(MAX_SIEVE_CHUNKS);
-    let omitted = chunks.len().saturating_sub(shown);
-    for (index, chunk) in chunks.iter().take(shown).enumerate() {
-        let name = if index == 0 {
-            "Sieve source".to_owned()
-        } else {
-            format!("Sieve source ({})", index + 1)
-        };
-        let mut value = format!("```sieve\n{chunk}\n```");
-        if index + 1 == shown && omitted > 0 {
-            value.push_str(&format!(
-                "\n… {omitted} more field(s) truncated; see the database for the full rule."
-            ));
-        }
-        embed = embed.field(name, truncate_chars(&value, MAX_FIELD_CHARS), false);
-    }
+    embed = with_sieve_source(embed, &market.sieve_source);
 
     let signals = state.db.recent_signals(&market.id, MAX_SIGNAL_LINES)?;
     if signals.is_empty() {
@@ -2164,7 +2146,7 @@ fn resolve_any_market(state: &DiscordState, query: &str) -> AppResult<TrackedMar
 fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
     let market = &draft.market;
 
-    let mut embed = CreateEmbed::new()
+    let embed = CreateEmbed::new()
         .title(truncate_chars(&market.question, MAX_TITLE_CHARS))
         .field(
             "Market",
@@ -2182,25 +2164,39 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
             true,
         );
 
-    let chunks = chunk_chars(&draft.sieve_source, SIEVE_CHUNK_CHARS);
+    with_sieve_source(embed, &draft.sieve_source)
+}
+
+/// Appends the Sieve source to an embed as bounded, numbered fields.
+///
+/// One embed field cannot exceed ~1024 characters and the whole embed is capped
+/// at 6000, so a long rule is split into at most [`MAX_SIEVE_CHUNKS`] fields
+/// named `Sieve source #1`, `#2`, … The last field notes how much was dropped.
+/// Both the `/status` market view and the `[ONBOARDED]` embed use this, so the
+/// two never disagree about how a rule is presented.
+fn with_sieve_source(mut embed: CreateEmbed, source: &str) -> CreateEmbed {
+    let chunks = chunk_chars(source, SIEVE_CHUNK_CHARS);
     let shown = chunks.len().min(MAX_SIEVE_CHUNKS);
     let omitted = chunks.len().saturating_sub(shown);
     for (index, chunk) in chunks.iter().take(shown).enumerate() {
         let mut value = format!("```sieve\n{chunk}\n```");
         if index + 1 == shown && omitted > 0 {
             value.push_str(&format!(
-                "\n… {omitted} more field(s) truncated; see `/status` or the database for the \
-                 full rule."
+                "\n… {omitted} more field(s) truncated; see the database for the full rule."
             ));
         }
         embed = embed.field(
-            format!("Sieve source #{}", index + 1),
+            sieve_field_name(index),
             truncate_chars(&value, MAX_FIELD_CHARS),
             false,
         );
     }
-
     embed
+}
+
+/// Names one Sieve source field, `#1`-based.
+fn sieve_field_name(index: usize) -> String {
+    format!("Sieve source #{}", index + 1)
 }
 
 /// The action buttons attached to the ONBOARDED embed.
@@ -2712,6 +2708,64 @@ mod tests {
             market_field["value"],
             "https://manifold.markets/Alice/will-it-rain"
         );
+    }
+
+    // -- Sieve source fields -----------------------------------------------
+
+    /// Serializes an embed and returns its field names in order.
+    fn field_names(embed: CreateEmbed) -> Vec<String> {
+        let value = serde_json::to_value(embed).expect("embed serializes");
+        value["fields"]
+            .as_array()
+            .expect("embed fields")
+            .iter()
+            .filter_map(|field| field["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Returns the value of the field with the given name.
+    fn field_value(embed: CreateEmbed, name: &str) -> String {
+        let value = serde_json::to_value(embed).expect("embed serializes");
+        value["fields"]
+            .as_array()
+            .expect("embed fields")
+            .iter()
+            .find(|field| field["name"] == name)
+            .and_then(|field| field["value"].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test]
+    fn sieve_source_fields_are_numbered_from_one() {
+        let source = "x".repeat(SIEVE_CHUNK_CHARS + 10);
+        let names = field_names(with_sieve_source(CreateEmbed::new(), &source));
+
+        assert_eq!(names, vec!["Sieve source #1", "Sieve source #2"]);
+        // Nothing was dropped, so no field claims a truncation.
+        let last = field_value(with_sieve_source(CreateEmbed::new(), &source), "Sieve source #2");
+        assert!(!last.contains("truncated"), "{last}");
+    }
+
+    #[test]
+    fn sieve_source_fields_stop_at_the_cap_and_note_omissions() {
+        let source = "x".repeat(SIEVE_CHUNK_CHARS * 5);
+        let embed = with_sieve_source(CreateEmbed::new(), &source);
+        let names = field_names(embed.clone());
+
+        assert_eq!(
+            names,
+            vec!["Sieve source #1", "Sieve source #2", "Sieve source #3"]
+        );
+        let last = field_value(embed, "Sieve source #3");
+        assert!(last.contains("2 more field(s) truncated"), "{last}");
+    }
+
+    #[test]
+    fn sieve_source_field_still_appears_for_an_empty_rule() {
+        let names = field_names(with_sieve_source(CreateEmbed::new(), ""));
+
+        assert_eq!(names, vec!["Sieve source #1"]);
     }
 
     // -- Autocomplete -------------------------------------------------------
