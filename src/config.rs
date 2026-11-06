@@ -39,6 +39,24 @@ const DEFAULT_MC_MAX_NEW_PER_TICK: usize = 2;
 const DEFAULT_MC_MAX_ANSWER_FRACTION: f64 = 0.25;
 /// Manifold allows 500 requests/minute per IP; the bucket starts at that.
 const DEFAULT_RATE_LIMIT_PER_MIN: usize = 500;
+/// S2 new-market sniping is off until its own canary phase is approved.
+const DEFAULT_SNIPE_ENABLED: bool = false;
+/// Separate global pool for snipes, so autonomous discovery cannot spend the
+/// per-market budgets that `/track` allocated.
+const DEFAULT_SNIPE_POOL_MANA: f64 = 100.0;
+/// Per-snipe cap; new markets are thin, so one bad resolution stays small.
+const DEFAULT_SNIPE_MAX_MANA: f64 = 10.0;
+/// Markets below this liquidity cannot absorb even a minimum snipe.
+const DEFAULT_SNIPE_MIN_LIQ: f64 = 100.0;
+/// Smallest |p_model − p_initial| worth a trade; below this is noise.
+const DEFAULT_SNIPE_MIN_GAP: f64 = 0.10;
+/// Fractional Kelly for snipe sizing, smaller than the news default because
+/// the model has one shot and the creator can resolve oddly.
+const DEFAULT_SNIPE_KELLY_FRACTION: f64 = 0.25;
+/// How long a new market stays eligible for a snipe.
+const DEFAULT_SNIPE_TTL_SECS: usize = 3600;
+/// Deadline for one fair-probability decision call; snipe speed is the edge.
+const DEFAULT_SNIPE_DECISION_TIMEOUT_SECS: usize = 2;
 
 /// Runtime configuration for the bot.
 ///
@@ -98,6 +116,29 @@ pub struct Config {
     /// Manifold REST requests per minute shared by every consumer, refilled
     /// continuously; trade writes have priority over housekeeping.
     pub rate_limit_per_min: usize,
+    /// Enables S2 new-market sniping (`docs/ALGO.md` §S2). Off by default.
+    pub snipe_enabled: bool,
+    /// Global mana pool for snipes, separate from every per-market budget.
+    /// [`crate::db::Db::snipe_pool_invested`] reports what is committed.
+    pub snipe_pool_mana: f64,
+    /// Maximum mana for one snipe, validated only as positive here. It should
+    /// stay at or below [`Self::snipe_pool_mana`]; a larger value is warned
+    /// about at startup and clamped at use time.
+    pub snipe_max_mana: f64,
+    /// Minimum `totalLiquidity` a market needs before sniping it.
+    pub snipe_min_liq: f64,
+    /// Minimum absolute gap `|p_model − p_initial|` in the open interval
+    /// `(0, 1)`.
+    pub snipe_min_gap: f64,
+    /// Fractional Kelly fraction for snipe sizing, in `(0, 1]`.
+    pub snipe_kelly_fraction: f64,
+    /// How long a new market stays eligible for a snipe, in seconds.
+    ///
+    /// Substrate only: the strategy owns the eligibility boundary check; this
+    /// value is not enforced anywhere in this module.
+    pub snipe_ttl_secs: usize,
+    /// Deadline for one snipe decision call, in `[1, 30]` seconds.
+    pub snipe_decision_timeout_secs: usize,
     pub db_path: PathBuf,
 }
 
@@ -108,7 +149,16 @@ impl Config {
     /// not an error: the process environment may be the source of truth.
     pub fn from_env() -> AppResult<Self> {
         dotenvy::dotenv().ok();
-        Self::from_lookup(|key| std::env::var(key).ok())
+        let config = Self::from_lookup(|key| std::env::var(key).ok())?;
+        if config.snipe_max_mana > config.snipe_pool_mana {
+            tracing::warn!(
+                snipe_max_mana = config.snipe_max_mana,
+                snipe_pool_mana = config.snipe_pool_mana,
+                "SNIPE_MAX_MANA exceeds SNIPE_POOL_MANA; the per-snipe cap will be clamped to \
+                 the remaining pool at use time"
+            );
+        }
+        Ok(config)
     }
 
     /// Builds a configuration from an arbitrary key lookup.
@@ -208,6 +258,47 @@ impl Config {
             bail!("RATE_LIMIT_PER_MIN must be a positive number of requests per minute");
         }
 
+        let snipe_enabled = bool_or(&get, "SNIPE_ENABLED", DEFAULT_SNIPE_ENABLED)?;
+        let snipe_pool_mana = f64_or(&get, "SNIPE_POOL_MANA", DEFAULT_SNIPE_POOL_MANA)?;
+        if snipe_pool_mana <= 0.0 || !snipe_pool_mana.is_finite() {
+            bail!("SNIPE_POOL_MANA must be a finite number greater than 0, got {snipe_pool_mana}");
+        }
+        let snipe_max_mana = f64_or(&get, "SNIPE_MAX_MANA", DEFAULT_SNIPE_MAX_MANA)?;
+        if snipe_max_mana <= 0.0 || !snipe_max_mana.is_finite() {
+            bail!("SNIPE_MAX_MANA must be a finite number greater than 0, got {snipe_max_mana}");
+        }
+        let snipe_min_liq = f64_or(&get, "SNIPE_MIN_LIQ", DEFAULT_SNIPE_MIN_LIQ)?;
+        if snipe_min_liq < 0.0 || !snipe_min_liq.is_finite() {
+            bail!(
+                "SNIPE_MIN_LIQ must be a finite number greater than or equal to 0, got \
+                 {snipe_min_liq}"
+            );
+        }
+        let snipe_min_gap = f64_or(&get, "SNIPE_MIN_GAP", DEFAULT_SNIPE_MIN_GAP)?;
+        if !(snipe_min_gap > 0.0 && snipe_min_gap < 1.0) {
+            bail!("SNIPE_MIN_GAP must be within (0, 1), got {snipe_min_gap}");
+        }
+        let snipe_kelly_fraction =
+            f64_or(&get, "SNIPE_KELLY_FRACTION", DEFAULT_SNIPE_KELLY_FRACTION)?;
+        if !(snipe_kelly_fraction > 0.0 && snipe_kelly_fraction <= 1.0) {
+            bail!("SNIPE_KELLY_FRACTION must be within (0, 1], got {snipe_kelly_fraction}");
+        }
+        let snipe_ttl_secs = usize_or(&get, "SNIPE_TTL_SECS", DEFAULT_SNIPE_TTL_SECS)?;
+        if snipe_ttl_secs == 0 {
+            bail!("SNIPE_TTL_SECS must be at least 1 second");
+        }
+        let snipe_decision_timeout_secs = usize_or(
+            &get,
+            "SNIPE_DECISION_TIMEOUT_SECS",
+            DEFAULT_SNIPE_DECISION_TIMEOUT_SECS,
+        )?;
+        if !(1..=30).contains(&snipe_decision_timeout_secs) {
+            bail!(
+                "SNIPE_DECISION_TIMEOUT_SECS must be within [1, 30] seconds, got \
+                 {snipe_decision_timeout_secs}"
+            );
+        }
+
         let db_path = optional(&get, "DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
@@ -239,6 +330,14 @@ impl Config {
             mc_max_new_per_tick,
             mc_max_answer_fraction,
             rate_limit_per_min,
+            snipe_enabled,
+            snipe_pool_mana,
+            snipe_max_mana,
+            snipe_min_liq,
+            snipe_min_gap,
+            snipe_kelly_fraction,
+            snipe_ttl_secs,
+            snipe_decision_timeout_secs,
             db_path,
         };
 
@@ -435,6 +534,14 @@ mod tests {
         assert_eq!(config.mc_max_new_per_tick, 2);
         assert_eq!(config.mc_max_answer_fraction, 0.25);
         assert_eq!(config.rate_limit_per_min, DEFAULT_RATE_LIMIT_PER_MIN);
+        assert!(!config.snipe_enabled, "sniping must default to off");
+        assert_eq!(config.snipe_pool_mana, 100.0);
+        assert_eq!(config.snipe_max_mana, 10.0);
+        assert_eq!(config.snipe_min_liq, 100.0);
+        assert_eq!(config.snipe_min_gap, 0.10);
+        assert_eq!(config.snipe_kelly_fraction, 0.25);
+        assert_eq!(config.snipe_ttl_secs, 3600);
+        assert_eq!(config.snipe_decision_timeout_secs, 2);
         assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
@@ -458,6 +565,14 @@ mod tests {
             ("MC_MAX_NEW_PER_TICK", "1"),
             ("MC_MAX_ANSWER_FRACTION", "0.5"),
             ("RATE_LIMIT_PER_MIN", "400"),
+            ("SNIPE_ENABLED", "true"),
+            ("SNIPE_POOL_MANA", "50"),
+            ("SNIPE_MAX_MANA", "5"),
+            ("SNIPE_MIN_LIQ", "250"),
+            ("SNIPE_MIN_GAP", "0.2"),
+            ("SNIPE_KELLY_FRACTION", "0.5"),
+            ("SNIPE_TTL_SECS", "120"),
+            ("SNIPE_DECISION_TIMEOUT_SECS", "5"),
             ("DB_PATH", "/tmp/test.db"),
         ]);
 
@@ -482,6 +597,14 @@ mod tests {
         assert_eq!(config.mc_max_new_per_tick, 1);
         assert_eq!(config.mc_max_answer_fraction, 0.5);
         assert_eq!(config.rate_limit_per_min, 400);
+        assert!(config.snipe_enabled);
+        assert_eq!(config.snipe_pool_mana, 50.0);
+        assert_eq!(config.snipe_max_mana, 5.0);
+        assert_eq!(config.snipe_min_liq, 250.0);
+        assert_eq!(config.snipe_min_gap, 0.2);
+        assert_eq!(config.snipe_kelly_fraction, 0.5);
+        assert_eq!(config.snipe_ttl_secs, 120);
+        assert_eq!(config.snipe_decision_timeout_secs, 5);
         assert_eq!(config.db_path, PathBuf::from("/tmp/test.db"));
     }
 
@@ -597,6 +720,110 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_non_positive_snipe_pool() {
+        for value in ["0", "-1", "NaN"] {
+            let mut vars = required_vars();
+            vars.push(("SNIPE_POOL_MANA", value));
+
+            let error = config_from(&vars).expect_err("non-positive pool should fail");
+            assert!(error.to_string().contains("SNIPE_POOL_MANA"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_non_positive_snipe_max() {
+        for value in ["0", "-1", "NaN"] {
+            let mut vars = required_vars();
+            vars.push(("SNIPE_MAX_MANA", value));
+
+            let error = config_from(&vars).expect_err("non-positive max should fail");
+            assert!(error.to_string().contains("SNIPE_MAX_MANA"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_negative_snipe_min_liquidity() {
+        for value in ["-1", "-0.01", "NaN"] {
+            let mut vars = required_vars();
+            vars.push(("SNIPE_MIN_LIQ", value));
+
+            let error = config_from(&vars).expect_err("negative liquidity should fail");
+            assert!(error.to_string().contains("SNIPE_MIN_LIQ"), "{error}");
+        }
+        // Zero is allowed: it only disables the liquidity gate.
+        let mut vars = required_vars();
+        vars.push(("SNIPE_MIN_LIQ", "0"));
+        assert_eq!(
+            config_from(&vars).expect("zero liquidity is valid").snipe_min_liq,
+            0.0
+        );
+    }
+
+    #[test]
+    fn rejects_a_snipe_min_gap_outside_the_open_unit_interval() {
+        for value in ["0", "-0.1", "1", "1.1", "NaN"] {
+            let mut vars = required_vars();
+            vars.push(("SNIPE_MIN_GAP", value));
+
+            let error = config_from(&vars).expect_err("out-of-range gap should fail");
+            assert!(error.to_string().contains("SNIPE_MIN_GAP"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_snipe_kelly_fraction_outside_the_half_open_unit_interval() {
+        for value in ["0", "-0.1", "1.1", "NaN"] {
+            let mut vars = required_vars();
+            vars.push(("SNIPE_KELLY_FRACTION", value));
+
+            let error = config_from(&vars).expect_err("out-of-range fraction should fail");
+            assert!(
+                error.to_string().contains("SNIPE_KELLY_FRACTION"),
+                "{error}"
+            );
+        }
+        // 1.0 is the closed upper bound and is valid.
+        let mut vars = required_vars();
+        vars.push(("SNIPE_KELLY_FRACTION", "1"));
+        assert_eq!(
+            config_from(&vars).expect("full Kelly is valid").snipe_kelly_fraction,
+            1.0
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_snipe_ttl() {
+        let mut vars = required_vars();
+        vars.push(("SNIPE_TTL_SECS", "0"));
+
+        let error = config_from(&vars).expect_err("zero TTL should fail");
+        assert!(error.to_string().contains("SNIPE_TTL_SECS"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_snipe_decision_timeout_outside_the_one_to_thirty_second_band() {
+        for value in ["0", "31", "-2"] {
+            let mut vars = required_vars();
+            vars.push(("SNIPE_DECISION_TIMEOUT_SECS", value));
+
+            let error = config_from(&vars).expect_err("out-of-range timeout should fail");
+            assert!(
+                error.to_string().contains("SNIPE_DECISION_TIMEOUT_SECS"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_malformed_snipe_enabled_flag() {
+        let mut vars = required_vars();
+        vars.push(("SNIPE_ENABLED", "sometimes"));
+
+        let error = config_from(&vars).expect_err("malformed flag should fail");
+        assert!(error.to_string().contains("SNIPE_ENABLED"), "{error}");
     }
 
     #[test]

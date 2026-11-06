@@ -31,7 +31,7 @@ use crate::llm::LlmClient;
 use crate::market_store::MarketStore;
 use crate::onboarding_agent;
 use crate::sieve::EngineRegistry;
-use crate::types::{MarketStatus, TrackedMarket};
+use crate::types::{MarketStatus, TrackedMarket, STRATEGY_NEWS};
 
 /// Manifold slug lookup endpoint; the slug is appended as a path segment.
 const MANIFOLD_SLUG_URL: &str = "https://api.manifold.markets/v0/slug";
@@ -591,6 +591,7 @@ fn build_market(
         deleted_at: None,
         outcome_type: market.outcome_type.clone(),
         should_answers_sum_to_one: market.should_answers_sum_to_one,
+        strategy: STRATEGY_NEWS.to_owned(),
     }
 }
 
@@ -687,6 +688,7 @@ mod tests {
             deleted_at: None,
             outcome_type: "BINARY".to_owned(),
             should_answers_sum_to_one: false,
+            strategy: STRATEGY_NEWS.to_owned(),
         };
         OnboardingDraft {
             market,

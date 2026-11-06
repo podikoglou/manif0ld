@@ -364,6 +364,18 @@ fn market_option(description: &str, required: bool) -> CreateCommandOption {
 // Autocomplete
 // -----------------------------------------------------------------------------
 
+/// Keeps only the operator's own `/track`ed markets.
+///
+/// Snipe markets are internal: they stay in the executor's `active()` set and
+/// in reconciliation, but `/status` and autocomplete are operator views and
+/// must not list them. Their trade embeds still post, because
+/// `channel_for_market` falls back to the control channel when the thread ID
+/// is empty.
+pub(crate) fn operator_markets(mut markets: Vec<TrackedMarket>) -> Vec<TrackedMarket> {
+    markets.retain(|market| market.is_news());
+    markets
+}
+
 /// Answers the focused option with matching tracked markets.
 ///
 /// The active markets are queried first for freshness, then every database
@@ -376,9 +388,9 @@ async fn autocomplete(state: &DiscordState, ctx: &Context, interaction: &Command
         .map(|option| option.value.trim().to_owned())
         .unwrap_or_default();
 
-    let mut markets = state.store.active();
+    let mut markets = operator_markets(state.store.active());
     match state.store.list() {
-        Ok(all) => markets.extend(all),
+        Ok(all) => markets.extend(operator_markets(all)),
         Err(error) => tracing::warn!(error = %error, "autocomplete could not list all markets"),
     }
 
@@ -481,7 +493,7 @@ async fn status(state: &DiscordState, ctx: &Context, interaction: &CommandIntera
 
 /// Builds the multi-market overview embed.
 fn status_overview(state: &DiscordState) -> AppResult<CreateEmbed> {
-    let markets = state.store.list()?;
+    let markets = operator_markets(state.store.list()?);
     let mut embed = CreateEmbed::new().title("Tracked markets");
 
     if markets.is_empty() {
@@ -2271,6 +2283,7 @@ mod tests {
             deleted_at: None,
             outcome_type: "BINARY".to_owned(),
             should_answers_sum_to_one: false,
+            strategy: crate::types::STRATEGY_NEWS.to_owned(),
         }
     }
 
@@ -2710,6 +2723,21 @@ mod tests {
         let choices = market_choices(&markets, "sun-rise");
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].1, "M2");
+    }
+
+    #[test]
+    fn operator_markets_keeps_news_and_drops_snipe_rows() {
+        let mut snipe = market("S1", "Snipe question?", "snipe-question");
+        snipe.strategy = crate::types::STRATEGY_SNIPE.to_owned();
+        let markets = vec![
+            market("M1", "News question?", "news-question"),
+            snipe,
+        ];
+
+        let visible = operator_markets(markets);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "M1");
+        assert!(visible[0].is_news());
     }
 
     #[test]

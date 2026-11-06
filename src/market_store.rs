@@ -20,6 +20,7 @@
 //! | `p_market_last` | [`MarketStore::record_price`], [`MarketStore::market_prices_observed`] |
 //! | `invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares` | [`MarketStore::record_position`] |
 //! | `outcome_type`, `should_answers_sum_to_one` | [`MarketStore::record_kind`] |
+//! | `strategy` | [`MarketStore::insert`] (fixed at creation time) |
 //! | `market_answers.p_market_last` | [`MarketStore::market_prices_observed`] |
 //!
 //! [`MarketStore::market_prices_observed`] is the price mirror for live
@@ -69,7 +70,7 @@ use crate::types::{MarketId, MarketStatus, TrackedMarket};
 const MARKET_COLUMNS: &str = "id, slug, market_url, question, description, resolution_criteria, close_time, \
      status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, no_shares, \
      p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, discord_thread_id, \
-     created_at, deleted_at, outcome_type, should_answers_sum_to_one";
+     created_at, deleted_at, outcome_type, should_answers_sum_to_one, strategy";
 
 /// Row truth plus the in-memory snapshot of the live markets.
 ///
@@ -168,8 +169,9 @@ impl MarketStore {
             "INSERT INTO tracked_markets (id, slug, market_url, question, description, resolution_criteria, \
              close_time, status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, \
              no_shares, p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, \
-             discord_thread_id, created_at, deleted_at, outcome_type, should_answers_sum_to_one) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+             discord_thread_id, created_at, deleted_at, outcome_type, should_answers_sum_to_one, \
+             strategy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 market.id,
                 market.slug,
@@ -193,6 +195,7 @@ impl MarketStore {
                 market.deleted_at,
                 market.outcome_type,
                 market.should_answers_sum_to_one,
+                market.strategy,
             ],
         )
         .with_context(|| format!("inserting market {}", market.id))?;
@@ -531,13 +534,14 @@ fn market_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedMarket> {
         deleted_at: row.get(19)?,
         outcome_type: row.get(20)?,
         should_answers_sum_to_one: row.get(21)?,
+        strategy: row.get(22)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TrackedAnswer;
+    use crate::types::{TrackedAnswer, STRATEGY_NEWS, STRATEGY_SNIPE};
 
     fn sample_market(id: &str, created_at: i64) -> TrackedMarket {
         TrackedMarket {
@@ -563,6 +567,7 @@ mod tests {
             deleted_at: None,
             outcome_type: "BINARY".to_owned(),
             should_answers_sum_to_one: false,
+            strategy: STRATEGY_NEWS.to_owned(),
         }
     }
 
@@ -607,6 +612,7 @@ mod tests {
             actual.should_answers_sum_to_one,
             expected.should_answers_sum_to_one
         );
+        assert_eq!(actual.strategy, expected.strategy);
     }
 
     fn market_ids(markets: &[TrackedMarket]) -> Vec<&str> {
@@ -662,6 +668,26 @@ mod tests {
 
         let loaded = store.load("m1").expect("load market").expect("row exists");
         assert_eq!(loaded.market_url, market.market_url);
+    }
+
+    #[test]
+    fn strategy_roundtrips_and_active_keeps_snipe_markets() {
+        let mut snipe = sample_market("snipe", 2);
+        snipe.strategy = STRATEGY_SNIPE.to_owned();
+        let (_db, store) = store_with(&[sample_market("news", 1), snipe]);
+
+        let loaded = store.load("snipe").expect("load").expect("row");
+        assert_eq!(loaded.strategy, STRATEGY_SNIPE);
+        assert!(loaded.is_snipe());
+        assert_eq!(
+            store.cached("snipe").expect("cached").strategy,
+            STRATEGY_SNIPE
+        );
+
+        let listed = store.list().expect("list markets");
+        assert_eq!(market_ids(&listed), vec!["news", "snipe"]);
+        // Only operator-facing views filter; the executor still sees snipes.
+        assert_eq!(market_ids(&store.active()), vec!["news", "snipe"]);
     }
 
     #[test]

@@ -1073,6 +1073,7 @@ mod tests {
             deleted_at: None,
             outcome_type: "BINARY".to_owned(),
             should_answers_sum_to_one: false,
+            strategy: crate::types::STRATEGY_NEWS.to_owned(),
         }
     }
 

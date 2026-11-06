@@ -1488,6 +1488,14 @@ mod tests {
             mc_max_new_per_tick: 2,
             mc_max_answer_fraction: 0.25,
             rate_limit_per_min: 500,
+            snipe_enabled: false,
+            snipe_pool_mana: 100.0,
+            snipe_max_mana: 10.0,
+            snipe_min_liq: 100.0,
+            snipe_min_gap: 0.10,
+            snipe_kelly_fraction: 0.25,
+            snipe_ttl_secs: 3600,
+            snipe_decision_timeout_secs: 2,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-live.db"),
         }
     }
@@ -1516,6 +1524,7 @@ mod tests {
             deleted_at: None,
             outcome_type: "BINARY".to_owned(),
             should_answers_sum_to_one: false,
+            strategy: crate::types::STRATEGY_NEWS.to_owned(),
         }
     }
 

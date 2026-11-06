@@ -2,8 +2,10 @@
 //!
 //! Market rows (`tracked_markets`) are not here: [`crate::market_store`] owns
 //! them so that no caller can write a market column without keeping the shared
-//! in-memory snapshot in step. This module keeps the transaction domain (one
-//! connection) that both layers share.
+//! in-memory snapshot in step. [`Db::snipe_pool_invested`] is the one read-only
+//! aggregate over that table, because the snipe pool has no cached counterpart.
+//! This module keeps the transaction domain (one connection) that both layers
+//! share.
 //!
 //! [`Db`] is a cheaply cloneable handle around a single connection. Every query
 //! is short and synchronous; callers share one handle across tasks and the
@@ -17,7 +19,9 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::{anyhow, bail, AppResult, Context};
-use crate::types::{SignalRecord, TrackedAnswer, TradeRecord};
+use crate::types::{
+    MarketStatus, SignalRecord, SnipeRecord, TrackedAnswer, TradeRecord, STRATEGY_SNIPE,
+};
 
 const ANSWER_COLUMNS: &str = "id, market_id, text, p_internal_log_odds, p_market_last, \
      belief_updated_at, yes_shares, no_shares, created_at, invested_mana";
@@ -27,6 +31,9 @@ const SIGNAL_COLUMNS: &str = "id, market_id, answer_id, post_uri, author_handle,
 
 const TRADE_COLUMNS: &str = "id, market_id, answer_id, action, mana_amount, shares_delta, p_internal, \
      p_market, trigger_post_uri, manifold_bet_id, created_at";
+
+const SNIPE_COLUMNS: &str = "id, contract_id, question, p_initial, p_model, gap, answer, action, \
+     reason, mana_amount, limit_prob, manifold_bet_id, cost_usd, created_at";
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -113,6 +120,12 @@ impl Db {
         // `DELETE`, so it is idempotent and needs no structural check.
         conn.execute_batch(include_str!("../migrations/006_remove_jetstream_cursor.sql"))
             .context("applying database migration 006 (remove jetstream cursor)")?;
+        // 007: `strategy` on `tracked_markets` plus the `snipe_ledger` table.
+        // The `ALTER` must run exactly once; the table creates are guarded.
+        if !table_has_column(conn, "tracked_markets", "strategy")? {
+            conn.execute_batch(include_str!("../migrations/007_strategy.sql"))
+                .context("applying database migration 007 (strategy and snipe ledger)")?;
+        }
         Ok(())
     }
 
@@ -233,6 +246,81 @@ impl Db {
             .query_map(params![market_id, limit], trade_from_row)
             .with_context(|| format!("querying trades for market {market_id}"))?;
         collect_rows(rows, "listing trades")
+    }
+
+    // ---------------------------------------------------------------------
+    // Snipe evaluation ledger
+    // ---------------------------------------------------------------------
+
+    /// Appends one snipe evaluation and returns its assigned row ID.
+    ///
+    /// Skips are recorded too, so the thresholds can be tuned later.
+    /// `record.id` is ignored; SQLite assigns the identifier.
+    pub fn insert_snipe(&self, record: &SnipeRecord) -> AppResult<i64> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO snipe_ledger (contract_id, question, p_initial, p_model, gap, answer, \
+             action, reason, mana_amount, limit_prob, manifold_bet_id, cost_usd, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                record.contract_id,
+                record.question,
+                record.p_initial,
+                record.p_model,
+                record.gap,
+                record.answer,
+                record.action,
+                record.reason,
+                record.mana_amount,
+                record.limit_prob,
+                record.manifold_bet_id,
+                record.cost_usd,
+                record.created_at,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "inserting snipe evaluation for contract {}",
+                record.contract_id
+            )
+        })?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Returns the newest snipe evaluations, newest first.
+    pub fn recent_snipes(&self, limit: usize) -> AppResult<Vec<SnipeRecord>> {
+        let limit = limit_to_i64(limit);
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT {SNIPE_COLUMNS} FROM snipe_ledger \
+                 ORDER BY created_at DESC, id DESC LIMIT ?1"
+            ))
+            .context("preparing snipe history")?;
+        let rows = statement
+            .query_map(params![limit], snipe_from_row)
+            .context("querying snipe history")?;
+        collect_rows(rows, "listing snipe evaluations")
+    }
+
+    /// Mana currently committed to open S2 snipe positions.
+    ///
+    /// Exact semantics: `SUM(invested_mana - realized_pnl_mana)` over every
+    /// `tracked_markets` row where `strategy = 'snipe'`, `status = 'ACTIVE'`,
+    /// and `deleted_at IS NULL`. Returns `0.0` when no row matches. The snipe
+    /// pool budget in `docs/ALGO.md` §S2 is separate from the per-market
+    /// budgets: `SNIPE_POOL_MANA - snipe_pool_invested()` is what a new snipe
+    /// may still deploy.
+    pub fn snipe_pool_invested(&self) -> AppResult<f64> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COALESCE(SUM(invested_mana - realized_pnl_mana), 0.0) \
+             FROM tracked_markets \
+             WHERE strategy = ?1 AND status = ?2 AND deleted_at IS NULL",
+            params![STRATEGY_SNIPE, MarketStatus::Active.as_str()],
+            |row| row.get::<_, f64>(0),
+        )
+        .context("summing invested mana across active snipe markets")
     }
 
     // ---------------------------------------------------------------------
@@ -559,6 +647,25 @@ fn trade_from_row(row: &Row<'_>) -> rusqlite::Result<TradeRecord> {
     })
 }
 
+fn snipe_from_row(row: &Row<'_>) -> rusqlite::Result<SnipeRecord> {
+    Ok(SnipeRecord {
+        id: row.get(0)?,
+        contract_id: row.get(1)?,
+        question: row.get(2)?,
+        p_initial: row.get(3)?,
+        p_model: row.get(4)?,
+        gap: row.get(5)?,
+        answer: row.get(6)?,
+        action: row.get(7)?,
+        reason: row.get(8)?,
+        mana_amount: row.get(9)?,
+        limit_prob: row.get(10)?,
+        manifold_bet_id: row.get(11)?,
+        cost_usd: row.get(12)?,
+        created_at: row.get(13)?,
+    })
+}
+
 fn answer_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedAnswer> {
     Ok(TrackedAnswer {
         id: row.get(0)?,
@@ -577,7 +684,7 @@ fn answer_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedAnswer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Direction, TradeAction};
+    use crate::types::{Direction, SnipeRecord, TradeAction, STRATEGY_NEWS};
     use chrono::Utc;
 
     fn sample_signal(id: i64, market_id: &str, created_at: i64) -> SignalRecord {
@@ -655,6 +762,162 @@ mod tests {
 
         // Applying again is a no-op.
         Db::apply_migrations(&conn).expect("migration 002 is idempotent");
+    }
+
+    fn sample_snipe(contract_id: &str, created_at: i64) -> SnipeRecord {
+        SnipeRecord {
+            id: 0,
+            contract_id: contract_id.to_owned(),
+            question: "Will the thing happen?".to_owned(),
+            p_initial: Some(0.40),
+            p_model: Some(0.62),
+            gap: Some(0.22),
+            answer: None,
+            action: "BUY_YES".to_owned(),
+            reason: Some("gap above threshold".to_owned()),
+            mana_amount: 8.5,
+            limit_prob: Some(0.61),
+            manifold_bet_id: Some("bet-snipe-1".to_owned()),
+            cost_usd: Some(0.0004),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn strategy_migration_backfills_news_and_is_idempotent() {
+        // Simulate a database created before migration 007: base schema only.
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch(include_str!("../migrations/001_init.sql"))
+            .expect("base schema applies");
+        conn.execute(
+            "INSERT INTO tracked_markets \
+             (id, slug, question, description, resolution_criteria, status, budget_mana, \
+              invested_mana, realized_pnl_mana, yes_shares, no_shares, p_internal_log_odds, \
+              p_market_last, belief_updated_at, sieve_source, discord_thread_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                "old", "old-slug", "Q?", "D", "C", "ACTIVE", 100.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.5, 1, "match Old { \"x\" }", "", 1,
+            ],
+        )
+        .expect("pre-007 row inserts");
+
+        Db::apply_migrations(&conn).expect("migration 007 applies");
+        assert!(table_has_column(&conn, "tracked_markets", "strategy").expect("has column"));
+
+        // The pre-existing row is now a news market.
+        let strategy: String = conn
+            .query_row(
+                "SELECT strategy FROM tracked_markets WHERE id = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pre-007 row still reads");
+        assert_eq!(strategy, STRATEGY_NEWS);
+
+        // The snipe ledger exists after the migration.
+        conn.execute(
+            "INSERT INTO snipe_ledger (contract_id, question, action, mana_amount, created_at) \
+             VALUES ('c1', 'Q?', 'SKIP', 0, 1)",
+            [],
+        )
+        .expect("snipe ledger accepts a row");
+
+        // Applying again is a no-op.
+        Db::apply_migrations(&conn).expect("migration 007 is idempotent");
+    }
+
+    #[test]
+    fn snipe_ledger_roundtrip_and_ordering() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let first_id = db
+            .insert_snipe(&sample_snipe("c1", 100))
+            .expect("insert snipe");
+        let mut skip = sample_snipe("c2", 200);
+        skip.action = "SKIP".to_owned();
+        skip.reason = Some("liquidity below SNIPE_MIN_LIQ".to_owned());
+        skip.mana_amount = 0.0;
+        skip.p_model = None;
+        skip.gap = None;
+        skip.limit_prob = None;
+        skip.manifold_bet_id = None;
+        skip.cost_usd = None;
+        let second_id = db.insert_snipe(&skip).expect("insert skip");
+
+        assert!(first_id > 0 && second_id > first_id);
+
+        let recent = db.recent_snipes(10).expect("recent snipes");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].id, second_id);
+        assert_eq!(recent[0].contract_id, "c2");
+        assert_eq!(recent[0].action, "SKIP");
+        assert_eq!(recent[0].p_model, None);
+        assert_eq!(recent[0].reason.as_deref(), Some("liquidity below SNIPE_MIN_LIQ"));
+        assert_eq!(recent[1].id, first_id);
+        assert_eq!(recent[1].action, "BUY_YES");
+        assert_eq!(recent[1].p_initial, Some(0.40));
+        assert_eq!(recent[1].p_model, Some(0.62));
+        assert_eq!(recent[1].gap, Some(0.22));
+        assert_eq!(recent[1].mana_amount, 8.5);
+        assert_eq!(recent[1].limit_prob, Some(0.61));
+        assert_eq!(recent[1].manifold_bet_id.as_deref(), Some("bet-snipe-1"));
+        assert_eq!(recent[1].cost_usd, Some(0.0004));
+
+        assert_eq!(db.recent_snipes(1).expect("limited").len(), 1);
+        assert_eq!(db.recent_snipes(1).expect("limited")[0].id, second_id);
+    }
+
+    #[test]
+    fn snipe_pool_invested_sums_active_undeleted_snipe_rows() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = crate::market_store::MarketStore::new(&db).expect("store loads");
+
+        let snipe_market = |id: &str, invested: f64, realized: f64| crate::types::TrackedMarket {
+            id: id.to_owned(),
+            slug: format!("slug-{id}"),
+            market_url: String::new(),
+            question: format!("Question {id}?"),
+            description: String::new(),
+            resolution_criteria: String::new(),
+            close_time: None,
+            status: crate::types::MarketStatus::Active,
+            budget_mana: 0.0,
+            invested_mana: invested,
+            realized_pnl_mana: realized,
+            yes_shares: 0.0,
+            no_shares: 0.0,
+            p_internal_log_odds: 0.0,
+            p_market_last: 0.5,
+            belief_updated_at: 1,
+            sieve_source: String::new(),
+            discord_thread_id: String::new(),
+            created_at: 1,
+            deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
+            strategy: crate::types::STRATEGY_SNIPE.to_owned(),
+        };
+
+        store.insert(&snipe_market("s1", 30.0, 5.0)).expect("s1");
+        store.insert(&snipe_market("s2", 12.0, 2.0)).expect("s2");
+        store.insert(&snipe_market("s3", 50.0, 0.0)).expect("s3");
+        store.insert(&snipe_market("s4", 70.0, 0.0)).expect("s4");
+        store
+            .record_status("s3", crate::types::MarketStatus::Paused)
+            .expect("pause s3");
+        store.untrack("s4", 1_700_000_900).expect("untrack s4");
+        insert_market_row(&db);
+
+        // (30 - 5) + (12 - 2) = 35. The paused, soft-deleted, and news rows
+        // are excluded.
+        assert_eq!(db.snipe_pool_invested().expect("pool total"), 35.0);
+    }
+
+    #[test]
+    fn snipe_pool_invested_is_zero_without_snipe_rows() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        insert_market_row(&db);
+        assert_eq!(db.snipe_pool_invested().expect("pool total"), 0.0);
     }
 
     #[test]
@@ -829,6 +1092,7 @@ mod tests {
                 deleted_at: None,
                 outcome_type: "BINARY".to_owned(),
                 should_answers_sum_to_one: false,
+                strategy: crate::types::STRATEGY_NEWS.to_owned(),
             })
             .expect("insert market");
     }

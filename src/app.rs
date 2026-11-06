@@ -59,7 +59,10 @@ impl App {
 
         let registry = Arc::new(EngineRegistry::new());
         for market in store.list()? {
-            if market.status != MarketStatus::Active {
+            // Snipe markets have no Sieve rule: they are created by the
+            // strategy, not by `/track`, so compiling their empty source would
+            // log an invalid-rule error on every boot.
+            if market.status != MarketStatus::Active || !market.is_news() {
                 continue;
             }
             match sieve::compile(&market.sieve_source) {

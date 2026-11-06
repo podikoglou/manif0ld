@@ -161,7 +161,8 @@ CREATE TABLE tracked_markets (
   sieve_source         TEXT NOT NULL,
   discord_thread_id    TEXT NOT NULL,
   created_at           INTEGER NOT NULL,
-  deleted_at           INTEGER            -- NULL while tracked; set by /untrack
+  deleted_at           INTEGER,           -- NULL while tracked; set by /untrack
+  strategy             TEXT NOT NULL DEFAULT 'news' -- 'news' | 'snipe'
 );
 
 CREATE TABLE signal_ledger (
@@ -195,6 +196,23 @@ CREATE TABLE trade_ledger (
   created_at      INTEGER NOT NULL
 );
 
+CREATE TABLE snipe_ledger (                -- migration 007, one row per S2 evaluation
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  contract_id      TEXT NOT NULL,
+  question         TEXT NOT NULL,          -- snapshot at evaluation time
+  p_initial        REAL,                   -- creator's initialProb
+  p_model          REAL,                   -- NULL when the decision call failed
+  gap              REAL,                   -- p_model - p_initial
+  answer           TEXT,                   -- chosen answer text for MCQ
+  action           TEXT NOT NULL,          -- 'BUY_YES' | 'BUY_NO' | 'SKIP'
+  reason           TEXT,                   -- skip reason or buy rationale
+  mana_amount      REAL NOT NULL DEFAULT 0,
+  limit_prob       REAL,
+  manifold_bet_id  TEXT,
+  cost_usd         REAL,
+  created_at       INTEGER NOT NULL
+);
+
 CREATE TABLE kv (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -207,6 +225,12 @@ CREATE TABLE kv (
   row but no longer trades.
 - `deleted_at` describes tracking: `NULL` means the market is tracked. Setting
   it (via `/untrack`) also forces `status = 'CLOSED'`.
+- `strategy` names the component that owns the row: `'news'` for `/track`ed
+  and onboarded markets, `'snipe'` for rows created by S2 new-market sniping.
+  Operator listings (`/status`, autocomplete) show only `'news'`; the trade
+  executor and reconciliation keep every active row, and a snipe market has no
+  Sieve rule and no Discord thread (its embeds fall back to the control
+  channel).
 - A soft-deleted row, its `market_answers`, and its `signal_ledger` /
   `trade_ledger` history stay in the database. Every listing query
   (`list_markets`, `list_markets_by_status`) skips it, so it leaves the market

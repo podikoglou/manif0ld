@@ -13,6 +13,21 @@ use serde::Deserialize;
 /// Manifold contract identifier.
 pub type MarketId = String;
 
+/// Strategy that owns a `tracked_markets` row created by `/track` or onboarding.
+///
+/// These are the operator's markets: they run through Sieve matching, triage,
+/// and the news-latency pipeline, and they are the only rows shown by
+/// operator-facing Discord listings.
+pub const STRATEGY_NEWS: &str = "news";
+
+/// Strategy that owns a market discovered autonomously by S2 new-market
+/// sniping (`docs/ALGO.md` §S2).
+///
+/// Snipe markets have no Sieve rule, no Discord thread, and no per-market
+/// budget of their own; they draw from the shared snipe pool
+/// (`SNIPE_POOL_MANA`) and stay visible to the executor and reconciliation.
+pub const STRATEGY_SNIPE: &str = "snipe";
+
 /// Lifecycle state of a tracked market.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarketStatus {
@@ -164,6 +179,11 @@ pub struct TrackedMarket {
     /// trading layer then normalizes the internal distribution. False for
     /// independent (`cpmm-multi-2`) answer sets.
     pub should_answers_sum_to_one: bool,
+    /// Component that owns this row: [`STRATEGY_NEWS`] or [`STRATEGY_SNIPE`].
+    ///
+    /// Migration 007 adds the column with a `'news'` default, so pre-existing
+    /// rows and every `/track`ed market stay news markets.
+    pub strategy: String,
 }
 
 impl TrackedMarket {
@@ -178,6 +198,18 @@ impl TrackedMarket {
     /// Whether this market carries a separate position per answer.
     pub fn is_multiple_choice(&self) -> bool {
         self.outcome_type == "MULTIPLE_CHOICE"
+    }
+
+    /// Whether `/track` (or onboarding) owns this market.
+    ///
+    /// Operator-facing views filter on this; the executor does not.
+    pub fn is_news(&self) -> bool {
+        self.strategy == STRATEGY_NEWS
+    }
+
+    /// Whether S2 new-market sniping owns this market.
+    pub fn is_snipe(&self) -> bool {
+        self.strategy == STRATEGY_SNIPE
     }
 }
 
@@ -296,6 +328,40 @@ pub struct TradeRecord {
     pub p_market: f64,
     pub trigger_post_uri: Option<String>,
     pub manifold_bet_id: Option<String>,
+    pub created_at: i64,
+}
+
+/// A row from `snipe_ledger`: one S2 evaluation, including skips.
+///
+/// The ledger exists so `SNIPE_MIN_GAP`, `SNIPE_MIN_LIQ`, and the Kelly
+/// fraction can be tuned from measured outcomes. Model outputs are optional:
+/// a timed-out or failed decision call still records the evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnipeRecord {
+    pub id: i64,
+    pub contract_id: MarketId,
+    /// Question text captured at evaluation time.
+    pub question: String,
+    /// Creator's `initialProb` when the market was seen.
+    pub p_initial: Option<f64>,
+    /// Model's fair probability.
+    pub p_model: Option<f64>,
+    /// `p_model - p_initial`.
+    pub gap: Option<f64>,
+    /// Chosen answer text for a multiple-choice market.
+    pub answer: Option<String>,
+    /// `BUY_YES`, `BUY_NO`, or `SKIP`.
+    pub action: String,
+    /// Why the strategy skipped, or why it bought.
+    pub reason: Option<String>,
+    /// Mana committed by this evaluation; zero for a skip.
+    pub mana_amount: f64,
+    /// Limit price sent with the buy, when one was sent.
+    pub limit_prob: Option<f64>,
+    /// Manifold bet ID when a bet was placed.
+    pub manifold_bet_id: Option<String>,
+    /// Decision-model cost in USD, when reported.
+    pub cost_usd: Option<f64>,
     pub created_at: i64,
 }
 
@@ -432,6 +498,7 @@ mod tests {
             deleted_at: None,
             outcome_type: "BINARY".to_owned(),
             should_answers_sum_to_one: false,
+            strategy: STRATEGY_NEWS.to_owned(),
         };
         assert_eq!(available_budget(&market), 70.0);
     }
@@ -461,6 +528,7 @@ mod tests {
             deleted_at: None,
             outcome_type: "BINARY".to_owned(),
             should_answers_sum_to_one: false,
+            strategy: STRATEGY_NEWS.to_owned(),
         };
         assert_eq!(available_budget(&market), -20.0);
         market.invested_mana = 0.0;
