@@ -440,6 +440,11 @@ evaluation. A multiple-choice market trades one position per `market_answers`
 row; `should_answers_sum_to_one` records whether the answers compete for one
 winner (`cpmm-multi-1`) or are independent binaries (`cpmm-multi-2`).
 
+Both kinds run through one planner (`book::Book::plan`): the binary/multiple-
+choice differences — the entry price band, the per-answer budget fraction, and
+the sum-to-one projection — are `TradeLimits` data selected by the market shape,
+not separate code paths.
+
 **Sizing** (fractional Kelly, λ = `KELLY_FRACTION`, capped at 50% of the
 relevant budget):
 

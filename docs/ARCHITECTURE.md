@@ -100,6 +100,7 @@ flowchart BT
     TRIAGE["triage.rs<br/>LlmClient + TriageClient<br/>+ prompt + parser"]
     STORE["market_store.rs<br/>MarketStore<br/>single writer of tracked_markets"]
     PIPE["pipeline.rs<br/>Pipeline + PipelineEvent"]
+    BOOK["book.rs<br/>Book + legs + policy"]
     TRADE["trade.rs<br/>ManifoldClient + TradeExecutor<br/>+ TradeEvent"]
     ONB["onboarding.rs<br/>prepare + activate"]
     AGENT["onboarding_agent.rs<br/>rig agent + Firecrawl tools"]
@@ -129,12 +130,18 @@ flowchart BT
     PIPE --> STORE
     PIPE --> TRIAGE
     PIPE --> TYPES
-    TRADE --> BEL
     TRADE --> CFG
     TRADE --> DB
     TRADE --> STORE
     TRADE --> TYPES
     TRADE -->|"PipelineEvent"| PIPE
+    TRADE -->|"Book, policy"| BOOK
+    BOOK --> BEL
+    BOOK --> CFG
+    BOOK --> DB
+    BOOK --> ERR
+    BOOK --> STORE
+    BOOK --> TYPES
     ONB --> BEL
     ONB --> CFG
     ONB --> DB
@@ -175,16 +182,20 @@ flowchart BT
 3. **`trade.rs` has two entry points.** It consumes `PipelineEvent` in `run()` and
    exposes `evaluate_market()`, `sync_market()`, `liquidate()`, `liquidate_all()`
    directly to Discord. It is both a subscriber and a service.
-4. **`onboarding.rs` reaches into `triage.rs`** for `LlmClient` and `snippet`.
+4. **`book.rs` is one-way.** `trade` imports `book` for the position model,
+   accounting, and policy; `book` never imports `trade`. It depends on `types`,
+   `db`, `market_store`, `belief`, `config`, and `error` only, so the trading
+   rules are testable without the HTTP client.
+5. **`onboarding.rs` reaches into `triage.rs`** for `LlmClient` and `snippet`.
    LLM transport is coupled to the triage feature.
    `onboarding.rs` and `onboarding_agent.rs` form one deliberate pair: the
    service prepares and activates a draft and delegates the model run, while the
    agent owns the tools and imports the prompt, market type, and progress events
    from the service. The import edge goes both ways, but it is one workflow, not
    two features.
-5. **`discord.rs` has the widest fan-in** (8 internal modules). Every command
+6. **`discord.rs` has the widest fan-in** (8 internal modules). Every command
    handler orchestrates store + DB + registry + trade + onboarding by hand.
-6. **`types.rs` is a shared kernel.** All modules depend on it, and it contains both
+7. **`types.rs` is a shared kernel.** All modules depend on it, and it contains both
    pure domain values (`TrackedMarket`, `Direction`) and workflow payloads
    (`TriageResult`, `TradeDecision`, `SignalRecord`). This is acceptable, but a
    change to a ledger struct touches many modules.
@@ -203,11 +214,11 @@ third store such as `EngineRegistry` or Manifold itself.
 | Presence of a Sieve engine | `EngineRegistry` map | none | `main` startup, onboarding.activate, `/untrack`, Liquidate button | dispatch |
 | Compiled rule text | `tracked_markets.sieve_source` | none | onboarding.activate | `/status` embed |
 | Budget `budget_mana` | `tracked_markets` | `MarketStore` | `record_budget` (`/budget`), `insert` | trade, `/status` |
-| Position `invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares` | `tracked_markets` | `MarketStore` | `record_position` (trade only) | trade, `/status` |
+| Position `invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares` | `book::Book` legs; answer rows hold a multiple-choice leg, root columns the binary leg | `MarketStore` | `Book::apply_buy`, `Book::apply_sell`, `Book::reconcile`; `Book::persist` writes answer rows then the root | trade, `/status` |
 | Belief `p_internal_log_odds`, `belief_updated_at` | `tracked_markets` and `market_answers` | `MarketStore` (market only) | `record_belief` (pipeline, `/override`), `insert` | pipeline, trade, `/status` |
 | Market price `p_market_last` | Manifold `/v0/market` | `tracked_markets` + `MarketStore` | `record_price` (trade sync only) | triage prompt, trade, `/status` |
 | Market kind `outcome_type`, `should_answers_sum_to_one` | `tracked_markets` | `MarketStore` | `record_kind` (trade sync) | trade, `/status` |
-| Position truth | Manifold `/v0/market/{id}/positions` | local shares + invested | trade.reconcile | trade, `/status` |
+| Position truth | Manifold `/v0/market/{id}/positions` | local shares + invested | `trade.prepare` → `Book::reconcile` | trade, `/status` |
 | Global kill switch | `kv.global_kill_switch` | none | `/panic` | trade.evaluate_market |
 | Signal history | `signal_ledger` | none | pipeline worker | `/status` |
 | Trade history | `trade_ledger` | none | trade | `/status` |
@@ -230,6 +241,21 @@ intended model. A writer that carried both groups could revert a belief (or a
 pause) from a snapshot taken before an HTTP call. The pipeline and `/override`
 therefore never touch `p_market_last`; the 60-second trade sync is its only
 writer.
+
+### One writer for the position aggregate
+
+`book::Book` adds one layer of ownership above `MarketStore`. A market owns one
+**leg** per position: a binary market has exactly one leg without an answer ID,
+a multiple-choice market has one leg per answer row. The root
+`invested_mana`/`yes_shares`/`no_shares` columns are always the **sum of the
+legs**, derived on demand by `Book::aggregate`; no caller increments them.
+
+`Book::persist` is the only code that writes a position: it updates the answer
+rows first and the root row after, through `MarketStore::record_position` and
+`Db::update_answer_position`. `trade.rs` and `discord.rs` never write a position
+column, so the five hand-maintained aggregate updates that used to live in the
+executor cannot drift apart again. `realized_pnl_mana` has no per-answer column,
+so it stays a single value on the market row; a sell on any leg adds to it.
 
 
 ### Lifecycle state machine (three stores must agree)
@@ -260,7 +286,7 @@ Rules encoded only by convention, not by a type:
 - Re-`/track` on a `CLOSED` row hard-deletes the row and answers, then inserts a new
   one. The ledgers keep the old history.
 - Position reconciliation can change shares/invested **without** a trade.
-  `sync_market` writes them from Manifold every 60 s.
+  `sync_market` writes them from Manifold every 60 s, through `Book::persist`.
 
 ### Multi-step writes with no shared transaction
 
@@ -430,6 +456,50 @@ run(self: Arc<Self>, posts: broadcast::Receiver<ExtractedPost>)
 Private per-market machinery: `TriageJob`, `QueueHandle`, `QueueDepth`,
 `spawn_worker`, `worker_loop`, `process`, `dispatch`, `enqueue`.
 
+### `book.rs`
+
+```rust
+pub struct Book { market: TrackedMarket, legs: Vec<Leg>, shape: Shape }
+
+Book::load(&MarketStore, &Db, market_id) -> AppResult<Option<Book>>
+id() / status() / shape() / legs() / leg(index) / available_budget()
+aggregate() -> Position                   // sum of the legs
+market() -> TrackedMarket                 // row with the aggregate applied
+refresh_kind(&MarketStore, &Db, outcome_type, sum_to_one)
+observe_prices(&Db, now, root_probability, &[AnswerObservation])
+reconcile(&MarketPositions)               // pure: no IO
+persist(&MarketStore, &Db)                // the only position writer
+apply_buy(leg, TradeAction, cost, shares)
+apply_sell(leg, TradeAction, shares, proceeds) -> Settlement
+sell_sides(resolved) -> Vec<(usize, TradeAction, f64)>
+view(leg, now, halflife_hours) -> LegView
+plan(now, halflife_hours, &TradePolicy) -> Vec<PlannedTrade>
+
+pub struct Leg { answer_id, text, yes_shares, no_shares, invested_mana,
+                 p_internal_log_odds, p_market_last, belief_updated_at, created_at }
+pub enum Shape { Binary, Answers }
+pub struct Position { yes_shares, no_shares, invested, profit }
+pub struct MarketPositions { root, answers, saw_root }   // + answer(), totals(), checksum_ok()
+pub struct Settlement { sold, basis, realized }
+pub struct LegView { answer_id, p_internal, p_market, yes_shares, no_shares }
+pub struct PlannedTrade { leg, decision, p_internal, p_market }
+
+pub struct TradeParams { kelly_fraction, entry_edge_threshold, exit_edge_threshold, min_trade_size }
+kelly_target_mana(edge, p_market, available_budget, TradeParams) -> f64
+pub struct TradeLimits { max_positions, max_new_per_tick,
+                         max_answer_fraction: Option<f64>, entry_price_band: Option<(f64, f64)> }
+TradeLimits::multiple_choice(&Config) / TradeLimits::binary()
+pub struct TradePolicy { params: TradeParams, multiple_choice: TradeLimits }
+```
+
+One book per market. The legs are the position truth; the root aggregate is
+derived, never incremented. `Book::plan` is the single planner for both market
+kinds: `TradeLimits::binary()` or `TradePolicy::multiple_choice` is selected
+from `Book::shape` and returned as data, so the entry price band, the per-answer
+budget fraction, and the sum-to-one projection are configuration rather than
+separate code paths. `Book::apply_sell` returns the settlement; `Book::persist`
+writes answer rows first, then the root row and price.
+
 ### `trade.rs`
 
 ```rust
@@ -437,16 +507,11 @@ pub struct ManifoldClient { ... }
 ManifoldClient::new(&Config).await -> AppResult<Self>   // resolves GET /v0/me
 bot_user_id() -> &str
 market(id) -> MarketSnapshot
-position(id) -> PositionSnapshot
-buy(id, outcome, amount, answer_id) -> BetResult
+position(id) -> book::Position                          // root of positions()
+positions(id) -> book::MarketPositions
+buy(id, outcome, amount, answer_id, dry_run) -> BetResult
 sell(id, outcome, shares, answer_id) -> BetResult
 bets(id) -> Vec<Value>
-
-pub fn kelly_target_mana(...)
-pub fn decide_trade(&TrackedMarket, p_internal, p_market, TradeParams) -> Option<TradeDecision>
-pub fn decide_trade_for_answer(...)                     // multi-choice path
-pub fn apply_buy(&mut TrackedMarket, TradeAction, cost, shares)
-pub fn apply_sell(&mut TrackedMarket, TradeAction, shares, proceeds)
 
 pub enum TradeEvent {
     Trade { market_id, action, mana_amount, shares_delta,
@@ -454,9 +519,11 @@ pub enum TradeEvent {
     Error { market_id, message },
 }
 
+pub enum LiquidationOutcome { AlreadyClosed, AlreadyResolved, NoPosition, Sold }
+
 pub struct TradeExecutor {
     client: ManifoldClient, db: Db, store: Arc<MarketStore>,
-    params: TradeParams, halflife_hours: f64,
+    policy: TradePolicy, dry_run: bool, halflife_hours: f64,
     execution_lock: tokio::sync::Mutex<()>,
     events: broadcast::Sender<TradeEvent>,
 }
@@ -470,6 +537,12 @@ liquidate(market_id) -> LiquidationOutcome
 liquidate_all() -> Vec<(MarketId, Error)>
 run(self: Arc<Self>, broadcast::Receiver<PipelineEvent>)
 ```
+
+`trade.rs` is transport and control flow only. Private helpers: `load_book`,
+`prepare` (kind, positions, prices, reconcile, persist), `execute` (buy or sell
+plus the ledger row), `record_trade`, `emit_trade`, `emit_error`,
+`kill_switch_on`. `evaluate_market`, `sync_market`, and `liquidate` each have a
+single body for both market shapes; the shape lives in `book::Book`.
 
 `evaluate_market` does a full remote round trip on **every** material signal:
 `GET market` + `GET positions` + optional `POST bet/sell` + DB writes. It
@@ -561,6 +634,7 @@ sequenceDiagram
     participant BE as belief
     participant EV as PipelineEvent bus
     participant TE as TradeExecutor
+    participant BK as book::Book
     participant MA as Manifold
     participant DC as Discord consumer
 
@@ -602,16 +676,18 @@ sequenceDiagram
 
     EV->>TE: Signal, only if material
     TE->>TE: execution_lock
-    TE->>ST: load(id)
+    TE->>BK: Book::load (market row + answer rows)
     TE->>DB: get_kv("global_kill_switch")
     TE->>MA: GET /v0/market/{id}
     TE->>MA: GET /v0/market/{id}/positions
-    TE->>TE: reconcile_position + current_p_internal
-    TE->>ST: record_position + record_price
-    alt edge above threshold and no position
-        TE->>MA: POST /v0/bet
+    TE->>BK: refresh_kind, observe_prices, reconcile
+    TE->>ST: Book::persist (answer rows, then root)
+    TE->>BK: plan
+    loop each planned action
+        TE->>MA: POST /v0/bet or POST /v0/market/{id}/sell
         TE->>DB: insert_trade
-        TE->>ST: record_position + record_price
+        TE->>BK: apply_buy / apply_sell
+        TE->>ST: Book::persist (answer rows, then root)
         TE->>DC: TradeEvent::Trade
     end
     EV->>DC: Signal or Error
@@ -689,9 +765,10 @@ sequenceDiagram
     else live and liquidate
         D->>EX: liquidate(market_id)
         EX->>MA: GET market + GET positions
+        EX->>EX: Book::prepare, then one loop over Book::sell_sides
         EX->>MA: POST sell for each held side
         EX->>DB: insert_trade
-        EX->>ST: record_position + record_price
+        EX->>ST: Book::persist (answer rows, then root)
     end
     D->>RG: unregister
     D->>ST: untrack, CLOSED + deleted_at
@@ -840,13 +917,23 @@ failure needs manual thread archiving.
 Do **not** merge prepare and activate unless you accept a market row without a
 thread.
 
-### E. `trade.rs` is both a consumer and a service, and depends on the pipeline event type
+### E. `trade.rs` is both a consumer and a service, and depends on the pipeline event type — **partly resolved**
 
 **Today:** `TradeExecutor::run` selects on `PipelineEvent`; Discord calls
 `evaluate_market`/`liquidate` directly. One `execution_lock` serializes all markets.
 
 **Why it hurts:** the trade layer cannot be tested or reused without the pipeline's
 event enum. The global lock also means one slow Manifold call delays every market.
+
+**Done:** the policy and persistence half moved to `book.rs`. `TradeExecutor` is
+transport plus control flow; position accounting, the planner, and the shape
+differences are testable without the HTTP client or a pipeline event.
+
+**Residual:** `TradeExecutor::run` still matches on `PipelineEvent` (an adapter
+for a `SignalReady { market_id, post_uri }` command type has not been added),
+and the one global `execution_lock` still serializes every market. Both change
+concurrency and failure behaviour, so they need their own plan, not this
+refactor.
 
 **Candidate cut:**
 
@@ -898,16 +985,27 @@ if you add concurrent workers or long queries.
 a connection pool (`r2d2_sqlite`). Do **not** do this as part of a pure module
 refactor; it changes failure and latency behavior.
 
-### I. Multi-choice is a separate path
+### I. Multi-choice is a separate path — **resolved in trading**
 
 **Today:** `pipeline::process` branches on `answers.is_empty()`. The multi-choice
 branch updates each answer, writes one signal per answer, and emits a market-level
-`Signal` with `impulse = 0` and `p_after = p_before`. `trade` has
+`Signal` with `impulse = 0` and `p_after = p_before`. `trade` had
 `decide_trade_for_answer`. Discord's `/override` only handles the market-level
 belief.
 
 **Why it hurts:** two belief models and two event semantics live in one function. A
 refactor can silently break one.
+
+**Done:** the trading half is one path. `Book::plan` is the single planner;
+`decide_trade_for_answer`, `evaluate_answers`, `sync_answers`,
+`reconcile_answers`, and `liquidate_answers` are gone, and the binary/multiple-
+choice differences are `TradeLimits` data. `Book` owns one leg per position for
+both shapes.
+
+**Residual:** `pipeline::process` still branches on `answers.is_empty()` for the
+belief writes, and `/override` still only writes the market-level belief. Answer
+beliefs belong to triage and the operator, not to the book, so this remains a
+triage-side change.
 
 **Candidate cut:** make the triage outcome an enum:
 
