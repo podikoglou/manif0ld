@@ -88,10 +88,10 @@ works.
 
 \begin{enumerate}[leftmargin=1.5em, itemsep=1pt, topsep=2pt]
   \item \textbf{Ingest} (\texttt{ingest.rs}): connect to Jetstream with
-    \texttt{wantedCollections=app.bsky.feed.post}, resuming from the persisted
-    microsecond cursor (\texttt{jetstream\_cursor\_us}); reconnect with
-    exponential backoff (1\,s $\to$ 60\,s). Cursor is saved to SQLite every
-    5\,s and forced on stream close.
+    \texttt{wantedCollections=app.bsky.feed.post} at the live tail; reconnect
+    with exponential backoff (1\,s $\to$ 60\,s). No cursor and no replay:
+    posts published while the socket is down are dropped, because a replayed
+    post would move belief with news the market has already priced.
   \item \textbf{Extract} (\texttt{extract.rs}): keep \texttt{commit/create}
     posts only; concatenate body $+$ image alt-texts $+$ quoted body, verbatim.
     Handle falls back to the author DID.
