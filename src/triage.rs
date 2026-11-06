@@ -52,6 +52,17 @@ const DECISIONS_ENDPOINT: &str = "https://openrouter.ai/api/alpha/decisions";
 /// Upper bound on one decisions call. Joey answers in tens of milliseconds.
 const DECISIONS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on opening one TCP/TLS connection to an LLM provider.
+const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Longest silence tolerated while an LLM provider answers.
+///
+/// `reqwest` resets this on every successful read, so it bounds a stalled
+/// request and a stalled stream without capping how long a live stream may
+/// run. Without it a provider that stops sending holds the onboarding agent
+/// open until the whole `/track` run times out.
+const LLM_READ_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Expected evidence strength, on the 0-3 rubric, below which a post is noise.
 const MIN_STRENGTH: f64 = 0.5;
 
@@ -595,14 +606,28 @@ impl LlmClient {
     /// Builds the client from the process environment.
     ///
     /// Initializes Cloudflare and/or OpenRouter depending on the credentials
-    /// present in the process environment.
+    /// present in the process environment. Both providers share one transport
+    /// with [`LLM_READ_TIMEOUT`] applied, because the bundled `reqwest` client
+    /// rig defaults to has no request timeout at all.
     pub fn new() -> AppResult<Self> {
-        let (cloudflare, cf_err) = match rig::providers::cloudflare::from_env() {
-            Ok(client) => (Some(client), None),
+        let transport = rig::http_client::ReqwestClient::from(
+            rig::rig_reqwest::reqwest::Client::builder()
+                .connect_timeout(LLM_CONNECT_TIMEOUT)
+                .read_timeout(LLM_READ_TIMEOUT)
+                .build()
+                .context("building the LLM HTTP client")?,
+        );
+
+        let (cloudflare, cf_err) = match rig::providers::openai::OpenAIConfig::from_env_with(
+            &rig::providers::cloudflare::DIALECT,
+        ) {
+            Ok(config) => (Some(config.connect(transport.clone())), None),
             Err(e) => (None, Some(e)),
         };
-        let (openrouter, or_err) = match rig::providers::openrouter::from_env() {
-            Ok(client) => (Some(client), None),
+        let (openrouter, or_err) = match rig::providers::openai::OpenAIConfig::from_env_with(
+            &rig::providers::openai::wire::OPENROUTER,
+        ) {
+            Ok(config) => (Some(config.connect(transport)), None),
             Err(e) => (None, Some(e)),
         };
         if cloudflare.is_none() && openrouter.is_none() {
