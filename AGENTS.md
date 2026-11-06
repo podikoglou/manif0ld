@@ -69,6 +69,7 @@ All three must stay clean.
   module. Most cross-cutting work touches `src/pipeline.rs` (orchestration and
   `PipelineEvent`), `src/discord.rs` (embeds/commands/buttons), and
   `src/trade.rs` (`TradeExecutor`). Wire new long-running loops in
-  `src/main.rs` and abort them on Ctrl-C.
+  `src/app.rs` and abort them on Ctrl-C. Every broadcast subscription goes in
+  `App::spawn`, before its first `tokio::spawn`.
 - Something confusing: the spec is the source of truth. Update it only when an
   architectural decision actually changes.

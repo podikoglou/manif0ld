@@ -50,7 +50,8 @@ manif0ld/
 ├── migrations/
 │   └── 001_init.sql
 └── src/
-    ├── main.rs          # setup, task spawn, graceful shutdown
+    ├── main.rs          # process setup: rustls, tracing, config
+    ├── app.rs           # composition root: build, subscribe, spawn, run
     ├── config.rs        # env loading, constants
     ├── error.rs         # anyhow/thiserror aliases
     ├── types.rs         # domain types: Market, ExtractedPost, Trade, Belief, etc.

@@ -24,7 +24,7 @@ flowchart LR
         T_DISC["discord::run<br/>serenity client + handlers"]
         T_DPC["discord pipeline consumer"]
         T_DTC["discord trade consumer"]
-        T_LOG["main::log_pipeline_event"]
+        T_LOG["app::log_pipeline_event"]
         T_ONB["/track progress updater<br/>short-lived"]
     end
 
@@ -70,22 +70,25 @@ flowchart LR
     CFG -.->|"read by every task"| TASKS
 ```
 
-Key point for restructuring: there is **no single composition root object** after
-`main.rs`. Shared state is a set of independent `Arc`s passed into constructors.
-Any module can hold any other module's state.
+Key point for restructuring: the composition root is now `app::App`. `build`
+constructs every shared `Arc` and service, `spawn` subscribes every receiver and
+starts the tasks, and `Tasks::run` owns the aborts. It is a root, not a service
+locator: its fields are private, `spawn` consumes it, and nothing reads them
+afterwards. Shared state is still a set of independent `Arc`s passed into
+constructors, so any module can hold any other module's state.
 
 ### Task inventory
 
 | Task | Spawned in | Lifetime | Owns | Ends when |
 |---|---|---|---|---|
-| `ingest::run` | `main.rs:144` | process | WS stream, `post_tx` | Ctrl-C (`abort`) |
-| `Pipeline::run` | `main.rs:126` | process | `post_rx`, dispatch loop | Ctrl-C |
+| `ingest::run` | `app.rs` (`App::spawn`) | process | WS stream, `post_tx` | Ctrl-C (`abort`) |
+| `Pipeline::run` | `app.rs` (`App::spawn`) | process | `post_rx`, dispatch loop | Ctrl-C |
 | per-market worker | `pipeline.rs:433`, lazily | process, detached | `TriageJob` receiver, queue depth | sender dropped / Ctrl-C |
-| `TradeExecutor::run` | `main.rs:135` | process | pipeline event receiver, 60 s ticker | Ctrl-C |
-| `discord::run` | `main.rs:150` | process | gateway client, handlers | gateway error / Ctrl-C |
+| `TradeExecutor::run` | `app.rs` (`App::spawn`) | process | pipeline event receiver, 60 s ticker | Ctrl-C |
+| `discord::run` | `app.rs` (`App::spawn`) | process | gateway client, handlers | gateway error / Ctrl-C |
 | pipeline consumer | `discord.rs:115` | process | `PipelineEvent` receiver | channel closed |
 | trade consumer | `discord.rs:121` | process | `TradeEvent` receiver | channel closed |
-| logger | `main.rs:158` | process | `PipelineEvent` receiver | channel closed |
+| logger | `app.rs` (`App::spawn`) | process | `PipelineEvent` receiver | channel closed |
 | `/track` updater | `discord.rs:717` | one command | `OnboardUpdate` receiver, progress message | sender dropped |
 
 Every mutating command is now one [`control::ControlPlane`] call. Only `/status` and
@@ -116,6 +119,7 @@ flowchart BT
     INGEST["ingest.rs"]
     DISCORD["discord.rs<br/>commands + consumers"]
     MAIN["main.rs"]
+    APP["app.rs<br/>composition root"]
 
     ERR --> TYPES
     CFG --> ERR
@@ -181,7 +185,8 @@ flowchart BT
     DISCORD --> STORE
     DISCORD --> TRADE
     DISCORD --> TYPES
-    MAIN --> ALL
+    APP --> ALL
+    MAIN --> APP
 ```
 
 ### Dependency observations that matter for restructuring
@@ -229,7 +234,7 @@ third store such as `EngineRegistry` or Manifold itself.
 | Fact | Authoritative store | Mirrors | Writers | Readers |
 |---|---|---|---|---|
 | Market lifecycle `status` | `tracked_markets.status` | `MarketStore` snapshot | `control` (pause, resume, close, untrack), `insert` (onboarding) | dispatch, trade, `/status`, autocomplete |
-| Presence of a Sieve engine | `EngineRegistry` map | none | `main` startup, onboarding.activate, onboarding rollback, `control` teardown | dispatch |
+| Presence of a Sieve engine | `EngineRegistry` map | none | `app` startup, onboarding.activate, onboarding rollback, `control` teardown | dispatch |
 | Compiled rule text | `tracked_markets.sieve_source` | none | onboarding.activate | `/status` embed |
 | Budget `budget_mana` | `tracked_markets` | `MarketStore` | `control::set_budget`, `insert` | trade, `/status` |
 | Position `invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares` | `book::Book` legs; answer rows hold a multiple-choice leg, root columns the binary leg | `MarketStore` | `Book::apply_buy`, `Book::apply_sell`, `Book::reconcile`; `Book::persist` writes answer rows then the root | trade, `/status` |
@@ -918,8 +923,8 @@ calls `ControlPlane::set_paused`; the row and snapshot still change in one
 
 Properties to preserve:
 
-- `broadcast` has **no history**. `main.rs` subscribes all receivers before
-  spawning tasks. A late subscriber misses events.
+- `broadcast` has **no history**. `app::App::spawn` subscribes all receivers
+  before the first `tokio::spawn`. A late subscriber misses events.
 - No event is persisted. A restart loses in-flight signals. The 60 s `sync_all`
   recovers position and price, not missed signals.
 - Every channel is bounded. The design prefers dropping data to blocking the
@@ -1100,18 +1105,30 @@ enum Triaged {
 Then one branch applies it. Keep the market-level `Signal` for display, or emit a
 distinct `AnswerSignal` if Discord needs it.
 
-### J. `main.rs` is a manual composition root
+### J. `main.rs` is a manual composition root — **resolved**
 
-**Today:** `main.rs` builds every `Arc`, wires every constructor, subscribes four
-receivers in a specific order, and spawns five tasks. The ordering comments are
-load-bearing.
+**Then:** `main.rs` built every `Arc`, wired every constructor, subscribed the
+receivers in a specific order, and spawned every task. The ordering comments were
+load-bearing, and adding a module meant editing six regions of one function.
 
-**Why it hurts:** adding a module means editing `main.rs` in several places, and the
-subscribe-before-spawn rule is easy to break.
+**Now:** `app::App` is the composition root. `App::build` constructs every service
+in dependency order, `App::spawn` creates all five broadcast receivers in one block
+before its first `tokio::spawn` and then starts the six tasks, and `Tasks::run`
+waits for Ctrl-C and aborts them in the old order. `main.rs` keeps process setup
+only: the rustls provider, `tracing`, `Config::from_env`, then the three chained
+calls. `App`'s fields are private and `spawn` consumes it, so no code outside
+`app.rs` can reach a `Pipeline` or a `TradeExecutor` to subscribe late.
 
-**Candidate cut:** an `App`/`Runtime` struct with `App::build(config, db) -> App` and
-`App::spawn() -> Tasks`. Keep the same order inside it, but encode the rule once.
-This is a low-risk, high-clarity change.
+**Residual:** the subscribe-before-spawn rule is pinned by the module doc, review,
+and the structural greps, not by a test. `App::build` needs a live Manifold key, a
+process-environment OpenRouter key, and a Firecrawl client, so it cannot be built
+in a unit test; `Tasks::run` cannot be completed in-process without a real SIGINT
+or a shutdown parameter that would change the semantics it promises to keep.
+`App` also retains `registry` and `onboarding` handles that nothing reads after
+`build`; they are dropped at the top of `spawn` and their clones live in
+`Pipeline`, `ControlPlane`, and the onboarding service. `discord::run` and
+`pipeline` still spawn their own consumers and per-market workers, so a new task
+must be assigned to one of the two owners.
 
 ---
 

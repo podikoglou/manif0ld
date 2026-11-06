@@ -77,12 +77,12 @@ when the gap is wide. Each market has an isolated mana budget.
 \end{tikzpicture}
 \end{center}
 
-Modules: \texttt{main.rs} spawns five tasks (ingest, pipeline, trade executor,
-Discord, stdout logger); \texttt{db.rs} is the SQLite layer; \texttt{types.rs}
-holds the domain types. Text passing through \texttt{extract.rs} is never
-lowercased, trimmed, or NFKC-normalized --- the Sieve engine does all lexical
-normalization internally, so a case-sensitive \texttt{"SEC"!} literal still
-works.
+Modules: \texttt{app.rs} spawns six tasks (ingest, pipeline, trade executor,
+Discord, console logger, heartbeat); \texttt{db.rs} is the SQLite layer;
+\texttt{types.rs} holds the domain types. Text passing through
+\texttt{extract.rs} is never lowercased, trimmed, or NFKC-normalized --- the
+Sieve engine does all lexical normalization internally, so a case-sensitive
+\texttt{"SEC"!} literal still works.
 
 \section{The per-post path}\label{sec:path}
 
