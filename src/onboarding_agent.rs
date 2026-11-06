@@ -39,7 +39,8 @@ use tokio::sync::mpsc;
 
 use crate::error::{bail, AppResult};
 use crate::onboarding::{
-    build_sieve_user_prompt, ManifoldSlugMarket, OnboardUpdate, SieveAttempt, SIEVE_SYSTEM_PROMPT,
+    build_sieve_user_prompt, ManifoldSlugMarket, OnboardUpdate, ResearchStep, SieveAttempt,
+    SIEVE_SYSTEM_PROMPT,
 };
 use crate::sieve;
 
@@ -399,6 +400,15 @@ fn dry_run_sieve_tool(updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
 
                 match outcome {
                     Ok((warnings, results)) => {
+                        let total = results.len();
+                        let matched = results.iter().filter(|(matched, _)| *matched).count();
+                        let _ = updates
+                            .send(OnboardUpdate::Activity(ResearchStep::DryRun {
+                                matched,
+                                total,
+                                warnings: warnings.len(),
+                            }))
+                            .await;
                         let results: Vec<Value> = results
                             .into_iter()
                             .map(|(matched, text)| json!({ "matched": matched, "text": text }))
@@ -409,10 +419,17 @@ fn dry_run_sieve_tool(updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
                             "next": "narrow any rule arm that matched an off-topic post"
                         })))
                     }
-                    Err(error) => Ok(ToolOutput::text(format!(
-                        "compile error:\n{}\nFix the program and call dry_run_sieve again.",
-                        root_cause(&error)
-                    ))),
+                    Err(error) => {
+                        let message = root_cause(&error);
+                        let _ = updates
+                            .send(OnboardUpdate::Activity(ResearchStep::DryRunFailed {
+                                error: message.clone(),
+                            }))
+                            .await;
+                        Ok(ToolOutput::text(format!(
+                            "compile error:\n{message}\nFix the program and call dry_run_sieve again."
+                        )))
+                    }
                 }
             })
         },
@@ -486,6 +503,13 @@ fn web_search_tool(client: Arc<Client>, updates: mpsc::Sender<OnboardUpdate>) ->
                     .into_iter()
                     .map(map_search_result)
                     .collect();
+
+                let _ = updates
+                    .send(OnboardUpdate::Activity(ResearchStep::Search {
+                        query: query.clone(),
+                        results: results.len(),
+                    }))
+                    .await;
 
                 Ok(ToolOutput::json(json!({ "results": results })))
             })
@@ -590,6 +614,13 @@ fn read_page_tool(client: Arc<Client>, updates: mpsc::Sender<OnboardUpdate>) -> 
                         "read_page returned no readable content for this URL",
                     ));
                 }
+
+                let _ = updates
+                    .send(OnboardUpdate::Activity(ResearchStep::Page {
+                        url: raw_url.clone(),
+                        chars: markdown.chars().count(),
+                    }))
+                    .await;
 
                 Ok(ToolOutput::json(json!({
                     "url": raw_url,
@@ -731,12 +762,53 @@ mod tests {
 
         let value = output.as_json().cloned().expect("dry-run returns JSON");
         let results = value["results"].as_array().expect("results array");
-        assert!(results.iter().any(|r| r["matched"] == json!(true)), "{value}");
-        assert!(results.iter().any(|r| r["matched"] == json!(false)), "{value}");
+        assert!(
+            results.iter().any(|r| r["matched"] == json!(true)),
+            "{value}"
+        );
+        assert!(
+            results.iter().any(|r| r["matched"] == json!(false)),
+            "{value}"
+        );
         let warnings = value["warnings"].as_array().expect("warnings array");
-        assert!(warnings
-            .iter()
-            .any(|w| w.as_str().unwrap_or_default().contains("under 3 characters")));
+        assert!(warnings.iter().any(|w| w
+            .as_str()
+            .unwrap_or_default()
+            .contains("under 3 characters")));
+    }
+
+    #[tokio::test]
+    async fn dry_run_tool_reports_match_counts_as_activity() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let dry = dry_run_sieve_tool(tx);
+
+        let _ = dry
+            .run(json!({
+                "sieve_program": r#"match Market_test { ("talarico" | "ff") &..4 "senate" }"#,
+                "test_posts": ["talarico speaks at the senate hearing", "weather is nice today"]
+            }))
+            .await
+            .expect("valid dry-run should succeed");
+
+        let mut activity = None;
+        while let Ok(update) = rx.try_recv() {
+            if let OnboardUpdate::Activity(step) = update {
+                activity = Some(step);
+            }
+        }
+
+        match activity {
+            Some(ResearchStep::DryRun {
+                matched,
+                total,
+                warnings,
+            }) => {
+                assert_eq!(matched, 1, "exactly one sample matches");
+                assert_eq!(total, 2, "both samples are counted");
+                assert!(warnings >= 1, "the short literal must be warned about");
+            }
+            other => panic!("expected a dry-run activity update, got {other:?}"),
+        }
     }
 
     #[tokio::test]
