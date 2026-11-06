@@ -45,7 +45,7 @@ use crate::onboarding::{
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
 use crate::trade::{LiquidationOutcome, TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
-use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedMarket};
+use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket};
 
 /// Maximum number of autocomplete choices Discord accepts.
 const MAX_AUTOCOMPLETE_CHOICES: usize = 25;
@@ -79,6 +79,9 @@ const MAX_SIEVE_CHUNKS: usize = 3;
 
 /// Number of recent signals shown for one market.
 const MAX_SIGNAL_LINES: usize = 10;
+
+/// Number of answers shown in one multiple-choice status embed.
+const MAX_ANSWER_LINES: usize = 6;
 
 /// Timeout for one `/track` onboarding run.
 ///
@@ -470,16 +473,33 @@ fn status_overview(state: &DiscordState) -> AppResult<CreateEmbed> {
             }
         };
 
+        let probability_line = if market.is_multiple_choice() {
+            let answer_count = state
+                .db
+                .list_answers(&market.id)
+                .map(|rows| rows.len())
+                .unwrap_or(0);
+            format!(
+                "{answer_count} answers | sum-to-one {}",
+                if market.should_answers_sum_to_one {
+                    "yes"
+                } else {
+                    "no"
+                }
+            )
+        } else {
+            format!("P_int {p_internal:.3} vs P_mkt {:.3}", market.p_market_last)
+        };
+
         let value = format!(
             "Budget {:.2} | Invested {:.2} | Realized PnL {:+.2} | Available {:.2}\n\
-             P_int {:.3} vs P_mkt {:.3} | {}\n\
-             Queue {} | Last signal {}",
+             {}\n\
+             {} | Queue {} | Last signal {}",
             market.budget_mana,
             market.invested_mana,
             market.realized_pnl_mana,
             available_budget(market),
-            p_internal,
-            market.p_market_last,
+            probability_line,
             market.status,
             queue_depth,
             last_signal,
@@ -551,6 +571,20 @@ fn status_for_market(state: &DiscordState, query: &str) -> AppResult<CreateEmbed
 
     embed = with_sieve_source(embed, &market.sieve_source);
 
+    if market.is_multiple_choice() {
+        let answers = state.db.list_answers(&market.id).unwrap_or_default();
+        let value = if answers.is_empty() {
+            "no tracked answers".to_owned()
+        } else {
+            let mut lines = answer_lines(&answers, now, state.config.belief_halflife_hours);
+            if answers.len() > MAX_ANSWER_LINES {
+                lines.push(format!("({} answers total)", answers.len()));
+            }
+            lines.join("\n")
+        };
+        embed = embed.field("Answers", truncate_chars(&value, MAX_FIELD_CHARS), false);
+    }
+
     let signals = state.db.recent_signals(&market.id, MAX_SIGNAL_LINES)?;
     if signals.is_empty() {
         embed = embed.field("Recent signals", "none", false);
@@ -579,6 +613,54 @@ fn internal_probability(state: &DiscordState, market: &TrackedMarket, now: i64) 
         now,
         state.config.belief_halflife_hours,
     )
+}
+
+/// Renders the answers that matter most for a multiple-choice market.
+///
+/// Open positions come first, then the largest gap between internal and market
+/// probability. The line is compact because Discord caps one field at 1024
+/// characters and a MEGA market has more than fifty answers.
+fn answer_lines(answers: &[TrackedAnswer], now: i64, halflife_hours: f64) -> Vec<String> {
+    let mut scored: Vec<(bool, f64, f64, &TrackedAnswer)> = answers
+        .iter()
+        .map(|answer| {
+            let p_internal = belief::current_p_internal(
+                answer.p_internal_log_odds,
+                answer.belief_updated_at,
+                answer.p_market_last,
+                now,
+                halflife_hours,
+            );
+            let held = answer.yes_shares > 0.0 || answer.no_shares > 0.0;
+            let edge = p_internal - answer.p_market_last;
+            (held, edge.abs(), p_internal, answer)
+        })
+        .collect();
+
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.total_cmp(&left.1))
+            .then_with(|| left.3.text.cmp(&right.3.text))
+    });
+
+    scored
+        .into_iter()
+        .take(MAX_ANSWER_LINES)
+        .map(|(held, _, p_internal, answer)| {
+            format!(
+                "{} {} | Y {:.2} N {:.2} | {:.3} vs {:.3} ({:+.3})",
+                if held { "+" } else { " " },
+                truncate_chars(&answer.text, 64),
+                answer.yes_shares,
+                answer.no_shares,
+                p_internal,
+                answer.p_market_last,
+                p_internal - answer.p_market_last,
+            )
+        })
+        .collect()
 }
 
 /// Resolves an operator-provided market reference.
@@ -2892,5 +2974,48 @@ mod tests {
         assert_eq!(parse_button_custom_id("no-separator"), None);
         assert_eq!(parse_button_custom_id(":Market"), None);
         assert_eq!(parse_button_custom_id("pause:"), None);
+    }
+
+    // -- Multiple-choice answers -------------------------------------------
+
+    fn tracked_answer(id: &str, text: &str, p_internal: f64, price: f64, yes: f64) -> TrackedAnswer {
+        TrackedAnswer {
+            id: id.to_owned(),
+            market_id: "M1".to_owned(),
+            text: text.to_owned(),
+            p_internal_log_odds: belief::logit(p_internal),
+            p_market_last: price,
+            belief_updated_at: 0,
+            yes_shares: yes,
+            no_shares: 0.0,
+            created_at: 0,
+            invested_mana: 0.0,
+        }
+    }
+
+    #[test]
+    fn answer_lines_put_open_positions_first_and_cap_the_list() {
+        let mut answers: Vec<TrackedAnswer> = (0..8)
+            .map(|index| {
+                tracked_answer(
+                    &format!("a{index}"),
+                    &format!("Answer {index}"),
+                    0.5,
+                    0.5,
+                    0.0,
+                )
+            })
+            .collect();
+        // A small edge but an open position must outrank a larger bare edge.
+        answers[5].yes_shares = 10.0;
+        answers[5].p_internal_log_odds = belief::logit(0.52);
+        answers[2].p_internal_log_odds = belief::logit(0.9);
+
+        let lines = answer_lines(&answers, 0, 4.0);
+
+        assert_eq!(lines.len(), MAX_ANSWER_LINES);
+        assert!(lines[0].starts_with('+'), "line: {}", lines[0]);
+        assert!(lines[0].contains("Answer 5"), "line: {}", lines[0]);
+        assert!(lines[1].contains("Answer 2"), "line: {}", lines[1]);
     }
 }
