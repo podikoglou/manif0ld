@@ -425,6 +425,11 @@ impl OnboardingService {
         updates: &mpsc::Sender<OnboardUpdate>,
     ) -> AppResult<String> {
         let model = self.ai.completion_model(&self.model)?;
+        tracing::info!(
+            market = %market.id,
+            model = %self.model,
+            "synthesizing a Sieve rule"
+        );
         onboarding_agent::synthesize(model, Arc::clone(&self.firecrawl), market, updates)
             .await
             .with_context(|| format!("synthesizing a Sieve rule with model {}", self.model))
