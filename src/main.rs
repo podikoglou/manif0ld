@@ -28,6 +28,7 @@ mod rate;
 mod sieve;
 mod snipe;
 mod trade;
+mod traders;
 mod triage;
 mod types;
 

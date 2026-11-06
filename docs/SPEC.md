@@ -126,6 +126,13 @@ SNIPE_KELLY_FRACTION=0.25
 SNIPE_TTL_SECS=3600        # eligibility window from contract creation
 SNIPE_DECISION_TIMEOUT_SECS=2
 
+# S3 smart-money leaderboard (read-only; copy execution has its own flag)
+TRADERS_ENABLED=true
+TRADER_WATCH_SIZE=200      # [10, 1000]
+TRADER_MIN_BETS=25         # activity gate
+TRADER_REFRESH_MIN=60      # [5, 1440]
+TRADER_REQUEST_BUDGET=120  # hard cap per refresh; 3 + 2 per enriched trader
+
 # Storage
 DB_PATH=./data/manif0ld.db
 ```
@@ -227,6 +234,35 @@ CREATE TABLE kv (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );  -- 'global_kill_switch'
+
+CREATE TABLE trader_scores (               -- migration 008, S3a watch list
+  user_id          TEXT PRIMARY KEY,       -- Manifold user ID
+  username         TEXT,                   -- NULL when the bulk lookup missed it
+  profit_all_time  REAL,                   -- deposit-adjusted, mana
+  profit_weekly    REAL,                   -- trailing seven days, mana
+  bet_count        INTEGER,                -- sampled bets, capped at TRADER_MIN_BETS
+  score            REAL,                   -- §6.10 formula
+  updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE copy_ledger (                 -- migration 008, S3b (next task)
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  trader_id        TEXT NOT NULL,
+  contract_id      TEXT NOT NULL,
+  question         TEXT NOT NULL,
+  bet_id           TEXT,                   -- the copied bet
+  bet_amount       REAL,                   -- size of the copied bet
+  p_before         REAL,
+  p_after          REAL,
+  p_informed       REAL,                   -- decision-model gate output
+  fair_prob        REAL,
+  gap              REAL,
+  action           TEXT NOT NULL,          -- 'COPY' | 'SKIP'
+  reason           TEXT,
+  mana_amount      REAL NOT NULL DEFAULT 0,
+  manifold_bet_id  TEXT,
+  created_at       INTEGER NOT NULL
+);
 ```
 
 ### 5.1 Market lifecycle and soft deletion
@@ -1011,6 +1047,100 @@ shows `p_model` against the creation price for a fresh entry.
 autocomplete) and from the Sieve registry, but the executor (`active()`) and
 the reconcile pass treat them like every other active row: prices mirror, makes
 fills apply, exits fire, and `/panic` sweeps them.
+
+### 6.10 Trader Leaderboard (`traders.rs`, S3a)
+
+**Scope.** This milestone builds and persists the smart-money watch list only.
+Copy execution — the `global/new-bet` trigger, the `is_informed_bet` gate, the
+follow ladder, and `copy_ledger` writes — is the next task; the ledger table
+exists already so the copy strategy needs no schema change.
+
+**Endpoints (verified live, 2026-11-06).** All are public; the bot key is sent
+but not required.
+
+| Request | Cost | Observed shape |
+|---|---|---|
+| `GET /v0/leaderboard?kind=profit&limit=100` | 1 | `[{userId, score}]`, all-time profit, highest first |
+| `GET /v0/leaderboard?kind=creator&limit=100` | 1 | same shape, ranked by creator earnings |
+| `GET /v0/users/by-id?ids=…` | 1 per 100 ids | `[{id, name, username, isBot, avatarUrl}]`; unknown ids absent |
+| `GET /v0/get-user-portfolio-history?userId=…&period=weekly` | 1 | ~585 hourly points, ~168 h, `{timestamp, profit, balance, …}` |
+| `GET /v0/bets?userId=…&limit=N` | 1 | bare array of the newest N bet rows |
+
+Wire facts that shaped the implementation:
+
+- `leaderboard` caps `limit` at 100 and rejects `offset`; it has no time-window
+  parameter. `kind=volume` answers an empty body (the request hangs), so the
+  two usable ranked lists are `profit` and `creator`.
+- The last point's cumulative `profit` in a `period=weekly` history equals the
+  leaderboard's all-time `score` for the same account (checked exactly on the
+  first-place trader). One history call therefore yields **both** profit
+  windows: `profit_all_time = last.profit` and
+  `profit_weekly = last.profit − first.profit`. The series is already
+  deposit-adjusted, and a brand-new account's single point has no `profit`.
+- Per-contract metrics (`get-user-contract-metrics-with-contracts`, also
+  verified) expose `profit` and `from.week.profit`, but paginate at 1000 rows
+  (5.6 MB for a whale) and the weekly sum is biased when truncated: the top
+  account's weekly sum moved 35 000 mana between `limit=200` and `limit=1000`,
+  against the exact −23 752 from history. Metrics are therefore not a scoring
+  source.
+- `get-user-portfolio` exposes `dailyProfit`, not a weekly figure, and
+  `/v0/leagues?season=N` returns ~6 000 unsorted rows whose `manaEarned` is
+  still zero early in the current season. Neither is used.
+- `GET /v0/user/{id}` takes a *username*; `users/by-id` is the only batch
+  identity lookup. Bet rows on the broadcast websocket carry no username.
+
+**Candidate universe.** Two ranked pages: `kind=profit` (the skill core) and
+`kind=creator` (active high-volume accounts as fresh blood). Deduplicated in
+order and truncated to `TRADER_WATCH_SIZE`. Names are resolved in bulk, 100 IDs
+per request; a name-lookup failure is cosmetic and never blocks scoring.
+
+**Scoring.** One pure function of the persisted columns:
+
+```
+compress(x) = sign(x) · ln(1 + |x| / 1 000)
+score       = 0.7 · compress(profit_weekly) + 0.3 · compress(profit_all_time)
+score       = −∞   when bet_count < TRADER_MIN_BETS
+```
+
+Recent form carries 70 % because a trader who is good *now* is the better
+person to copy, while all-time profit over-rewards early adopters who have
+since stopped. The logarithm replaces rank percentiles on purpose: Manifold
+profit is heavy-tailed (top ≈ 5.8 M, healthy ≈ 1 k), so `ln(1 + x/1 000)`
+compresses the tail deterministically, keeps losers negative, and makes a
+trader's score independent of who else is in the list — the same rows always
+produce the same score. The bet count gates instead of blending because the
+activity probe is capped at `TRADER_MIN_BETS` to stay cheap, so every passing
+trader reports the same full sample; one lucky bet never buys a slot.
+
+**Refresh cost and cadence.** One pass costs three universe requests (two
+leaderboard pages plus one bulk name lookup per 100 candidates) and **two per
+enriched trader** (history for the profit windows, a bounded bets call for the
+gate). `TRADER_REQUEST_BUDGET` (default 120) is a hard cap, so a default pass
+fully enriches 58 traders. Candidates are visited stalest-first (never-seen
+first, then oldest `updated_at`), so the whole list rotates across passes and
+everyone keeps their last score meanwhile; raise the budget to
+`3 + 2 × TRADER_WATCH_SIZE` (403 at the defaults) to refresh the full list in
+one pass. Every request spends a `Priority::Discovery` token from the shared
+500/min bucket; a refusal ends the pass early instead of erroring. A full
+200-trader pass is 403 requests and ~30 MB of history payload (~175 KB per
+trader), still inside one minute of the bucket; at the default budget it is
+~120 requests. `TRADER_REFRESH_MIN` (default 60) sets the cadence and the first
+pass runs immediately at startup.
+
+**Persistence and sharing.** `trader_scores` is rewritten by one replace-all
+transaction per pass and is the row truth. `TraderBoard` is the read cache in
+front of it, built at startup by `TraderBoard::load` before anything trades.
+`App` owns one `Arc<TraderBoard>` and hands the same handle to the executor,
+which exposes `TradeExecutor::trader_board()`; the copy strategy reads it on
+every `global/new-bet` with `lookup(user_id)` (no I/O, one short read lock).
+`TRADERS_ENABLED` (default true) gates only the refresh task — the board is
+read-only, so it needs no canary phase; copy execution keeps its own flag.
+
+**Gating and failure.** A refreshed trader below `TRADER_MIN_BETS` loses the
+slot instead of keeping a stale score. A per-trader fetch failure keeps the
+previous score; a failed pass logs and waits for the next tick, leaving the
+persisted board usable. The board is trimmed to `TRADER_WATCH_SIZE` by score,
+so unrefreshed members survive until displaced.
 
 ## 7. Sieve DSL Reference (for onboarding LLM)
 

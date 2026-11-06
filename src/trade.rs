@@ -148,6 +148,7 @@ use crate::market_store::MarketStore;
 use crate::pipeline::PipelineEvent;
 use crate::rate::{Priority, RateLimiter, SystemClock, WRITE_COST_TOKENS};
 use crate::snipe::SnipeStrategy;
+use crate::traders::TraderBoard;
 use crate::types::{
     MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision, TradeRecord,
     available_budget,
@@ -196,6 +197,10 @@ const FALLBACK_LIMIT_EXPIRY_SECS: i64 = 60;
 /// Markets per `GET /v0/market-probs` call. Manifold documents a maximum of
 /// 100 IDs per request.
 const PROB_CHUNK_SIZE: usize = 100;
+
+/// Largest `limit` the public leaderboard route accepts (verified live
+/// 2026-11-06: 101 is rejected, 100 is served).
+pub(crate) const LEADERBOARD_MAX_LIMIT: usize = 100;
 
 /// Contracts per page of `GET /v0/get-user-contract-metrics-with-contracts`.
 /// The portfolio of a bot is small; one page is the steady state, more pages
@@ -258,6 +263,43 @@ impl fmt::Debug for ManifoldClient {
 #[derive(Debug, Deserialize)]
 struct MeResponse {
     id: String,
+}
+
+/// One row of `GET /v0/leaderboard`.
+///
+/// Verified live 2026-11-06: `kind=profit` returns this shape ranked by
+/// all-time profit and `kind=creator` ranked by creator earnings, in both
+/// cases highest first. The server caps `limit` at
+/// [`LEADERBOARD_MAX_LIMIT`] and rejects any `offset`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LeaderboardEntry {
+    #[serde(rename = "userId")]
+    pub user_id: String,
+    /// All-time profit in mana for `kind=profit`; creator earnings otherwise.
+    pub score: f64,
+}
+
+/// One row of `GET /v0/users/by-id` (a Manifold LiteUser).
+///
+/// The bulk lookup is the only cheap way to turn leaderboard IDs into names:
+/// `GET /v0/user/{id}` accepts a *username*, not an ID. Verified live
+/// 2026-11-06 with 200 IDs in one request (~6.6 KB URL).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LiteUserRow {
+    pub id: String,
+    pub username: Option<String>,
+}
+
+/// One point of `GET /v0/get-user-portfolio-history`.
+///
+/// Only the two fields the leaderboard scores are read. The series is hourly
+/// and `period=weekly` spans about seven days (585 points, ~175 KB per user).
+/// `profit` is deposit-adjusted and cumulative; it is absent on the single
+/// point of a brand-new account (verified live 2026-11-06).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PortfolioHistoryPoint {
+    pub timestamp: i64,
+    pub profit: Option<f64>,
 }
 
 impl ManifoldClient {
@@ -379,6 +421,80 @@ impl ManifoldClient {
         // every list entry, including the empty lists the parser drops.
         let raw_entries = raw_metrics_entry_count(&value);
         Ok((by_contract, raw_entries, raw_entries < PORTFOLIO_PAGE_SIZE))
+    }
+
+    /// Fetches one page of the public leaderboard (`GET /v0/leaderboard`).
+    ///
+    /// The S3 trader discovery (`crate::traders`) asks for `kind=profit` (the
+    /// all-time profit ranking, which also hands over a candidate's all-time
+    /// profit for free) and `kind=creator` (active high-volume accounts as
+    /// fresh blood). Verified live 2026-11-06: the server caps `limit` at
+    /// [`LEADERBOARD_MAX_LIMIT`], rejects `offset`, and `kind=volume` answers
+    /// an empty body instead of a ranking, so it must not be used.
+    pub async fn leaderboard(&self, kind: &str, limit: usize) -> AppResult<Vec<LeaderboardEntry>> {
+        if limit == 0 || limit > LEADERBOARD_MAX_LIMIT {
+            bail!(
+                "leaderboard limit must be within [1, {LEADERBOARD_MAX_LIMIT}], got {limit}"
+            );
+        }
+        let path = format!("/v0/leaderboard?kind={kind}&limit={limit}");
+        let request = self.http.get(self.url(&path));
+        self.send(request, "GET /v0/leaderboard").await
+    }
+
+    /// Resolves many user IDs to LiteUsers in one request
+    /// (`GET /v0/users/by-id?ids=a&ids=b…`).
+    ///
+    /// This is the only batch identity lookup the public API offers; the
+    /// single-user route takes a *username*, not an ID. Verified live
+    /// 2026-11-06 with 200 IDs (~6.6 KB of query string). IDs the server does
+    /// not know (deleted or banned accounts) are simply absent from the reply,
+    /// so callers must tolerate a short list.
+    pub async fn users_by_id(&self, ids: &[String]) -> AppResult<Vec<LiteUserRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query: Vec<(&str, &str)> = ids.iter().map(|id| ("ids", id.as_str())).collect();
+        let request = self.http.get(self.url("/v0/users/by-id")).query(&query);
+        self.send(request, "GET /v0/users/by-id").await
+    }
+
+    /// Fetches one user's portfolio history for a period
+    /// (`GET /v0/get-user-portfolio-history`).
+    ///
+    /// Accepted periods are `1hour`, `6hour`, `daily`, `weekly`, `monthly`,
+    /// and `allTime` (verified live 2026-11-06). The S3 leaderboard uses
+    /// `weekly`: its first point sits about seven days back, so the difference
+    /// between the last and first points' cumulative `profit` is the weekly
+    /// profit, deposit-adjusted by the server. The last point's `profit` was
+    /// verified equal to the leaderboard's all-time `score` for the same user.
+    pub async fn portfolio_history(
+        &self,
+        user_id: &str,
+        period: &str,
+    ) -> AppResult<Vec<PortfolioHistoryPoint>> {
+        let path = format!("/v0/get-user-portfolio-history?userId={user_id}&period={period}");
+        let request = self.http.get(self.url(&path));
+        self.send(request, "GET /v0/get-user-portfolio-history")
+            .await
+    }
+
+    /// Counts a user's most recent bets, capped at `limit`
+    /// (`GET /v0/bets?userId={id}&limit={n}`).
+    ///
+    /// The S3 leaderboard samples `TRADER_MIN_BETS` rows to answer one
+    /// question: has this account traded at least that many times? The reply is
+    /// the newest bets first, so a full `limit` means "at least this many".
+    /// Counting rows instead of reading them keeps the payload small (~40 KB
+    /// for 25 bets, dominated by `fills`) and needs no bet parser.
+    pub async fn user_bet_count(&self, user_id: &str, limit: usize) -> AppResult<usize> {
+        if limit == 0 {
+            bail!("bet-count probe limit must be at least 1");
+        }
+        let path = format!("/v0/bets?userId={user_id}&limit={limit}");
+        let request = self.http.get(self.url(&path));
+        let value: Value = self.send(request, "GET /v0/bets?userId&limit").await?;
+        bet_count_from_value(value)
     }
 
     /// Buys `amount` mana of `outcome` shares at up to `limit_prob`, with any
@@ -600,6 +716,14 @@ fn parse_bets_envelope(value: Value) -> AppResult<Vec<Value>> {
         },
         _ => bail!("Manifold GET /v0/bets response was not an array"),
     }
+}
+
+/// Counts the bet rows of a `GET /v0/bets` response.
+///
+/// The caller asks for a bounded `limit`, so the count is the traffic-light
+/// answer the S3 activity gate needs (`count == limit` means "at least").
+fn bet_count_from_value(value: Value) -> AppResult<usize> {
+    Ok(parse_bets_envelope(value)?.len())
 }
 
 /// Builds the `POST /v0/bet` request body for one buy.
@@ -1449,8 +1573,9 @@ pub struct TradeExecutor {
     /// Reverse-drift cancel slack; see [`should_cancel_for_drift`].
     limit_drift_cancel: f64,
     /// Global Manifold token bucket; writes spend Trade-class tokens, the
-    /// reconcile backstop spends Reconcile-class tokens.
-    rate: RateLimiter,
+    /// reconcile backstop spends Reconcile-class tokens, and the S3 trader
+    /// refresh spends Discovery-class tokens.
+    rate: Arc<RateLimiter>,
     execution_lock: Mutex<()>,
     /// Markets whose latest mirrored price was a terminal patch; see
     /// [`TerminalMirrors`]. Guarded by [`SyncMutex`], released before
@@ -1461,6 +1586,11 @@ pub struct TradeExecutor {
     own_orders: SyncMutex<OwnRestingOrders>,
     /// S2 new-market sniper; `None` when `SNIPE_ENABLED=false`.
     snipe: Option<SnipeStrategy>,
+    /// The S3 smart-money watch list. Read-mostly shared state: the hourly
+    /// `crate::traders::run` task owns writes, and the copy strategy (next
+    /// task) reads it through [`TradeExecutor::trader_board`] on every
+    /// `global/new-bet` event.
+    trader_board: Arc<TraderBoard>,
     events: broadcast::Sender<TradeEvent>,
 }
 
@@ -1469,7 +1599,12 @@ impl TradeExecutor {
     ///
     /// This performs one authenticated `GET /v0/me`. A failure is fatal at
     /// startup: silently disabling trading would hide a broken API key.
-    pub async fn new(config: &Config, db: Db, store: Arc<MarketStore>) -> AppResult<Self> {
+    pub async fn new(
+        config: &Config,
+        db: Db,
+        store: Arc<MarketStore>,
+        trader_board: Arc<TraderBoard>,
+    ) -> AppResult<Self> {
         let client = ManifoldClient::new(config)
             .await
             .context("initializing the Manifold client")?;
@@ -1496,11 +1631,15 @@ impl TradeExecutor {
             limit_epsilon: config.limit_epsilon,
             limit_expiry_secs: config.limit_expiry_secs as u64,
             limit_drift_cancel: config.limit_drift_cancel,
-            rate: RateLimiter::per_minute(config.rate_limit_per_min, Box::new(SystemClock)),
+            rate: Arc::new(RateLimiter::per_minute(
+                config.rate_limit_per_min,
+                Box::new(SystemClock),
+            )),
             execution_lock: Mutex::new(()),
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             own_orders: SyncMutex::new(OwnRestingOrders::default()),
             snipe,
+            trader_board,
             events,
         };
 
@@ -1592,6 +1731,18 @@ impl TradeExecutor {
     /// as onboarding and the Discord status command.
     pub fn client(&self) -> &ManifoldClient {
         &self.client
+    }
+
+    /// The shared Manifold rate bucket, so long-running housekeeping tasks
+    /// (the S3 trader refresh) spend the same 500/min budget as trades.
+    pub fn rate(&self) -> Arc<RateLimiter> {
+        Arc::clone(&self.rate)
+    }
+
+    /// The scored S3 watch list. The copy strategy (next task) reads it on
+    /// every `global/new-bet` event; the hourly refresh task writes it.
+    pub fn trader_board(&self) -> Arc<TraderBoard> {
+        Arc::clone(&self.trader_board)
     }
 
     /// Runs one trade check for a market, with a fresh REST snapshot first.
@@ -3561,6 +3712,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bet_count_probe_counts_both_bets_envelopes() {
+        // Trimmed from a live `GET /v0/bets?userId=…&limit=2` reply
+        // (2026-11-06): a bare array of bet rows.
+        let bare = json!([
+            {
+                "id": "9g9uUIpsOPzu",
+                "userId": "TlrmhHvAIAYOXPmaRJgYE8sKuRg1",
+                "contractId": "58CPEdOcuq",
+                "amount": 0,
+                "outcome": "YES",
+                "limitProb": 0.19,
+                "createdTime": 1796598353953_i64
+            },
+            {
+                "id": "AN9IlNnQ6y5E",
+                "userId": "NMyTWRxNlyU3FXC36RNiVXN1w3R2",
+                "contractId": "58CPEdOcuq",
+                "amount": 22,
+                "outcome": "NO",
+                "createdTime": 1794006361771_i64
+            }
+        ]);
+        assert_eq!(bet_count_from_value(bare).expect("bare array"), 2);
+
+        // The object envelope is the other shape the endpoint has produced.
+        let wrapped = json!({ "bets": [{ "id": "b1" }, { "id": "b2" }, { "id": "b3" }] });
+        assert_eq!(bet_count_from_value(wrapped).expect("object envelope"), 3);
+
+        assert!(bet_count_from_value(json!({ "message": "nope" })).is_err());
+    }
+
     fn market_with(budget: f64, invested: f64, pnl: f64, yes: f64, no: f64) -> TrackedMarket {
         TrackedMarket {
             id: "Market_test".to_owned(),
@@ -4765,11 +4948,12 @@ mod tests {
             limit_epsilon: 0.01,
             limit_expiry_secs: 60,
             limit_drift_cancel: 0.05,
-            rate: RateLimiter::per_minute(500, Box::new(SystemClock)),
+            rate: Arc::new(RateLimiter::per_minute(500, Box::new(SystemClock))),
             execution_lock: Mutex::new(()),
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             own_orders: SyncMutex::new(OwnRestingOrders::default()),
             snipe,
+            trader_board: Arc::new(TraderBoard::empty()),
             events: broadcast::channel(EVENT_CAPACITY).0,
         }
     }
@@ -5200,6 +5384,11 @@ mod tests {
             snipe_kelly_fraction: 0.25,
             snipe_ttl_secs: 3600,
             snipe_decision_timeout_secs: 2,
+        traders_enabled: true,
+        trader_watch_size: 200,
+        trader_min_bets: 25,
+        trader_refresh_min: 60,
+        trader_request_budget: 120,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-mcq-live.db"),
         }
     }
@@ -5246,7 +5435,12 @@ mod tests {
             .expect("insert market");
         let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
         let executor = runtime
-            .block_on(TradeExecutor::new(&config, db.clone(), Arc::clone(&store)))
+            .block_on(TradeExecutor::new(
+                &config,
+                db.clone(),
+                Arc::clone(&store),
+                Arc::new(TraderBoard::empty()),
+            ))
             .expect("executor builds");
 
         runtime
@@ -5307,7 +5501,12 @@ mod tests {
             .expect("insert independent market");
         let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
         let executor = runtime
-            .block_on(TradeExecutor::new(&config, db.clone(), Arc::clone(&store)))
+            .block_on(TradeExecutor::new(
+                &config,
+                db.clone(),
+                Arc::clone(&store),
+                Arc::new(TraderBoard::empty()),
+            ))
             .expect("executor builds");
 
         let sum_to_one = runtime

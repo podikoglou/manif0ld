@@ -837,6 +837,11 @@ pub(crate) fn test_config() -> Config {
         snipe_kelly_fraction: 0.25,
         snipe_ttl_secs: 3600,
         snipe_decision_timeout_secs: 2,
+        traders_enabled: true,
+        trader_watch_size: 200,
+        trader_min_bets: 25,
+        trader_refresh_min: 60,
+        trader_request_budget: 120,
         db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-snipe-test.db"),
     }
 }

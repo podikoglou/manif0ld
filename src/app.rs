@@ -30,6 +30,7 @@ use crate::onboarding::OnboardingService;
 use crate::pipeline::{Pipeline, PipelineEvent};
 use crate::sieve::{self, EngineRegistry};
 use crate::trade::TradeExecutor;
+use crate::traders::{self, TraderBoard};
 use crate::types::MarketStatus;
 
 /// How often the INFO heartbeat reports throughput and active markets.
@@ -45,6 +46,10 @@ pub struct App {
     pipeline: Arc<Pipeline>,
     executor: Arc<TradeExecutor>,
     control: Arc<ControlPlane>,
+    /// The S3 smart-money watch list. Shared with the executor, whose copy
+    /// strategy (next task) reads it on every `global/new-bet` event, and with
+    /// the hourly refresh task, which is the only writer.
+    trader_board: Arc<TraderBoard>,
 }
 
 impl App {
@@ -56,6 +61,10 @@ impl App {
         let config = Arc::new(config);
         let db = Db::open(&config.db_path)?;
         let store = Arc::new(MarketStore::new(&db)?);
+        // The persisted leaderboard is read here, before anything can trade, so
+        // the copy strategy has watch-list state from the first second after a
+        // restart instead of waiting for the next hourly refresh.
+        let trader_board = Arc::new(TraderBoard::load(&db)?);
 
         let registry = Arc::new(EngineRegistry::new());
         for market in store.list()? {
@@ -99,9 +108,14 @@ impl App {
         // Resolving the bot identity here makes a bad API key a startup failure
         // instead of silently disabling trading.
         let executor = Arc::new(
-            TradeExecutor::new(&config, db.clone(), Arc::clone(&store))
-                .await
-                .context("initializing the trade executor")?,
+            TradeExecutor::new(
+                &config,
+                db.clone(),
+                Arc::clone(&store),
+                Arc::clone(&trader_board),
+            )
+            .await
+            .context("initializing the trade executor")?,
         );
         tracing::info!(
             bot_user_id = executor.client().bot_user_id(),
@@ -128,6 +142,7 @@ impl App {
             pipeline,
             executor,
             control,
+            trader_board,
         })
     }
 
@@ -147,6 +162,7 @@ impl App {
             pipeline,
             executor,
             control,
+            trader_board,
             ..
         } = self;
 
@@ -234,9 +250,12 @@ impl App {
             }
         });
 
-        let ingest_task = tokio::spawn(async move {
-            if let Err(error) = ingest::run((*config).clone(), post_tx).await {
-                tracing::error!(error = %error, "ingest stopped");
+        let ingest_task = tokio::spawn({
+            let config = (*config).clone();
+            async move {
+                if let Err(error) = ingest::run(config, post_tx).await {
+                    tracing::error!(error = %error, "ingest stopped");
+                }
             }
         });
 
@@ -260,6 +279,27 @@ impl App {
             }
         });
 
+        // S3a: the leaderboard is read-only, so it needs no canary gate of its
+        // own; it shares the executor's Manifold client and rate bucket. Copy
+        // execution (the consumer of this board) keeps its own flag.
+        let traders_task = if config.traders_enabled {
+            let client = executor.client().clone();
+            let rate = executor.rate();
+            Some(tokio::spawn({
+                let config = Arc::clone(&config);
+                let db = db.clone();
+                let board = Arc::clone(&trader_board);
+                async move {
+                    if let Err(error) = traders::run(client, db, config, board, rate).await {
+                        tracing::error!(error = %error, "trader leaderboard stopped");
+                    }
+                }
+            }))
+        } else {
+            tracing::info!("TRADERS_ENABLED=false; the leaderboard refresh task is not started");
+            None
+        };
+
         Tasks {
             pipeline: pipeline_task,
             heartbeat: heartbeat_task,
@@ -268,6 +308,7 @@ impl App {
             discord: discord_task,
             event: event_task,
             manifold_ws: manifold_ws_task,
+            traders: traders_task,
         }
     }
 }
@@ -282,6 +323,8 @@ pub struct Tasks {
     event: JoinHandle<()>,
     /// The Manifold websocket client feeding the executor's price mirror.
     manifold_ws: JoinHandle<()>,
+    /// The S3 leaderboard refresh, absent when `TRADERS_ENABLED=false`.
+    traders: Option<JoinHandle<()>>,
 }
 
 impl Tasks {
@@ -302,6 +345,9 @@ impl Tasks {
         self.event.abort();
         self.discord.abort();
         self.manifold_ws.abort();
+        if let Some(traders) = &self.traders {
+            traders.abort();
+        }
 
         Ok(())
     }

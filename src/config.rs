@@ -57,6 +57,21 @@ const DEFAULT_SNIPE_KELLY_FRACTION: f64 = 0.25;
 const DEFAULT_SNIPE_TTL_SECS: usize = 3600;
 /// Deadline for one fair-probability decision call; snipe speed is the edge.
 const DEFAULT_SNIPE_DECISION_TIMEOUT_SECS: usize = 2;
+/// The S3 leaderboard is read-only, so it can run without a canary phase;
+/// copy execution has its own flag in the next task.
+const DEFAULT_TRADERS_ENABLED: bool = true;
+/// Target size of the scored watch list (`docs/ALGO.md` §3/S3 step 1).
+const DEFAULT_TRADER_WATCH_SIZE: usize = 200;
+/// Bets sampled per trader before the activity gate can pass; one lucky bet
+/// must not buy a watch-list slot.
+const DEFAULT_TRADER_MIN_BETS: usize = 25;
+/// One refresh per hour: trader skill is a slow signal and each refresh spends
+/// REST budget that trades may need.
+const DEFAULT_TRADER_REFRESH_MIN: usize = 60;
+/// Hard cap on Manifold requests one refresh may spend. Two per enriched
+/// trader plus three for the candidate universe, so the default covers ~58
+/// traders per pass; the remainder of the watch list keeps its last score.
+const DEFAULT_TRADER_REQUEST_BUDGET: usize = 120;
 
 /// Runtime configuration for the bot.
 ///
@@ -139,6 +154,19 @@ pub struct Config {
     pub snipe_ttl_secs: usize,
     /// Deadline for one snipe decision call, in `[1, 30]` seconds.
     pub snipe_decision_timeout_secs: usize,
+    /// Enables the S3 smart-money leaderboard (`docs/ALGO.md` §3/S3). The
+    /// leaderboard is read-only, so this only gates the hourly refresh task;
+    /// copy execution has its own flag in the next task.
+    pub traders_enabled: bool,
+    /// Target number of scored traders kept in `trader_scores`, in
+    /// `[10, 1000]`.
+    pub trader_watch_size: usize,
+    /// Minimum sampled bet count before a trader may hold a watch-list slot.
+    pub trader_min_bets: usize,
+    /// Minutes between leaderboard refreshes, in `[5, 1440]`.
+    pub trader_refresh_min: usize,
+    /// Hard cap on Manifold requests one refresh may spend, at least 20.
+    pub trader_request_budget: usize,
     pub db_path: PathBuf,
 }
 
@@ -303,6 +331,34 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
 
+        let traders_enabled = bool_or(&get, "TRADERS_ENABLED", DEFAULT_TRADERS_ENABLED)?;
+        let trader_watch_size =
+            usize_or(&get, "TRADER_WATCH_SIZE", DEFAULT_TRADER_WATCH_SIZE)?;
+        if !(10..=1000).contains(&trader_watch_size) {
+            bail!(
+                "TRADER_WATCH_SIZE must be within [10, 1000] traders, got {trader_watch_size}"
+            );
+        }
+        let trader_min_bets = usize_or(&get, "TRADER_MIN_BETS", DEFAULT_TRADER_MIN_BETS)?;
+        if trader_min_bets == 0 {
+            bail!("TRADER_MIN_BETS must be at least 1");
+        }
+        let trader_refresh_min =
+            usize_or(&get, "TRADER_REFRESH_MIN", DEFAULT_TRADER_REFRESH_MIN)?;
+        if !(5..=1440).contains(&trader_refresh_min) {
+            bail!(
+                "TRADER_REFRESH_MIN must be within [5, 1440] minutes, got {trader_refresh_min}"
+            );
+        }
+        let trader_request_budget =
+            usize_or(&get, "TRADER_REQUEST_BUDGET", DEFAULT_TRADER_REQUEST_BUDGET)?;
+        if trader_request_budget < 20 {
+            bail!(
+                "TRADER_REQUEST_BUDGET must be at least 20 requests per refresh, got \
+                 {trader_request_budget}"
+            );
+        }
+
         let config = Self {
             jetstream_url,
             cloudflare_account_id,
@@ -338,6 +394,11 @@ impl Config {
             snipe_kelly_fraction,
             snipe_ttl_secs,
             snipe_decision_timeout_secs,
+            traders_enabled,
+            trader_watch_size,
+            trader_min_bets,
+            trader_refresh_min,
+            trader_request_budget,
             db_path,
         };
 
@@ -542,6 +603,11 @@ mod tests {
         assert_eq!(config.snipe_kelly_fraction, 0.25);
         assert_eq!(config.snipe_ttl_secs, 3600);
         assert_eq!(config.snipe_decision_timeout_secs, 2);
+        assert!(config.traders_enabled, "the read-only leaderboard defaults on");
+        assert_eq!(config.trader_watch_size, 200);
+        assert_eq!(config.trader_min_bets, 25);
+        assert_eq!(config.trader_refresh_min, 60);
+        assert_eq!(config.trader_request_budget, 120);
         assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
@@ -573,6 +639,11 @@ mod tests {
             ("SNIPE_KELLY_FRACTION", "0.5"),
             ("SNIPE_TTL_SECS", "120"),
             ("SNIPE_DECISION_TIMEOUT_SECS", "5"),
+            ("TRADERS_ENABLED", "false"),
+            ("TRADER_WATCH_SIZE", "50"),
+            ("TRADER_MIN_BETS", "10"),
+            ("TRADER_REFRESH_MIN", "15"),
+            ("TRADER_REQUEST_BUDGET", "40"),
             ("DB_PATH", "/tmp/test.db"),
         ]);
 
@@ -605,6 +676,11 @@ mod tests {
         assert_eq!(config.snipe_kelly_fraction, 0.5);
         assert_eq!(config.snipe_ttl_secs, 120);
         assert_eq!(config.snipe_decision_timeout_secs, 5);
+        assert!(!config.traders_enabled);
+        assert_eq!(config.trader_watch_size, 50);
+        assert_eq!(config.trader_min_bets, 10);
+        assert_eq!(config.trader_refresh_min, 15);
+        assert_eq!(config.trader_request_budget, 40);
         assert_eq!(config.db_path, PathBuf::from("/tmp/test.db"));
     }
 
@@ -824,6 +900,66 @@ mod tests {
 
         let error = config_from(&vars).expect_err("malformed flag should fail");
         assert!(error.to_string().contains("SNIPE_ENABLED"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_trader_watch_size_outside_the_ten_to_thousand_band() {
+        for value in ["9", "1001"] {
+            let mut vars = required_vars();
+            vars.push(("TRADER_WATCH_SIZE", value));
+
+            let error = config_from(&vars).expect_err("out-of-range watch size should fail");
+            assert!(error.to_string().contains("TRADER_WATCH_SIZE"), "{error}");
+        }
+    }
+
+    #[test]
+    fn accepts_the_trader_watch_size_band_edges() {
+        for value in ["10", "1000"] {
+            let mut vars = required_vars();
+            vars.push(("TRADER_WATCH_SIZE", value));
+
+            let config = config_from(&vars).expect("band edge is valid");
+            assert_eq!(config.trader_watch_size, value.parse::<usize>().unwrap());
+        }
+    }
+
+    #[test]
+    fn rejects_a_zero_trader_min_bets() {
+        let mut vars = required_vars();
+        vars.push(("TRADER_MIN_BETS", "0"));
+
+        let error = config_from(&vars).expect_err("zero bets should fail");
+        assert!(error.to_string().contains("TRADER_MIN_BETS"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_trader_refresh_interval_outside_the_five_minute_to_one_day_band() {
+        for value in ["4", "1441"] {
+            let mut vars = required_vars();
+            vars.push(("TRADER_REFRESH_MIN", value));
+
+            let error = config_from(&vars).expect_err("out-of-range interval should fail");
+            assert!(error.to_string().contains("TRADER_REFRESH_MIN"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_trader_request_budget_below_the_universe_cost() {
+        let mut vars = required_vars();
+        vars.push(("TRADER_REQUEST_BUDGET", "19"));
+
+        let error = config_from(&vars).expect_err("budget below 20 should fail");
+        assert!(error.to_string().contains("TRADER_REQUEST_BUDGET"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_malformed_traders_enabled_flag() {
+        let mut vars = required_vars();
+        vars.push(("TRADERS_ENABLED", "sometimes"));
+
+        let error = config_from(&vars).expect_err("malformed flag should fail");
+        assert!(error.to_string().contains("TRADERS_ENABLED"), "{error}");
     }
 
     #[test]

@@ -126,6 +126,13 @@ impl Db {
             conn.execute_batch(include_str!("../migrations/007_strategy.sql"))
                 .context("applying database migration 007 (strategy and snipe ledger)")?;
         }
+        // 008: the S3 trader leaderboard (`trader_scores`) and the copy-trade
+        // ledger. Every statement is `IF NOT EXISTS`, and the guard keys on a
+        // column of the new table, so the batch runs once per database.
+        if !table_has_column(conn, "trader_scores", "user_id")? {
+            conn.execute_batch(include_str!("../migrations/008_traders.sql"))
+                .context("applying database migration 008 (trader scores and copy ledger)")?;
+        }
         Ok(())
     }
 
@@ -825,6 +832,49 @@ mod tests {
 
         // Applying again is a no-op.
         Db::apply_migrations(&conn).expect("migration 007 is idempotent");
+    }
+
+    #[test]
+    fn trader_migration_creates_both_tables_and_is_idempotent() {
+        // Simulate a database created before migration 008: base schema only,
+        // then the earlier migrations, as `from_connection` would apply them.
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch(include_str!("../migrations/001_init.sql"))
+            .expect("base schema applies");
+        Db::apply_migrations(&conn).expect("migrations apply");
+
+        assert!(table_has_column(&conn, "trader_scores", "user_id").expect("has column"));
+        assert!(table_has_column(&conn, "copy_ledger", "trader_id").expect("has column"));
+
+        conn.execute(
+            "INSERT INTO trader_scores \
+             (user_id, username, profit_all_time, profit_weekly, bet_count, score, updated_at) \
+             VALUES ('u1', 'alice', 1000.0, 250.0, 40, 1.5, 10)",
+            [],
+        )
+        .expect("trader_scores accepts a row");
+        conn.execute(
+            "INSERT INTO copy_ledger \
+             (trader_id, contract_id, question, action, created_at) \
+             VALUES ('u1', 'c1', 'Q?', 'SKIP', 10)",
+            [],
+        )
+        .expect("copy_ledger accepts a row");
+
+        // The `mana_amount` default belongs to the unpriced case.
+        let mana: f64 = conn
+            .query_row("SELECT mana_amount FROM copy_ledger WHERE contract_id = 'c1'", [], |row| {
+                row.get(0)
+            })
+            .expect("copy row reads");
+        assert_eq!(mana, 0.0);
+
+        // Applying again is a no-op: no error and no extra rows.
+        Db::apply_migrations(&conn).expect("migration 008 is idempotent");
+        let scored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trader_scores", [], |row| row.get(0))
+            .expect("trader rows count");
+        assert_eq!(scored, 1);
     }
 
     #[test]
