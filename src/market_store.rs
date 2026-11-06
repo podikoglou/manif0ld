@@ -58,7 +58,8 @@ use crate::types::{MarketId, MarketStatus, TrackedMarket};
 ///
 /// [`market_from_row`] maps by position, so a change here must be mirrored
 /// there.
-const MARKET_COLUMNS: &str = "id, slug, market_url, question, description, resolution_criteria, close_time, \
+const MARKET_COLUMNS: &str =
+    "id, slug, market_url, question, description, resolution_criteria, close_time, \
      status, budget_mana, invested_mana, realized_pnl_mana, yes_shares, no_shares, \
      p_internal_log_odds, p_market_last, belief_updated_at, sieve_source, discord_thread_id, \
      created_at, deleted_at, outcome_type, should_answers_sum_to_one";
@@ -425,14 +426,14 @@ fn snapshot(db: &Db) -> AppResult<HashMap<MarketId, TrackedMarket>> {
 
 /// Reads market rows in creation order, optionally including soft deletes.
 fn rows(db: &Db, include_deleted: bool) -> AppResult<Vec<TrackedMarket>> {
-    let filter = if include_deleted {
-        ""
+    let sql = if include_deleted {
+        format!("SELECT {MARKET_COLUMNS} FROM tracked_markets ORDER BY created_at ASC, id ASC")
     } else {
-        "WHERE deleted_at IS NULL "
+        format!(
+            "SELECT {MARKET_COLUMNS} FROM tracked_markets WHERE deleted_at IS NULL \
+             ORDER BY created_at ASC, id ASC"
+        )
     };
-    let sql = format!(
-        "SELECT {MARKET_COLUMNS} FROM tracked_markets {filter}ORDER BY created_at ASC, id ASC"
-    );
 
     let conn = db.lock()?;
     let mut statement = conn.prepare(&sql).context("preparing market listing")?;
@@ -698,7 +699,10 @@ mod tests {
 
         store.record_budget("m1", 250.0).expect("record budget");
 
-        assert_eq!(store.load("m1").expect("load").expect("row").budget_mana, 250.0);
+        assert_eq!(
+            store.load("m1").expect("load").expect("row").budget_mana,
+            250.0
+        );
         assert_eq!(store.cached("m1").expect("cached").budget_mana, 250.0);
     }
 
@@ -883,7 +887,8 @@ mod tests {
     #[test]
     fn untrack_keeps_answers_and_is_idempotent() {
         let (db, store) = store_with(&[sample_market("m1", 1)]);
-        db.upsert_answer(&sample_answer("m1")).expect("insert answer");
+        db.upsert_answer(&sample_answer("m1"))
+            .expect("insert answer");
 
         store.untrack("m1", 1_700_000_900).expect("first untrack");
         store.untrack("m1", 1_700_001_999).expect("second untrack");
@@ -911,7 +916,9 @@ mod tests {
         assert!(store.record_budget("missing", 10.0).is_err());
         assert!(store.record_belief("missing", 1.0, 1).is_err());
         assert!(store.record_price("missing", 0.6).is_err());
-        assert!(store.record_position("missing", 1.0, 0.0, 1.0, 0.0).is_err());
+        assert!(store
+            .record_position("missing", 1.0, 0.0, 1.0, 0.0)
+            .is_err());
         assert!(store.record_kind("missing", "BINARY", false).is_err());
         assert!(store.close("missing").is_err());
         assert!(store.untrack("missing", 1).is_err());
