@@ -629,6 +629,11 @@ Triggered by `/track url:<url> budget:<mana>`:
 | `/override` | `market`, `probability` (1–99) | Set `p_internal_log_odds`. Trigger trade check. |
 | `/panic` | `liquidate_all` (default false) | Set `global_kill_switch` in `kv`. If `liquidate_all`, sell all positions across markets. |
 
+Every mutating command goes through one control-plane service (`control.rs`), and
+the two teardown end states are explicit: `/untrack` hides the row
+(`CLOSED` + `deleted_at`) while `Liquidate & Close` keeps it visible (`CLOSED`,
+`deleted_at` NULL).
+
 **Threads:** One per tracked market, created under `DISCORD_CONTROL_CHANNEL_ID`, named `📈 [M{budget}] {short_title}`. All subsequent events for that market (signals, trades, errors) post into the thread.
 
 **Embeds emitted into threads:**

@@ -36,6 +36,7 @@ flowchart LR
         PIPE["Pipeline<br/>queues + event sender"]
         EXEC["TradeExecutor<br/>execution_lock + event sender"]
         ONB["OnboardingService"]
+        CONTROL["ControlPlane<br/>operator commands"]
     end
 
     JS -->|"commit/create"| T_ING
@@ -55,11 +56,13 @@ flowchart LR
     EXEC -->|"record_position,<br/>record_price"| STORE
     EXEC -->|"broadcast TradeEvent"| T_DTC
     T_DISC <-->|"slash commands, buttons"| DAPI
-    T_DISC -->|"/track prepare/activate"| ONB
-    T_DISC -->|"/status, /panic kv,<br/>answers"| DB
-    T_DISC -->|"record_budget, record_belief,<br/>record_status, close, untrack"| STORE
-    T_DISC -->|"register/unregister"| REG
-    T_DISC -->|"evaluate_market, liquidate"| EXEC
+    T_DISC -->|"one service call per command"| CONTROL
+    T_DISC -->|"/status, autocomplete,<br/>answers"| DB
+    T_DISC -->|"/status reads"| STORE
+    CONTROL -->|"/track prepare/activate"| ONB
+    CONTROL -->|"record_budget, record_belief,<br/>record_status, close, untrack"| STORE
+    CONTROL -->|"register/unregister"| REG
+    CONTROL -->|"evaluate_market, liquidate,<br/>liquidate_all"| EXEC
     T_DPC -->|"SIGNAL, ERROR embeds"| DAPI
     T_DTC -->|"TRADE, ERROR embeds"| DAPI
     ONB -->|"GET /v0/slug, LLM synthesis,<br/>compile, insert, register"| T_DISC
@@ -85,6 +88,10 @@ Any module can hold any other module's state.
 | logger | `main.rs:158` | process | `PipelineEvent` receiver | channel closed |
 | `/track` updater | `discord.rs:717` | one command | `OnboardUpdate` receiver, progress message | sender dropped |
 
+Every mutating command is now one [`control::ControlPlane`] call. Only `/status` and
+autocomplete still read the store and the database directly; they cannot write, so
+they cannot make two stores disagree.
+
 ---
 
 ## 2. Module dependency graph: who imports whom
@@ -104,6 +111,7 @@ flowchart BT
     TRADE["trade.rs<br/>ManifoldClient + TradeExecutor<br/>+ TradeEvent"]
     ONB["onboarding.rs<br/>prepare + activate"]
     AGENT["onboarding_agent.rs<br/>rig agent + Firecrawl tools"]
+    CONTROL["control.rs<br/>ControlPlane<br/>ports + reports"]
     EXTRACT["extract.rs"]
     INGEST["ingest.rs"]
     DISCORD["discord.rs<br/>commands + consumers"]
@@ -152,16 +160,24 @@ flowchart BT
     ONB -->|"delegates the run"| AGENT
     AGENT -->|"model, prompt,<br/>OnboardUpdate"| ONB
     AGENT -->|"compile +<br/>SIEVE_SYSTEM_PROMPT"| ONB
+    CONTROL --> BEL
+    CONTROL --> DB
+    CONTROL --> ERR
+    CONTROL --> ONB
+    CONTROL --> SIEVE
+    CONTROL --> STORE
+    CONTROL --> TRADE
+    CONTROL --> TYPES
     EXTRACT --> TYPES
     INGEST --> DB
     INGEST --> EXTRACT
     INGEST --> TYPES
     DISCORD --> BEL
     DISCORD --> CFG
+    DISCORD --> CONTROL
     DISCORD --> DB
     DISCORD --> ONB
     DISCORD --> PIPE
-    DISCORD --> SIEVE
     DISCORD --> STORE
     DISCORD --> TRADE
     DISCORD --> TYPES
@@ -193,8 +209,10 @@ flowchart BT
    agent owns the tools and imports the prompt, market type, and progress events
    from the service. The import edge goes both ways, but it is one workflow, not
    two features.
-6. **`discord.rs` has the widest fan-in** (8 internal modules). Every command
-   handler orchestrates store + DB + registry + trade + onboarding by hand.
+6. **`control.rs` is the command seam.** Every mutating Discord handler calls
+   one `ControlPlane` method; `discord.rs` keeps only presentation and the
+   `/status` read path. The edge is one-way (`discord → control`), so the
+   service can be tested in-process without the Discord client.
 7. **`types.rs` is a shared kernel.** All modules depend on it, and it contains both
    pure domain values (`TrackedMarket`, `Direction`) and workflow payloads
    (`TriageResult`, `TradeDecision`, `SignalRecord`). This is acceptable, but a
@@ -210,16 +228,16 @@ third store such as `EngineRegistry` or Manifold itself.
 
 | Fact | Authoritative store | Mirrors | Writers | Readers |
 |---|---|---|---|---|
-| Market lifecycle `status` | `tracked_markets.status` | `MarketStore` snapshot | `record_status` (Pause/Resume), `close` (Liquidate), `untrack` (`/untrack`), `insert` (onboarding) | dispatch, trade, `/status`, autocomplete |
-| Presence of a Sieve engine | `EngineRegistry` map | none | `main` startup, onboarding.activate, `/untrack`, Liquidate button | dispatch |
+| Market lifecycle `status` | `tracked_markets.status` | `MarketStore` snapshot | `control` (pause, resume, close, untrack), `insert` (onboarding) | dispatch, trade, `/status`, autocomplete |
+| Presence of a Sieve engine | `EngineRegistry` map | none | `main` startup, onboarding.activate, onboarding rollback, `control` teardown | dispatch |
 | Compiled rule text | `tracked_markets.sieve_source` | none | onboarding.activate | `/status` embed |
-| Budget `budget_mana` | `tracked_markets` | `MarketStore` | `record_budget` (`/budget`), `insert` | trade, `/status` |
+| Budget `budget_mana` | `tracked_markets` | `MarketStore` | `control::set_budget`, `insert` | trade, `/status` |
 | Position `invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares` | `book::Book` legs; answer rows hold a multiple-choice leg, root columns the binary leg | `MarketStore` | `Book::apply_buy`, `Book::apply_sell`, `Book::reconcile`; `Book::persist` writes answer rows then the root | trade, `/status` |
-| Belief `p_internal_log_odds`, `belief_updated_at` | `tracked_markets` and `market_answers` | `MarketStore` (market only) | `record_belief` (pipeline, `/override`), `insert` | pipeline, trade, `/status` |
+| Belief `p_internal_log_odds`, `belief_updated_at` | `tracked_markets` and `market_answers` | `MarketStore` (market only) | `record_belief` (pipeline, `control::set_probability`), `insert` | pipeline, trade, `/status` |
 | Market price `p_market_last` | Manifold `/v0/market` | `tracked_markets` + `MarketStore` | `record_price` (trade sync only) | triage prompt, trade, `/status` |
 | Market kind `outcome_type`, `should_answers_sum_to_one` | `tracked_markets` | `MarketStore` | `record_kind` (trade sync) | trade, `/status` |
 | Position truth | Manifold `/v0/market/{id}/positions` | local shares + invested | `trade.prepare` → `Book::reconcile` | trade, `/status` |
-| Global kill switch | `kv.global_kill_switch` | none | `/panic` | trade.evaluate_market |
+| Global kill switch | `kv.global_kill_switch` | none | `control::panic` | trade.evaluate_market |
 | Signal history | `signal_ledger` | none | pipeline worker | `/status` |
 | Trade history | `trade_ledger` | none | trade | `/status` |
 | Discord thread per market | `tracked_markets.discord_thread_id` | `MarketStore` | onboarding.activate (via `/track`) | embed consumers, `/untrack`, Liquidate |
@@ -242,6 +260,28 @@ pause) from a snapshot taken before an HTTP call. The pipeline and `/override`
 therefore never touch `p_market_last`; the 60-second trade sync is its only
 writer.
 
+### One writer for operator lifecycle transitions
+
+`control::ControlPlane` is the only writer of an operator-driven lifecycle
+transition (`untrack`, `close`, pause/resume) and the only caller of
+`EngineRegistry::unregister` outside onboarding's own rollback. That makes
+"status, `deleted_at`, and engine membership cannot disagree" a property of one
+module rather than a convention seven handlers must remember.
+
+Both teardowns go through one private `teardown(market, end, threads)` body. The
+end state is a value, and the failure order is the only deliberate divergence:
+
+| Step | `End::Hide` (`/untrack`) | `End::Keep` (Liquidate button) |
+|---|---|---|
+| 1. unregister the engine | yes | after the row write |
+| 2. write the row | `MarketStore::untrack`; a failure is propagated | `MarketStore::close`; a failure is logged |
+| 3. unregister the engine | — | yes |
+| 4. archive the thread | only when step 2 succeeded | always |
+
+`/untrack` leaves `CLOSED` + `deleted_at`; the button leaves `CLOSED` with
+`deleted_at` NULL. `Book::persist` remains the only position writer, and the
+control plane never writes a position column.
+
 ### One writer for the position aggregate
 
 `book::Book` adds one layer of ownership above `MarketStore`. A market owns one
@@ -262,13 +302,13 @@ so it stays a single value on the market row; a sell on any leg adds to it.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: /track activate<br/>store.insert + registry register<br/>+ thread
-    Active --> Paused: Pause button<br/>store.record_status<br/>engine stays registered
-    Paused --> Active: Resume button<br/>store.record_status
-    Active --> Closed: Liquidate button<br/>sell + store.close<br/>+ unregister
-    Paused --> Closed: Liquidate button
-    Active --> SoftDeleted: /untrack<br/>sell optional + store.untrack<br/>(CLOSED + deleted_at) + unregister
-    Paused --> SoftDeleted: /untrack
+    [*] --> Active: /track activate<br/>control.track: store.insert + registry register<br/>+ thread
+    Active --> Paused: Pause button<br/>control.set_paused
+    Paused --> Active: Resume button<br/>control.set_paused
+    Active --> Closed: Liquidate button<br/>control.close: sell + store.close<br/>+ unregister + archive
+    Paused --> Closed: Liquidate button<br/>control.close
+    Active --> SoftDeleted: /untrack<br/>control.untrack: sell optional + store.untrack<br/>(CLOSED + deleted_at) + unregister + archive
+    Paused --> SoftDeleted: /untrack<br/>control.untrack
     Closed --> Active: /track again<br/>hard delete old row + answers<br/>then insert new lifecycle
     SoftDeleted --> Active: /track again<br/>same hard delete path
     Closed --> [*]
@@ -293,15 +333,15 @@ Rules encoded only by convention, not by a type:
 | Operation | Steps | Failure handling |
 |---|---|---|
 | `onboarding.activate` | delete old closed row + answers → `store.insert` (row and snapshot) → insert answers → register engine | manual rollback of answers, market row, and engine; the snapshot entry goes with the row |
-| `/track` | prepare (read only) → create Discord thread → activate → post embed | archive thread if activate fails; post failure is logged only |
-| `/untrack` | resolve row → liquidate → unregister → `store.untrack` → archive thread | liquidation error does not abort cleanup; archive failure is logged only |
-| Liquidate button | check status → `executor.liquidate` → `store.close` → unregister → archive thread → disable buttons | each cleanup step is best effort; a sell error still closes the market |
-| Pause button | read row → validate → `store.record_status` → edit buttons | one call; the row and the snapshot cannot diverge |
-| `/override` | compute logit → `store.record_belief` → spawn trade check | trade check is fire-and-forget; errors are logged only |
+| `/track` (`ControlPlane::track`) | prepare (read only) → create Discord thread → activate → post embed | archive thread if activate fails; post failure is logged only |
+| `/untrack` (`ControlPlane::untrack`) | resolve row → liquidate → `End::Hide` (unregister → `store.untrack` → archive) | liquidation error does not abort cleanup; a `store.untrack` error aborts before archiving; archive failure is logged only |
+| Liquidate button (`ControlPlane::close`) | check status → `executor.liquidate` → `End::Keep` (log a `store.close` error → unregister → archive) → disable buttons | each cleanup step is best effort; a sell error still closes the market |
+| Pause button (`ControlPlane::set_paused`) | read row → validate → `store.record_status` → edit buttons | one call; the row and the snapshot cannot diverge |
+| `/override` (`ControlPlane::set_probability`) | compute logit → `store.record_belief` → `check_now` | trade check is fire-and-forget; errors are logged only |
 
-These are the main **consistency seams**. Any restructure should decide whether
-these become a single `MarketService` transaction, or stay as sagas with explicit
-compensation.
+These are the main **consistency seams**. The mutating commands now share one
+`ControlPlane` saga with explicit compensation; `/status` stays a read-only
+adapter path.
 
 ---
 
@@ -584,21 +624,68 @@ instructions, three `DynamicTool`s, and `default_max_turns(MAX_AGENT_TURNS)`:
 The agent's final text is ignored; the accepted program comes from the slot. If
 the run ends with an empty slot, the error carries the last compiler error.
 
+### `control.rs`
+
+```rust
+pub struct ThreadId(pub u64);
+
+#[async_trait]
+pub trait Threads: Send + Sync {
+    async fn create_for_market(&self, budget: f64, question: &str) -> AppResult<ThreadId>;
+    async fn archive(&self, thread: ThreadId);
+}
+
+#[async_trait]
+pub trait Onboarder: Send + Sync {
+    async fn prepare(&self, url, budget, initial_prob, updates: mpsc::Sender<OnboardUpdate>)
+        -> AppResult<OnboardingDraft>;
+    fn activate(&self, draft: OnboardingDraft, thread_id: &str) -> AppResult<TrackedMarket>;
+}
+
+#[async_trait]
+pub trait Trading: Send + Sync {
+    async fn evaluate(&self, market_id: &str) -> AppResult<()>;
+    async fn liquidate(&self, market_id: &str) -> AppResult<LiquidationOutcome>;
+    async fn liquidate_all(&self) -> Vec<(MarketId, anyhow::Error)>;
+}
+
+pub struct ControlPlane { db, store, registry, onboarding: Arc<dyn Onboarder>,
+                          trading: Arc<dyn Trading> }
+
+ControlPlane::new(db, Arc<MarketStore>, Arc<EngineRegistry>,
+                  Arc<dyn Onboarder>, Arc<dyn Trading>) -> Self
+
+ControlPlane::track(url, budget, initial_prob, updates, &dyn Threads) -> AppResult<Onboarded>
+ControlPlane::untrack(query, liquidate, &dyn Threads) -> AppResult<UntrackReport>
+ControlPlane::close(market_id, &dyn Threads) -> AppResult<CloseReport>
+ControlPlane::set_budget(query, new_budget) -> AppResult<BudgetChange>
+ControlPlane::set_probability(query, probability) -> AppResult<ProbabilityChange>
+ControlPlane::set_paused(market_id) -> AppResult<MarketStatus>
+ControlPlane::check_now(market_id)                       // awaits one evaluation
+ControlPlane::panic(liquidate_all) -> AppResult<PanicReport>
+
+pub(crate) fn resolve_market(markets, query) -> Option<&TrackedMarket>
+```
+
+Reports are data: `Onboarded`, `Sale`, `UntrackReport`, `CloseReport`,
+`BudgetChange`, `ProbabilityChange`, and `PanicReport`. Rendering stays in
+`discord.rs`. `Onboarder` is implemented for `OnboardingService` and `Trading`
+for `TradeExecutor` in `control.rs`; the real `Threads` adapter is
+`DiscordThreads` in `discord.rs`. `control.rs` never imports the Discord client.
+
 ### `discord.rs`
 
 ```rust
 pub struct DiscordState {
-    config: Arc<Config>, db: Db, registry: Arc<EngineRegistry>,
-    store: Arc<MarketStore>, pipeline: Arc<Pipeline>,
-    onboarding: Arc<OnboardingService>, executor: Arc<TradeExecutor>,
+    config: Arc<Config>, db: Db, store: Arc<MarketStore>,
+    pipeline: Arc<Pipeline>, control: Arc<ControlPlane>,
 }
 
 discord::run(state, pipeline_events, trade_events) -> AppResult<()>
 ```
 
-Handlers are private functions. Each does its own orchestration: `track`,
-`untrack`, `budget`, `status`, `override_belief`, `panic_mode`, `pause_button`,
-`liquidate_button`, `autocomplete`.
+Handlers parse options and render one service result. `/status`, autocomplete,
+`TrackProgress`, and the two event consumers stay here; they only read.
 
 ### `ingest.rs` / `extract.rs`
 
@@ -699,7 +786,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant OP as Operator
-    participant D as discord handler
+    participant D as discord / ControlPlane
     participant U as progress updater
     participant O as OnboardingService
     participant AG as onboarding agent
@@ -742,13 +829,19 @@ sequenceDiagram
     D->>OP: delete progress messages
 ```
 
+`D` is the `discord.rs` handler plus `ControlPlane::track`. The handler parses
+options, defers, and starts the progress updater; the service runs prepare, the
+duplicate check, thread creation, and activation in that order, and archives the
+thread on an activation failure. The progress sender is passed by value so the
+updater can finish when `track` returns.
+
 ### 5.3 `/untrack`, Liquidate button, Pause button
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant OP as Operator
-    participant D as discord handler
+    participant D as discord / ControlPlane
     participant DB as SQLite
     participant EX as TradeExecutor
     participant MA as Manifold
@@ -800,6 +893,13 @@ Note: the Liquidate button leaves `deleted_at = NULL`, so the closed row still
 appears in `/status`. `/untrack` sets `deleted_at` and hides the row. These are
 **different** end states that are easy to confuse during a refactor.
 
+Both teardowns now call the one private `ControlPlane::teardown` body with the
+end state as a value (`End::Hide` for `/untrack`, `End::Keep` for the button).
+The sale is a caller step because `close` inspects
+`LiquidationOutcome::AlreadyClosed` before retiring anything. The pause button
+calls `ControlPlane::set_paused`; the row and snapshot still change in one
+`MarketStore` call.
+
 ---
 
 ## 6. Communication contract details
@@ -850,72 +950,53 @@ structural rather than conventional.
 own them, so `trade` and `discord` import `pipeline` for the event type. Moving
 the events to `events.rs` is still open and would remove those edges.
 
-### B. Three sources of truth for "is this market live"
+### B. Three sources of truth for "is this market live" — **resolved**
 
-**Today:** DB status + snapshot entry + registry membership. `MarketStore` keeps
-the first two in step in one call, so pause and resume touch two stores and
-untrack touches three. `dispatch` re-checks the snapshot status.
+**Then:** DB status + snapshot entry + registry membership. `MarketStore` kept
+the first two in step in one call, so pause and resume touched two stores and
+untrack touched three. `dispatch` re-checks the snapshot status.
 
-**Why it hurts:** a bug in any writer produces a market that matches but does not
-trade, or trades but is not visible, or has no Discord thread.
+**Now:** `control::ControlPlane` is the only writer of an operator-driven
+lifecycle transition and the only caller of `EngineRegistry::unregister`
+outside onboarding's own rollback. Pause/resume, close, and untrack each update
+the row, the snapshot, and engine membership in one documented order (see §3).
 
-**Candidate cut:** a single `MarketLifecycle` service with explicit transitions:
+**Residual:** `/untrack` unregisters first and propagates a row-write failure,
+while the Liquidate button logs a row-write failure and continues. The end
+states and compensation orders are deliberate and preserved; changing them is
+its own decision because it changes which store a failed transition leaves
+behind.
 
-```rust
-activate(draft, thread_id)
-pause(id) / resume(id)
-close(id)             // no deletion, row visible
-untrack(id)           // close + soft delete
-```
+### C. Discord handlers are orchestrators — **resolved**
 
-Each transition updates DB, snapshot, and registry in one place, with a documented
-compensation order. Keep `EngineRegistry` internal to this service so callers cannot
-forget to unregister.
-
-### C. Discord handlers are orchestrators
-
-**Today:** `untrack_market`, `liquidate_market`, `pause_button`, `budget`,
-`override_belief` each combine store reads/writes, registry changes, executor
+**Then:** `untrack_market`, `liquidate_market`, `pause_button`, `budget`, and
+`override_belief` each combined store reads/writes, registry changes, executor
 calls, thread archiving, and embed edits. `untrack_market` and
-`liquidate_market` duplicate most of the teardown.
+`liquidate_market` duplicated most of the teardown.
 
-**Why it hurts:** the same lifecycle transition exists twice with different end
-states. Testing requires a Discord mock.
+**Now:** every mutating handler parses options, calls one `ControlPlane` method,
+and renders a report. Thread lifecycle is a `Threads` port with a Discord
+adapter, and the three service ports let the rules be tested in-process without
+a network or a Discord mock. One private teardown body serves both end states.
 
-**Candidate cut:** introduce a `ControlPlane` service (or `MarketService`) with
-intention-revealing methods that return a plain report struct:
+**Residual:** input validation stays in the adapter because it is about command
+options, and `/status` plus autocomplete still read the store and DB directly.
+Neither can write.
 
-```rust
-track(url, budget, initial_prob) -> TrackResult
-untrack(query, liquidate) -> UntrackResult
-set_budget(query, amount) -> BudgetResult
-set_probability(query, p) -> OverrideResult
-set_paused(id, paused) -> StatusResult
-panic(liquidate_all) -> PanicResult
-status(query) -> StatusReport
-```
+### D. `/track` is split by a UI constraint — **resolved**
 
-Discord then only parses options, calls one method, and renders the result. Thread
-creation/archiving needs a small port (`ThreadProvisioner`) because it is a Discord
-concern, but the *ordering* stays in the service.
-
-### D. `/track` is split by a UI constraint
-
-**Today:** `prepare` is read-only, then Discord creates a thread, then `activate`
-writes. That split exists because no market should go live without a thread.
-
-**Why it hurts:** the transaction spans two modules plus the Discord API. Partial
-failure needs manual thread archiving.
-
-**Candidate cut:** keep the split, but make it explicit:
-
-- `prepare` returns a `PreparedMarket` value.
-- `activate(prepared, thread_id)` is the only writer.
-- A small `onboard_market` orchestrator in the control-plane service creates the
-  thread and compensates.
-
-Do **not** merge prepare and activate unless you accept a market row without a
+**Then:** `prepare` was read-only, then Discord created a thread, then
+`activate` wrote. The split exists because no market should go live without a
 thread.
+
+**Now:** the split stays, but it is explicit inside `ControlPlane::track`:
+`Onboarder::prepare` returns an `OnboardingDraft`, the `Threads` port creates the
+thread, and `Onboarder::activate` is the only writer. The service archives the
+thread when activation fails.
+
+**Residual:** the Discord adapter still owns the thread name
+(`[M{budget}] {question}`), so `shorten_question` and its tests stay with the
+presentation layer.
 
 ### E. `trade.rs` is both a consumer and a service, and depends on the pipeline event type — **partly resolved**
 
@@ -1087,9 +1168,10 @@ If you make only three cuts, make these:
 1. ~~**Move `MarketCache` out of `pipeline`** and give it a single writer
    (`MarketStore`).~~ Done: `market_store.rs` owns the snapshot and the market
    SQL, and `onboarding` no longer imports `pipeline`.
-2. **Move lifecycle transitions into one service** so status, `deleted_at`, and
+2. ~~**Move lifecycle transitions into one service** so status, `deleted_at`, and
    registry membership cannot disagree. This removes duplicated teardown in
-   Discord.
+   Discord.~~ Done: `control.rs` owns every operator-driven transition and calls
+   `unregister` only from its one teardown body.
 3. **Move `LlmClient` into `llm.rs`** so triage and onboarding are peers, not parent
    and child.
 
