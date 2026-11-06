@@ -29,6 +29,8 @@ pub struct Config {
     pub cloudflare_account_id: Option<String>,
     pub triage_model: String,
     pub onboarding_model: String,
+    /// Firecrawl credential for the onboarding research agent.
+    pub firecrawl_api_key: String,
     pub manifold_api_key: String,
     pub discord_bot_token: String,
     pub discord_guild_id: u64,
@@ -94,6 +96,7 @@ impl Config {
         }
 
         let manifold_api_key = required(&get, "MANIFOLD_API_KEY")?;
+        let firecrawl_api_key = required(&get, "FIRECRAWL_API_KEY")?;
         let discord_bot_token = required(&get, "DISCORD_BOT_TOKEN")?;
         let discord_guild_id = required_u64(&get, "DISCORD_GUILD_ID")?;
         let discord_control_channel_id = required_u64(&get, "DISCORD_CONTROL_CHANNEL_ID")?;
@@ -118,6 +121,7 @@ impl Config {
             cloudflare_account_id,
             triage_model,
             onboarding_model,
+            firecrawl_api_key,
             manifold_api_key,
             discord_bot_token,
             discord_guild_id,
@@ -261,6 +265,7 @@ mod tests {
             ("CLOUDFLARE_ACCOUNT_ID", "test-account"),
             ("TRIAGE_MODEL", "cloudflare/@cf/google/gemini-test"),
             ("ONBOARDING_MODEL", "cloudflare/@cf/deepseek/test"),
+            ("FIRECRAWL_API_KEY", "fc-test"),
             ("MANIFOLD_API_KEY", "manifold-key"),
             ("DISCORD_BOT_TOKEN", "discord-token"),
             ("DISCORD_GUILD_ID", "123456789012345678"),
@@ -401,6 +406,15 @@ mod tests {
 
         let error = config_from(&vars).expect_err("missing OPENROUTER_API_KEY should fail");
         assert!(error.to_string().contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn rejects_missing_firecrawl_key() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| *name != "FIRECRAWL_API_KEY");
+
+        let error = config_from(&vars).expect_err("missing Firecrawl key should fail");
+        assert!(error.to_string().contains("FIRECRAWL_API_KEY"));
     }
 
     #[test]
