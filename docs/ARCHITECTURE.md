@@ -102,6 +102,7 @@ flowchart BT
     PIPE["pipeline.rs<br/>Pipeline + MarketCache<br/>+ PipelineEvent"]
     TRADE["trade.rs<br/>ManifoldClient + TradeExecutor<br/>+ TradeEvent"]
     ONB["onboarding.rs<br/>prepare + activate"]
+    AGENT["onboarding_agent.rs<br/>rig agent + Firecrawl tools"]
     EXTRACT["extract.rs"]
     INGEST["ingest.rs"]
     DISCORD["discord.rs<br/>commands + consumers"]
@@ -136,6 +137,9 @@ flowchart BT
     ONB --> TYPES
     ONB -->|"MarketCache"| PIPE
     ONB -->|"LlmClient,<br/>json helpers"| TRIAGE
+    ONB -->|"delegates the run"| AGENT
+    AGENT -->|"model, prompt,<br/>OnboardUpdate"| ONB
+    AGENT -->|"compile +<br/>SIEVE_SYSTEM_PROMPT"| ONB
     EXTRACT --> TYPES
     INGEST --> DB
     INGEST --> EXTRACT
@@ -166,9 +170,13 @@ flowchart BT
 3. **`trade.rs` has two entry points.** It consumes `PipelineEvent` in `run()` and
    exposes `evaluate_market()`, `sync_market()`, `liquidate()`, `liquidate_all()`
    directly to Discord. It is both a subscriber and a service.
-4. **`onboarding.rs` reaches into `triage.rs`** for `LlmClient`,
-   `extract_json_object`, and `snippet`. LLM transport is coupled to the triage
-   feature.
+4. **`onboarding.rs` reaches into `triage.rs`** for `LlmClient` and `snippet`.
+   LLM transport is coupled to the triage feature.
+   `onboarding.rs` and `onboarding_agent.rs` form one deliberate pair: the
+   service prepares and activates a draft and delegates the model run, while the
+   agent owns the tools and imports the prompt, market type, and progress events
+   from the service. The import edge goes both ways, but it is one workflow, not
+   two features.
 5. **`discord.rs` has the widest fan-in** (7 internal modules). Every command
    handler orchestrates DB + cache + registry + trade + onboarding by hand.
 6. **`types.rs` is a shared kernel.** All modules depend on it, and it contains both
@@ -315,7 +323,7 @@ pub struct LlmClient { cloudflare: Option<...>, openrouter: Option<...> }
 
 LlmClient::new() -> AppResult<Self>              // reads env through rig providers
 LlmClient::complete(model, system, user) -> String
-LlmClient::complete_chat(model, system, turns) -> String
+LlmClient::completion_model(model) -> rig::DynModel<rig::operation::Completion>
 
 pub struct TriageClient { client: LlmClient, model: String }
 
@@ -333,7 +341,9 @@ parse_triage_response(raw) -> TriageResult
 is_material(&TriageResult) -> bool
 ```
 
-`TriageClient` is a thin feature wrapper. The reusable LLM transport is `LlmClient`.
+`TriageClient` is a thin feature wrapper. The reusable LLM transport is
+`LlmClient`. Triage uses `complete`; onboarding passes `completion_model` to the
+`rig` agent builder in `onboarding_agent.rs`.
 
 ### `pipeline.rs`
 
@@ -420,13 +430,35 @@ serializes all markets on one `execution_lock`.
 OnboardingService::new(&Config, Db, Arc<EngineRegistry>, Arc<MarketCache>)
 
 prepare(url, budget, initial_prob, &mpsc::Sender<OnboardUpdate>)
-    -> AppResult<OnboardingDraft>          // read only: Manifold + LLM + compile
+    -> AppResult<OnboardingDraft>          // read only: Manifold + agent + compile
 activate(draft, thread_id)
     -> AppResult<TrackedMarket>            // DB + answers + engine + cache
 ```
 
 `OnboardingDraft { market, sieve_source, answers }`. The split exists only because
 Discord must create the thread between the two calls.
+
+### `onboarding_agent.rs`
+
+```rust
+MAX_AGENT_TURNS: usize = 200             // runaway guard, not an attempt limit
+synthesize(model, Arc<firecrawl::Client>, &ManifoldSlugMarket, &mpsc::Sender<OnboardUpdate>)
+    -> AppResult<String>                 // the first program that compiled
+```
+
+`synthesize` builds one `rig` agent with the `SIEVE_SYSTEM_PROMPT` plus the agent
+instructions, three `DynamicTool`s, and `default_max_turns(MAX_AGENT_TURNS)`:
+
+- `submit_sieve` compiles a program with `spawn_blocking` (Cranelift is CPU-bound
+  and `CompiledSieve` is `!Send`). It records the first program that compiles in
+  a shared slot and reports every submission as `OnboardUpdate::Sieve`. There is
+  no attempt limit; a compile error goes back to the model as tool text.
+- `web_search` calls Firecrawl `/search` over web and news.
+- `read_page` calls Firecrawl `/scrape` in Markdown mode and truncates the page
+  to 20,000 characters.
+
+The agent's final text is ignored; the accepted program comes from the slot. If
+the run ends with an empty slot, the error carries the last compiler error.
 
 ### `discord.rs`
 
@@ -546,8 +578,9 @@ sequenceDiagram
     participant D as discord handler
     participant U as progress updater
     participant O as OnboardingService
+    participant AG as onboarding agent
+    participant FC as Firecrawl
     participant MA as Manifold
-    participant LLM as LLM
     participant DB as SQLite
     participant RG as EngineRegistry
     participant CA as MarketCache
@@ -560,12 +593,16 @@ sequenceDiagram
     O->>MA: GET /v0/slug/{slug}
     MA-->>O: market + answers
     O->>DB: get_market(id), duplicate check
-    loop up to 5 attempts
-        O->>LLM: synthesize Sieve rule
-        LLM-->>O: sieve_program
-        O->>O: sieve::compile
-        O->>U: SieveAttempt, success or compiler error
+    O->>AG: synthesize(model, firecrawl, market, updates)
+    loop until submit_sieve compiles (no attempt limit)
+        AG->>FC: web_search / read_page
+        FC-->>AG: sources and page Markdown
+        AG->>AG: write Sieve program, call submit_sieve
+        AG->>AG: sieve::compile (spawn_blocking)
+        AG->>U: SieveAttempt, success or compiler error
+        AG-->>AG: compiler error is tool text, so the model retries
     end
+    AG-->>O: first compiling program
     O-->>D: OnboardingDraft
     D->>DB: duplicate check again
     D->>TH: create public thread under control channel

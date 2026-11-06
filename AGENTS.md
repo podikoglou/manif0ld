@@ -23,6 +23,8 @@ and API contracts.
   differently changes in the Sieve rule, not in `extract.rs`.
 - **Filter-first.** One LLM call per surviving post; the pipeline exists to
   make that call rare.
+- **Onboarding is a rig agent.** It researches with Firecrawl and submits Sieve
+  programs through a tool. Do not reintroduce a fixed attempt loop.
 - **Per-market isolated budgets.** `available_budget = budget + realized_pnl
   − invested`; never exceed `budget_mana` net.
 - **No autonomous market discovery.** Markets enter only via the operator

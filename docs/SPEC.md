@@ -61,7 +61,8 @@ bsky-manifold-arb/
     ├── triage.rs        # CF AI Gateway client, LLM triage call
     ├── belief.rs        # log-odds state, decay, impulse
     ├── trade.rs         # Manifold client, Kelly sizing, order manager
-    ├── onboarding.rs    # fetch market, prompt LLM, compile Sieve
+    ├── onboarding.rs    # fetch market, prepare/activate a draft
+    ├── onboarding_agent.rs # research agent: Firecrawl + Sieve submission
     ├── pipeline.rs      # extract → match → triage → belief → trade orchestration
     └── discord.rs       # bot, commands, embeds, thread management
 ```
@@ -446,13 +447,30 @@ Triggered by `/track url:<url> budget:<mana>`:
 
 1. **Parse slug** from URL's last path segment.
 2. **Fetch market:** `GET https://api.manifold.markets/v0/slug/{slug}`. Verify `outcomeType == "BINARY"` and `isResolved == false`. Extract `{id, question, textDescription, resolutionCriteria?, closeTime, probability, url}`. The canonical `url` is persisted as `tracked_markets.market_url` and shown in the ONBOARDED embed; the bare slug cannot reconstruct it because the creator segment is not part of the slug.
-3. **LLM Sieve synthesis:** Call `ONBOARDING_MODEL` with `SIEVE_SYSTEM_PROMPT` + market context. Request JSON:
-   ```json
-   {
-     "sieve_program": "match Market_<id> { ... }"
-   }
-   ```
-4. **Compile with agentic self-correction:** `CompiledSieve::compile(&sieve_program)`. The call is a multi-turn loop, not a single generation: each LLM answer is followed by a validation report (the compiler error, or nothing if it compiled) as the next message, so the model corrects its own rule. Judgment stops at parse + compile correctness — matching behavior has no ground truth at onboarding time. If it still fails to compile after 5 attempts, abort and post the error + last LLM output to the Discord channel.
+3. **Onboarding research agent:** `ONBOARDING_MODEL` runs as a `rig` agent in
+   `onboarding_agent.rs`. The preamble is `SIEVE_SYSTEM_PROMPT` plus the agent
+   instructions, and the model must support tool calling. The agent has three
+   tools:
+   - `web_search` — Firecrawl search over web and news (at most 8 results per
+     call). The agent uses at most 8 searches.
+   - `read_page` — Firecrawl Markdown scrape of one http(s) page, truncated to
+     20,000 characters. The agent uses at most 5 page reads.
+   - `submit_sieve` — compiles the submitted program with `sieve::compile` on a
+     blocking thread and returns `ok` or the compiler error.
+
+   The agent researches the market topic for names, aliases, tickers, people,
+   organizations, and events that Bluesky posts would use. The research feeds
+   only the Sieve script.
+4. **Compile with agentic self-correction:** there is no fixed attempt limit.
+   Each `submit_sieve` call compiles one complete program; on failure the model
+   reads the real compiler error in the tool result and submits a corrected
+   program. The agent stops when `submit_sieve` returns `ok`; the accepted
+   program is stored in a shared slot, so the model's final text is ignored.
+   `MAX_AGENT_TURNS` (200) is only a runaway guard. Judgment stops at compile
+   correctness — matching behavior has no ground truth at onboarding time. If
+   the run ends without a compiling rule, abort and post the last compiler
+   error to the Discord channel. `/track` wraps the whole run in a 600-second
+   timeout; research plus several agent turns regularly exceeds the old 120 s.
 5. **Persist** market row (initial `p_internal_log_odds = logit(market.probability)`), register `CompiledSieve` in `EngineRegistry`, create Discord thread, post the `[ONBOARDED]` embed.
 
 **No ring-buffer benchmarking, no pass-rate gate.** If it compiles, it's live. Operator is responsible for reviewing the script in the thread embed and using `/untrack` if it looks wrong.
@@ -491,7 +509,7 @@ Triggered by `/track url:<url> budget:<mana>`:
 
 ## 7. Sieve DSL Reference (for onboarding LLM)
 
-Embed the following verbatim in `onboarding.rs` as `SIEVE_SYSTEM_PROMPT`. Note that lexical normalization (case folding, NFKC, leetspeak expansion, word-boundary handling) is the *engine's* job — the DSL below describes what Sieve does with each literal, not what our pipeline does.
+Embed the following verbatim in `onboarding.rs` as `SIEVE_SYSTEM_PROMPT`; `onboarding_agent.rs` appends its agent instructions to it at run time. Note that lexical normalization (case folding, NFKC, leetspeak expansion, word-boundary handling) is the *engine's* job — the DSL below describes what Sieve does with each literal, not what our pipeline does.
 
 ```
 You are an expert filtration engineer writing a program in the Sieve DSL.
