@@ -529,6 +529,15 @@ Triggered by `/track url:<url> budget:<mana>`:
    timeout; research plus several agent turns regularly exceeds the old 120 s.
 5. **Persist** market row (initial `p_internal_log_odds = logit(market.probability)`), register `CompiledSieve` in `EngineRegistry`, create Discord thread, post the `[ONBOARDED]` embed.
 
+   **Live progress:** the ephemeral `/track` followup is edited as onboarding
+   advances. It shows the current step, a rolling log of completed actions —
+   each `web_search` with its result count, each `read_page` with its size, and
+   each `dry_run_sieve` with its match count and warnings — plus elapsed time,
+   running counters, and the latest `submit_sieve` attempt in a code block.
+   Edits are coalesced to at most one every 1.2 seconds so a burst of tool
+   calls cannot trip Discord's per-message edit rate limit; the newest state
+   always wins.
+
 **No ring-buffer benchmarking, no pass-rate gate.** If it compiles, it's live. Operator is responsible for reviewing the script in the thread embed and using `/untrack` if it looks wrong.
 
 ### 6.8 Discord Control Plane (`discord.rs`)
