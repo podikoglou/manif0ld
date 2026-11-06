@@ -1,4 +1,4 @@
-# bsky-manifold-arb
+# manif0ld
 
 Personal Bluesky → Manifold auto-trader. The core value is filtering:
 it turns the Bluesky Jetstream firehose into a small number of posts that
@@ -25,7 +25,7 @@ Implementation is in progress. See `docs/SPEC.md` §8 for milestones.
    cargo run --release
    ```
 
-Data is stored in SQLite at `DB_PATH` (default `./data/arb.db`). The schema
+Data is stored in SQLite at `DB_PATH` (default `./data/manif0ld.db`). The schema
 is applied automatically from `migrations/001_init.sql` at startup.
 
 ## Layout
