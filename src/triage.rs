@@ -92,6 +92,43 @@ impl LlmClient {
         })
     }
 
+    /// Builds a `rig` completion model for an agent run.
+    ///
+    /// Onboarding uses this to hand the onboarding model to
+    /// [`rig::AgentBuilder`]; triage keeps the plain [`Self::complete`] call.
+    /// The provider is selected by the `raw_model` prefix, exactly as in
+    /// [`Self::send`].
+    pub fn completion_model(
+        &self,
+        raw_model: &str,
+    ) -> AppResult<rig::DynModel<rig::operation::Completion>> {
+        let (provider, model) = parse_model_spec(raw_model)?;
+        let model: rig::DynModel<rig::operation::Completion> = match provider {
+            ModelProvider::Cloudflare => self
+                .cloudflare
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Cloudflare AI Gateway client is not initialized; please set \
+                         CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
+                    )
+                })?
+                .completion(model)
+                .into(),
+            ModelProvider::OpenRouter => self
+                .openrouter
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "OpenRouter client is not initialized; please set OPENROUTER_API_KEY"
+                    )
+                })?
+                .completion(model)
+                .into(),
+        };
+        Ok(model)
+    }
+
     /// Sends one chat-completion request and returns the assistant text.
     ///
     /// rig parses the standard OpenAI reply natively, so this wrapper strips
