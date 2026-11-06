@@ -57,12 +57,21 @@ const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Longest silence tolerated while an LLM provider answers.
 ///
-/// `reqwest` resets this on every successful read, so it bounds a stalled
-/// request and a stalled stream without capping how long a live stream may
-/// run. Without it a provider that stops sending holds the onboarding agent
-/// open until the whole `/track` run times out. Observed model turns answer in
-/// a few seconds, so this only ever fires on a dead connection.
+/// `reqwest` resets this on every successful read, so it bounds a request whose
+/// connection goes quiet, without capping how long a live stream may run.
+/// Observed model turns answer in a few seconds, so this only ever fires on a
+/// dead connection.
 const LLM_READ_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Longest one onboarding model request may run, from connect to last byte.
+///
+/// [`LLM_READ_TIMEOUT`] cannot end a stream that keeps arriving: OpenRouter
+/// holds a queued upstream request open with `: OPENROUTER PROCESSING` comment
+/// lines, and every comment counts as a read and resets that timeout. A stalled
+/// turn then runs with no log line and no error until the whole `/track` run
+/// hits its 600-second wall. This total deadline ends one turn of the research
+/// agent instead.
+const ONBOARDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Expected evidence strength, on the 0-3 rubric, below which a post is noise.
 const MIN_STRENGTH: f64 = 0.5;
@@ -608,13 +617,15 @@ impl LlmClient {
     ///
     /// Initializes Cloudflare and/or OpenRouter depending on the credentials
     /// present in the process environment. Both providers share one transport
-    /// with [`LLM_READ_TIMEOUT`] applied, because the bundled `reqwest` client
-    /// rig defaults to has no request timeout at all.
+    /// with [`LLM_READ_TIMEOUT`] and overall [`ONBOARDING_REQUEST_TIMEOUT`]
+    /// applied, because the bundled `reqwest` client rig defaults to has no
+    /// request timeout at all.
     pub fn new() -> AppResult<Self> {
         let transport = rig::http_client::ReqwestClient::from(
             rig::rig_reqwest::reqwest::Client::builder()
                 .connect_timeout(LLM_CONNECT_TIMEOUT)
                 .read_timeout(LLM_READ_TIMEOUT)
+                .timeout(ONBOARDING_REQUEST_TIMEOUT)
                 .build()
                 .context("building the LLM HTTP client")?,
         );
