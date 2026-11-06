@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 mod belief;
+mod book;
 mod config;
 mod db;
 mod discord;
