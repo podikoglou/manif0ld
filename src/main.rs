@@ -1,10 +1,14 @@
 //! Entry point for the Bluesky-to-Manifold trading bot.
 //!
 //! Startup is deliberately linear: load configuration, open the database,
-//! compile one Sieve engine per active market, build the market cache, then
+//! build the market store, compile one Sieve engine per active market, then
 //! connect ingestion to the triage pipeline and the pipeline to the trade
 //! executor. Discord is not started yet; [`pipeline::PipelineEvent`] is the
 //! extension point a Discord consumer subscribes to.
+//!
+//! [`market_store::MarketStore`] is constructed once and shared as an `Arc`:
+//! it is the only path to `tracked_markets`, so every writer patches the same
+//! snapshot.
 //!
 //! The process runs until Ctrl-C, then aborts its spawned tasks.
 
@@ -36,8 +40,9 @@ use tokio::sync::broadcast;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{anyhow, AppResult, Context};
+use crate::market_store::MarketStore;
 use crate::onboarding::OnboardingService;
-use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
+use crate::pipeline::{Pipeline, PipelineEvent};
 use crate::trade::TradeExecutor;
 use crate::types::MarketStatus;
 
@@ -57,9 +62,10 @@ async fn main() -> AppResult<()> {
 
     let config = Arc::new(Config::from_env()?);
     let db = Db::open(&config.db_path)?;
+    let store = Arc::new(MarketStore::new(&db)?);
 
     let registry = Arc::new(sieve::EngineRegistry::new());
-    for market in db.list_markets()? {
+    for market in store.list()? {
         if market.status != MarketStatus::Active {
             continue;
         }
@@ -78,22 +84,20 @@ async fn main() -> AppResult<()> {
         "loaded Sieve engines"
     );
 
-    let cache = Arc::new(MarketCache::load(&db)?);
-
     // Onboarding shares the registry; build it before the registry is moved
     // into the pipeline.
     let onboarding = Arc::new(OnboardingService::new(
         &config,
         db.clone(),
         Arc::clone(&registry),
-        Arc::clone(&cache),
+        Arc::clone(&store),
     )?);
 
     let pipeline = Arc::new(Pipeline::new(
         Arc::clone(&config),
         db.clone(),
         registry,
-        Arc::clone(&cache),
+        Arc::clone(&store),
     )?);
     let mut pipeline_events = pipeline.events().subscribe();
     // Subscribe before spawning the executor: the broadcast channel has no
@@ -106,7 +110,7 @@ async fn main() -> AppResult<()> {
     // Resolving the bot identity here makes a bad API key a startup failure
     // instead of silently disabling trading.
     let executor = Arc::new(
-        TradeExecutor::new(&config, db.clone(), Arc::clone(&cache))
+        TradeExecutor::new(&config, db.clone(), Arc::clone(&store))
             .await
             .context("initializing the trade executor")?,
     );
@@ -120,7 +124,7 @@ async fn main() -> AppResult<()> {
         config: Arc::clone(&config),
         db: db.clone(),
         registry: Arc::clone(&pipeline.registry),
-        cache: Arc::clone(&cache),
+        store: Arc::clone(&store),
         pipeline: Arc::clone(&pipeline),
         onboarding,
         executor: Arc::clone(&executor),
@@ -140,6 +144,7 @@ async fn main() -> AppResult<()> {
 
     let heartbeat_task = tokio::spawn({
         let pipeline = Arc::clone(&pipeline);
+        let store = Arc::clone(&store);
         async move {
             let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -161,7 +166,7 @@ async fn main() -> AppResult<()> {
                 tracing::info!(
                     messages_per_sec = %format!("{per_sec:.1}"),
                     messages_processed = count,
-                    active_markets = pipeline.cache.active_count(),
+                    active_markets = store.active_count(),
                     "heartbeat"
                 );
                 last_count = count;

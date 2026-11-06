@@ -48,7 +48,8 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{bail, AppResult, Context};
-use crate::pipeline::{MarketCache, PipelineEvent};
+use crate::market_store::MarketStore;
+use crate::pipeline::PipelineEvent;
 use crate::types::{
     available_budget, MarketId, MarketStatus, TrackedAnswer, TrackedMarket, TradeAction,
     TradeDecision, TradeRecord,
@@ -1254,7 +1255,7 @@ struct ExecutionContext<'a> {
 pub struct TradeExecutor {
     client: ManifoldClient,
     db: Db,
-    cache: Arc<MarketCache>,
+    store: Arc<MarketStore>,
     params: TradeParams,
     limits: TradeLimits,
     dry_run: bool,
@@ -1268,7 +1269,7 @@ impl TradeExecutor {
     ///
     /// This performs one authenticated `GET /v0/me`. A failure is fatal at
     /// startup: silently disabling trading would hide a broken API key.
-    pub async fn new(config: &Config, db: Db, cache: Arc<MarketCache>) -> AppResult<Self> {
+    pub async fn new(config: &Config, db: Db, store: Arc<MarketStore>) -> AppResult<Self> {
         let client = ManifoldClient::new(config)
             .await
             .context("initializing the Manifold client")?;
@@ -1277,7 +1278,7 @@ impl TradeExecutor {
         Ok(Self {
             client,
             db,
-            cache,
+            store,
             params: TradeParams::from_config(config),
             limits: TradeLimits::from_config(config),
             dry_run: config.trading_dry_run,
@@ -1315,7 +1316,7 @@ impl TradeExecutor {
     ) -> AppResult<Option<TradeRecord>> {
         let _guard = self.execution_lock.lock().await;
 
-        let Some(mut market) = self.db.get_market(market_id)? else {
+        let Some(mut market) = self.store.load(market_id)? else {
             bail!("market {market_id} is not tracked");
         };
         if market.status != MarketStatus::Active {
@@ -1576,7 +1577,7 @@ impl TradeExecutor {
             return Ok(());
         }
 
-        self.db.update_market_kind(
+        self.store.record_kind(
             &market.id,
             &snapshot.outcome_type,
             snapshot.should_answers_sum_to_one,
@@ -1739,7 +1740,7 @@ impl TradeExecutor {
     pub async fn sync_market(&self, market_id: &str) -> AppResult<TrackedMarket> {
         let _guard = self.execution_lock.lock().await;
 
-        let Some(mut market) = self.db.get_market(market_id)? else {
+        let Some(mut market) = self.store.load(market_id)? else {
             bail!("market {market_id} is not tracked");
         };
 
@@ -1789,12 +1790,10 @@ impl TradeExecutor {
     /// This is the 60-second trade check. `evaluate_market` performs the
     /// reconciliation itself, so the ticker makes one price and one position
     /// request per market. Failures are collected per market so one broken
-    /// market cannot stop the tick for the others.
+    /// market cannot stop the tick for the others. The active set comes from
+    /// the store's snapshot, so a paused market is skipped without a query.
     pub async fn sync_all(&self) -> Vec<(MarketId, anyhow::Error)> {
-        let markets = match self.db.list_markets_by_status(MarketStatus::Active) {
-            Ok(markets) => markets,
-            Err(error) => return vec![(String::new(), error)],
-        };
+        let markets = self.store.active();
 
         let mut errors = Vec::new();
         for market in markets {
@@ -1818,7 +1817,7 @@ impl TradeExecutor {
     pub async fn liquidate(&self, market_id: &str) -> AppResult<LiquidationOutcome> {
         let _guard = self.execution_lock.lock().await;
 
-        let Some(mut market) = self.db.get_market(market_id)? else {
+        let Some(mut market) = self.store.load(market_id)? else {
             bail!("market {market_id} is not tracked");
         };
         if market.status == MarketStatus::Closed {
@@ -2028,7 +2027,7 @@ impl TradeExecutor {
     /// would resume holding. Errors are collected rather than aborting the
     /// sweep, so one unsellable market does not strand the others.
     pub async fn liquidate_all(&self) -> Vec<(MarketId, anyhow::Error)> {
-        let markets = match self.db.list_markets() {
+        let markets = match self.store.list() {
             Ok(markets) => markets,
             Err(error) => return vec![(String::new(), error)],
         };
@@ -2369,24 +2368,20 @@ impl TradeExecutor {
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("true")))
     }
 
-    /// Writes the position, belief, and probability fields and refreshes the
-    /// cache with the same values.
+    /// Writes the reconciled position and the freshly observed market price.
+    ///
+    /// Belief columns are deliberately absent: triage and `/override` own them
+    /// and may have written a newer value between the snapshot this call was
+    /// built from and now.
     fn persist_market(&self, market: &TrackedMarket) -> AppResult<()> {
-        self.db.update_position(
+        self.store.record_position(
             &market.id,
             market.invested_mana,
             market.realized_pnl_mana,
             market.yes_shares,
             market.no_shares,
         )?;
-        self.db.update_belief(
-            &market.id,
-            market.p_internal_log_odds,
-            market.p_market_last,
-            market.belief_updated_at,
-        )?;
-        self.cache.upsert(market.clone());
-        Ok(())
+        self.store.record_price(&market.id, market.p_market_last)
     }
 }
 
@@ -3315,15 +3310,16 @@ mod tests {
     fn live_dry_run_places_a_simulated_answer_bet() {
         let config = live_config();
         let db = Db::open_in_memory().expect("in-memory DB");
-        db.insert_market(&live_mc_market(
-            "thlctZn5PU",
-            "Israel election: Who will be the next prime minister?",
-        ))
-        .expect("insert market");
-        let cache = Arc::new(MarketCache::load(&db).expect("cache loads"));
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store
+            .insert(&live_mc_market(
+                "thlctZn5PU",
+                "Israel election: Who will be the next prime minister?",
+            ))
+            .expect("insert market");
         let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
         let executor = runtime
-            .block_on(TradeExecutor::new(&config, db.clone(), Arc::clone(&cache)))
+            .block_on(TradeExecutor::new(&config, db.clone(), Arc::clone(&store)))
             .expect("executor builds");
 
         runtime
@@ -3372,20 +3368,22 @@ mod tests {
     fn live_sync_reads_every_answer_of_both_mechanisms() {
         let config = live_config();
         let db = Db::open_in_memory().expect("in-memory DB");
-        db.insert_market(&live_mc_market(
-            "thlctZn5PU",
-            "Israel election: Who will be the next prime minister?",
-        ))
-        .expect("insert sum-to-one market");
-        db.insert_market(&live_mc_market(
-            "hEpuZQpgR2",
-            "US Midterms MEGA Market",
-        ))
-        .expect("insert independent market");
-        let cache = Arc::new(MarketCache::load(&db).expect("cache loads"));
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store
+            .insert(&live_mc_market(
+                "thlctZn5PU",
+                "Israel election: Who will be the next prime minister?",
+            ))
+            .expect("insert sum-to-one market");
+        store
+            .insert(&live_mc_market(
+                "hEpuZQpgR2",
+                "US Midterms MEGA Market",
+            ))
+            .expect("insert independent market");
         let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
         let executor = runtime
-            .block_on(TradeExecutor::new(&config, db.clone(), Arc::clone(&cache)))
+            .block_on(TradeExecutor::new(&config, db.clone(), Arc::clone(&store)))
             .expect("executor builds");
 
         let sum_to_one = runtime

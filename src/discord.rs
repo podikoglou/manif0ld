@@ -22,7 +22,7 @@
 //!
 //! # Locking
 //!
-//! The database handle and market cache use synchronous locks. Every handler
+//! The database handle and market store use synchronous locks. Every handler
 //! finishes its synchronous reads and drops the guard before the next `.await`;
 //! no lock is held across a Discord request.
 
@@ -39,10 +39,11 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{bail, AppResult, Context as AnyhowContext};
+use crate::market_store::MarketStore;
 use crate::onboarding::{
     OnboardUpdate, OnboardingDraft, OnboardingService, ResearchStep, SieveAttempt,
 };
-use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
+use crate::pipeline::{Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
 use crate::trade::{LiquidationOutcome, TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
 use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket};
@@ -118,7 +119,7 @@ pub struct DiscordState {
     pub config: Arc<Config>,
     pub db: Db,
     pub registry: Arc<EngineRegistry>,
-    pub cache: Arc<MarketCache>,
+    pub store: Arc<MarketStore>,
     pub pipeline: Arc<Pipeline>,
     pub onboarding: Arc<OnboardingService>,
     pub executor: Arc<TradeExecutor>,
@@ -138,13 +139,13 @@ pub async fn run(
 
     spawn_pipeline_consumer(
         Arc::clone(&http),
-        state.db.clone(),
+        Arc::clone(&state.store),
         Arc::clone(&state.config),
         pipeline_events,
     );
     spawn_trade_consumer(
         Arc::clone(&http),
-        state.db.clone(),
+        Arc::clone(&state.store),
         Arc::clone(&state.config),
         trade_events,
     );
@@ -333,9 +334,9 @@ fn market_option(description: &str, required: bool) -> CreateCommandOption {
 
 /// Answers the focused option with matching tracked markets.
 ///
-/// The active cache is queried first for freshness, then every database market
-/// is added so paused and closed markets stay addressable by commands such as
-/// `/untrack`.
+/// The active markets are queried first for freshness, then every database
+/// market is added so paused and closed markets stay addressable by commands
+/// such as `/untrack`.
 async fn autocomplete(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
     let query = interaction
         .data
@@ -343,8 +344,8 @@ async fn autocomplete(state: &DiscordState, ctx: &Context, interaction: &Command
         .map(|option| option.value.trim().to_owned())
         .unwrap_or_default();
 
-    let mut markets = state.cache.active_markets();
-    match state.db.list_markets() {
+    let mut markets = state.store.active();
+    match state.store.list() {
         Ok(all) => markets.extend(all),
         Err(error) => tracing::warn!(error = %error, "autocomplete could not list all markets"),
     }
@@ -365,7 +366,7 @@ async fn autocomplete(state: &DiscordState, ctx: &Context, interaction: &Command
 /// Filters markets by a case-insensitive substring and caps the result.
 ///
 /// Matching covers the question, market ID, and slug. Duplicate IDs are removed
-/// because callers concatenate the cache and database snapshots. Each choice
+/// because callers concatenate the active and full database listings. Each choice
 /// name has the form `"{question} ({id})"` and is truncated to Discord's limit.
 pub(crate) fn market_choices(markets: &[TrackedMarket], query: &str) -> Vec<(String, String)> {
     let trimmed = query.trim();
@@ -448,7 +449,7 @@ async fn status(state: &DiscordState, ctx: &Context, interaction: &CommandIntera
 
 /// Builds the multi-market overview embed.
 fn status_overview(state: &DiscordState) -> AppResult<CreateEmbed> {
-    let markets = state.db.list_markets()?;
+    let markets = state.store.list()?;
     let mut embed = CreateEmbed::new().title("Tracked markets");
 
     if markets.is_empty() {
@@ -525,7 +526,7 @@ fn status_overview(state: &DiscordState) -> AppResult<CreateEmbed> {
 
 /// Builds the full state embed for one market, matched by ID or unique slug.
 fn status_for_market(state: &DiscordState, query: &str) -> AppResult<CreateEmbed> {
-    let markets = state.db.list_markets()?;
+    let markets = state.store.list()?;
     let Some(market) = resolve_market(&markets, query) else {
         bail!("no unique tracked market matches {query:?}");
     };
@@ -1154,7 +1155,7 @@ async fn onboard(
         .prepare(url, budget, initial_prob, &updates)
         .await?;
 
-    if let Some(existing) = state.db.get_market(&draft.market.id)? {
+    if let Some(existing) = state.store.load(&draft.market.id)? {
         if existing.status != MarketStatus::Closed {
             bail!(
                 "market {} is already tracked (see /status or /untrack)",
@@ -1241,8 +1242,8 @@ async fn untrack(state: &DiscordState, ctx: &Context, interaction: &CommandInter
 ///
 /// The market row is kept with `status = CLOSED` and a `deleted_at` timestamp,
 /// so its answers and ledger history stay auditable. It disappears from every
-/// listing, the Sieve engine is unregistered, the cache entry is dropped, and
-/// the thread is archived.
+/// listing and from the match path, the Sieve engine is unregistered, and the
+/// thread is archived.
 ///
 /// The call is validated and idempotent: an already-untracked market is
 /// reported without selling or archiving anything a second time.
@@ -1275,10 +1276,7 @@ async fn untrack_market(
     }
 
     state.registry.unregister(&market_id);
-    state
-        .db
-        .soft_delete_market(&market_id, Utc::now().timestamp())?;
-    state.cache.remove(&market_id);
+    state.store.untrack(&market_id, Utc::now().timestamp())?;
 
     if let Ok(channel_id) = thread_id.trim().parse::<u64>() {
         if let Err(error) = ChannelId::new(channel_id)
@@ -1344,10 +1342,7 @@ async fn budget(state: &DiscordState, ctx: &Context, interaction: &CommandIntera
     let result = (|| -> AppResult<String> {
         let market = resolve_single_market(state, &query)?;
         let before = market.budget_mana;
-        state.db.update_budget(&market.id, new_budget)?;
-        if let Some(reloaded) = state.db.get_market(&market.id)? {
-            state.cache.upsert(reloaded);
-        }
+        state.store.record_budget(&market.id, new_budget)?;
         Ok(format!(
             "Budget for **{}** (`{}`): {before:.2} mana → {new_budget:.2} mana.",
             market.question, market.id
@@ -1385,15 +1380,9 @@ async fn override_belief(state: &DiscordState, ctx: &Context, interaction: &Comm
         let market = resolve_single_market(state, &query)?;
         let (log_odds, clamped_p) = belief::override_probability(probability);
         let now = Utc::now().timestamp();
-        // Keep the stored probability consistent with the belief timestamp: the
-        // market price observed at override time stays in `p_market_last`, so
-        // future decay does not start from a stale pair.
-        state
-            .db
-            .update_belief(&market.id, log_odds, market.p_market_last, now)?;
-        if let Some(reloaded) = state.db.get_market(&market.id)? {
-            state.cache.upsert(reloaded);
-        }
+        // Only the belief columns move. `p_market_last` belongs to the trade
+        // sync, so the next decay uses whatever price the market last reported.
+        state.store.record_belief(&market.id, log_odds, now)?;
 
         // Trigger one trade check off the interaction path: it makes network
         // calls and must not block the response.
@@ -1458,8 +1447,8 @@ async fn panic_mode(state: &DiscordState, ctx: &Context, interaction: &CommandIn
         if liquidate_all {
             let errors = state.executor.liquidate_all().await;
             let attempted = state
-                .db
-                .list_markets()?
+                .store
+                .list()?
                 .iter()
                 .filter(|market| market.status != MarketStatus::Closed)
                 .count();
@@ -1721,7 +1710,7 @@ async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: Comp
     }
 
     let result = (|| -> AppResult<MarketStatus> {
-        let Some(market) = state.db.get_market(&market_id)? else {
+        let Some(market) = state.store.load(&market_id)? else {
             bail!("market {market_id} is not tracked");
         };
         if market.is_deleted() {
@@ -1735,10 +1724,7 @@ async fn pause_button(state: &DiscordState, ctx: &Context, mut interaction: Comp
             MarketStatus::Paused => MarketStatus::Active,
             MarketStatus::Closed => bail!("market {market_id} is closed and cannot be resumed"),
         };
-        state.db.update_market_status(&market_id, new_status)?;
-        if let Some(reloaded) = state.db.get_market(&market_id)? {
-            state.cache.upsert(reloaded);
-        }
+        state.store.record_status(&market_id, new_status)?;
         Ok(new_status)
     })();
 
@@ -1832,7 +1818,7 @@ async fn liquidate_market(
     ctx: &Context,
     market_id: &str,
 ) -> AppResult<String> {
-    let Some(market) = state.db.get_market(market_id)? else {
+    let Some(market) = state.store.load(market_id)? else {
         return Ok(format!(
             "Market `{market_id}` is no longer tracked. Nothing was liquidated."
         ));
@@ -1865,17 +1851,13 @@ async fn liquidate_market(
         ));
     }
 
-    // Closing the market, unregistering the engine, dropping the cache entry,
-    // and archiving the thread are best-effort cleanup of a market the operator
-    // asked to remove. Their failures do not abort the sequence.
-    if let Err(error) = state
-        .db
-        .update_market_status(market_id, MarketStatus::Closed)
-    {
+    // Closing the market, unregistering the engine, and archiving the thread
+    // are best-effort cleanup of a market the operator asked to remove. Their
+    // failures do not abort the sequence.
+    if let Err(error) = state.store.close(market_id) {
         tracing::error!(market_id = %market_id, error = %error, "failed to close the market");
     }
     state.registry.unregister(market_id);
-    state.cache.remove(market_id);
 
     if let Ok(channel_id) = thread_id.trim().parse::<u64>() {
         if let Err(error) = ChannelId::new(channel_id)
@@ -1949,31 +1931,31 @@ async fn respond_component_followup(
 /// Spawns the pipeline-event renderer.
 fn spawn_pipeline_consumer(
     http: Arc<Http>,
-    db: Db,
+    store: Arc<MarketStore>,
     config: Arc<Config>,
     events: broadcast::Receiver<PipelineEvent>,
 ) {
     tokio::spawn(async move {
-        consume_pipeline_events(http, db, config, events).await;
+        consume_pipeline_events(http, store, config, events).await;
     });
 }
 
 /// Spawns the trade-event renderer.
 fn spawn_trade_consumer(
     http: Arc<Http>,
-    db: Db,
+    store: Arc<MarketStore>,
     config: Arc<Config>,
     events: broadcast::Receiver<TradeEvent>,
 ) {
     tokio::spawn(async move {
-        consume_trade_events(http, db, config, events).await;
+        consume_trade_events(http, store, config, events).await;
     });
 }
 
 /// Renders pipeline signals and errors into Discord messages.
 async fn consume_pipeline_events(
     http: Arc<Http>,
-    db: Db,
+    store: Arc<MarketStore>,
     config: Arc<Config>,
     mut events: broadcast::Receiver<PipelineEvent>,
 ) {
@@ -1984,7 +1966,7 @@ async fn consume_pipeline_events(
                 post_uri,
                 author_handle,
             }) => {
-                let channel = channel_for_market(&db, &config, Some(&market_id));
+                let channel = channel_for_market(&store, &config, Some(&market_id));
                 let url = bsky_post_url_with_handle(&post_uri, Some(&author_handle))
                     .unwrap_or_else(|| post_uri.clone());
                 send_text_message(&http, channel, &url).await;
@@ -2008,7 +1990,7 @@ async fn consume_pipeline_events(
                 p_market,
                 ..
             }) => {
-                let channel = channel_for_market(&db, &config, Some(&market_id));
+                let channel = channel_for_market(&store, &config, Some(&market_id));
 
                 let mut embed = CreateEmbed::new()
                     .title(truncate_chars(
@@ -2075,7 +2057,7 @@ async fn consume_pipeline_events(
             }
             Ok(PipelineEvent::Error { market_id, message }) => {
                 tracing::error!(market_id = ?market_id, message = %message, "pipeline error");
-                let channel = channel_for_market(&db, &config, market_id.as_deref());
+                let channel = channel_for_market(&store, &config, market_id.as_deref());
                 let mut embed = CreateEmbed::new()
                     .title("[ERROR]")
                     .colour(Colour::RED)
@@ -2096,7 +2078,7 @@ async fn consume_pipeline_events(
 /// Renders trades and trade-loop errors into Discord messages.
 async fn consume_trade_events(
     http: Arc<Http>,
-    db: Db,
+    store: Arc<MarketStore>,
     config: Arc<Config>,
     mut events: broadcast::Receiver<TradeEvent>,
 ) {
@@ -2112,7 +2094,7 @@ async fn consume_trade_events(
                 available_budget,
                 bet_id,
             }) => {
-                let channel = channel_for_market(&db, &config, Some(&market_id));
+                let channel = channel_for_market(&store, &config, Some(&market_id));
                 let embed = CreateEmbed::new()
                     .title(format!("[TRADE] {action}"))
                     .field("Market", &market_id, false)
@@ -2133,7 +2115,7 @@ async fn consume_trade_events(
             }
             Ok(TradeEvent::Error { market_id, message }) => {
                 tracing::error!(market_id = ?market_id, message = %message, "trade error");
-                let channel = channel_for_market(&db, &config, market_id.as_deref());
+                let channel = channel_for_market(&store, &config, market_id.as_deref());
                 let mut embed = CreateEmbed::new()
                     .title("[ERROR]")
                     .colour(Colour::RED)
@@ -2153,9 +2135,9 @@ async fn consume_trade_events(
 
 /// Chooses the market thread when it is a valid channel ID, otherwise the
 /// control channel.
-fn channel_for_market(db: &Db, config: &Config, market_id: Option<&str>) -> ChannelId {
+fn channel_for_market(store: &MarketStore, config: &Config, market_id: Option<&str>) -> ChannelId {
     let thread = market_id
-        .and_then(|id| match db.get_market(id) {
+        .and_then(|id| match store.load(id) {
             Ok(market) => market,
             Err(error) => {
                 tracing::warn!(
@@ -2212,7 +2194,7 @@ async fn send_text_message(http: &Http, channel: ChannelId, content: &str) {
 /// Soft-deleted markets are excluded, so commands such as `/status` and
 /// `/override` only see markets that are still tracked.
 fn resolve_single_market(state: &DiscordState, query: &str) -> AppResult<TrackedMarket> {
-    let markets = state.db.list_markets()?;
+    let markets = state.store.list()?;
     let Some(market) = resolve_market(&markets, query) else {
         bail!("no unique tracked market matches {query:?}");
     };
@@ -2224,7 +2206,7 @@ fn resolve_single_market(state: &DiscordState, query: &str) -> AppResult<Tracked
 /// `/untrack` needs this so a repeated call reports "already untracked"
 /// instead of claiming the market never existed.
 fn resolve_any_market(state: &DiscordState, query: &str) -> AppResult<TrackedMarket> {
-    let markets = state.db.list_markets_including_deleted()?;
+    let markets = state.store.list_including_deleted()?;
     let Some(market) = resolve_market(&markets, query) else {
         bail!("no tracked or untracked market matches {query:?}");
     };

@@ -20,7 +20,7 @@
 //!
 //! # Locking
 //!
-//! The market cache and the queue map use `std::sync` locks. A guard is never
+//! The market store and the queue map use `std::sync` locks. A guard is never
 //! held across an `.await`: every method extracts owned data (`TrackedMarket`,
 //! `QueueHandle`, sender clone) and drops the guard before doing async work.
 //! Locks recover from poisoning because a panic in one task must not take the
@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -38,6 +38,7 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::AppResult;
+use crate::market_store::MarketStore;
 use crate::sieve::EngineRegistry;
 use crate::triage::{Target, TriageClient};
 use crate::types::{
@@ -52,106 +53,6 @@ const EVENT_CAPACITY: usize = 1024;
 
 /// Minimum gap between saturation warnings for one market.
 const QUEUE_LAG_WARN_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Snapshot of every tracked market.
-///
-/// The cache exists because the hot matching path needs market state without a
-/// SQLite query per post. It is shared as `Arc<MarketCache>` and refreshed with
-/// [`MarketCache::upsert`], [`MarketCache::remove`], or [`MarketCache::reload`]
-/// when control-plane commands change a market.
-pub struct MarketCache {
-    markets: RwLock<HashMap<MarketId, TrackedMarket>>,
-}
-
-impl MarketCache {
-    /// Loads every market row from the database.
-    pub fn load(db: &Db) -> AppResult<Self> {
-        Ok(Self {
-            markets: RwLock::new(Self::snapshot(db)?),
-        })
-    }
-
-    /// Returns a clone of one cached market.
-    pub fn get(&self, id: &str) -> Option<TrackedMarket> {
-        self.read().get(id).cloned()
-    }
-
-    /// Returns every active market, sorted by ID for deterministic callers.
-    pub fn active_markets(&self) -> Vec<TrackedMarket> {
-        let markets = self.read();
-        let mut active: Vec<TrackedMarket> = markets
-            .values()
-            .filter(|market| market.status == MarketStatus::Active)
-            .cloned()
-            .collect();
-        active.sort_by(|left, right| left.id.cmp(&right.id));
-        active
-    }
-
-    /// Number of active markets without cloning their snapshots.
-    ///
-    /// The heartbeat calls this every few seconds, so it avoids allocating a
-    /// `Vec<TrackedMarket>` just to read its length.
-    pub fn active_count(&self) -> usize {
-        self.read()
-            .values()
-            .filter(|market| market.status == MarketStatus::Active)
-            .count()
-    }
-
-    /// Inserts or replaces one market.
-    ///
-    /// Used both when a market is onboarded and when the trading or control
-    /// plane layer persists position, probability, or status changes.
-    pub fn upsert(&self, market: TrackedMarket) {
-        self.write().insert(market.id.clone(), market);
-    }
-
-    /// Removes one market from the cache. Missing IDs are ignored.
-    pub fn remove(&self, id: &str) {
-        self.write().remove(id);
-    }
-
-    /// Replaces the whole cache with a fresh database snapshot.
-    pub fn reload(&self, db: &Db) -> AppResult<()> {
-        let snapshot = Self::snapshot(db)?;
-        *self.write() = snapshot;
-        Ok(())
-    }
-
-    /// Updates the belief fields of one cached market after a successful write.
-    ///
-    /// Keeping the cache in step matters because queued jobs read the current
-    /// belief state when they start, not the state at enqueue time.
-    fn record_belief(&self, id: &str, log_odds: f64, p_market: f64, updated_at: i64) {
-        let mut markets = self.write();
-        if let Some(market) = markets.get_mut(id) {
-            market.p_internal_log_odds = log_odds;
-            market.p_market_last = p_market;
-            market.belief_updated_at = updated_at;
-        }
-    }
-
-    fn snapshot(db: &Db) -> AppResult<HashMap<MarketId, TrackedMarket>> {
-        let markets = db.list_markets()?;
-        Ok(markets
-            .into_iter()
-            .map(|market| (market.id.clone(), market))
-            .collect())
-    }
-
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<MarketId, TrackedMarket>> {
-        self.markets
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<MarketId, TrackedMarket>> {
-        self.markets
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
 
 /// One item queued for a market's triage worker.
 #[derive(Debug, Clone)]
@@ -267,7 +168,7 @@ pub struct Pipeline {
     pub config: Arc<Config>,
     pub db: Db,
     pub registry: Arc<EngineRegistry>,
-    pub cache: Arc<MarketCache>,
+    pub store: Arc<MarketStore>,
     triage: TriageClient,
     events: broadcast::Sender<PipelineEvent>,
     queues: Mutex<HashMap<MarketId, QueueHandle>>,
@@ -281,7 +182,7 @@ impl Pipeline {
         config: Arc<Config>,
         db: Db,
         registry: Arc<EngineRegistry>,
-        cache: Arc<MarketCache>,
+        store: Arc<MarketStore>,
     ) -> AppResult<Self> {
         let triage = TriageClient::new(&config)?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
@@ -289,7 +190,7 @@ impl Pipeline {
             config,
             db,
             registry,
-            cache,
+            store,
             triage,
             events,
             queues: Mutex::new(HashMap::new()),
@@ -353,13 +254,13 @@ impl Pipeline {
     /// Matches one post against every engine and enqueues triage jobs.
     ///
     /// The extracted text is passed to Sieve unchanged. Markets absent from the
-    /// cache or not active are skipped, matching the control-plane semantics of
+    /// store or not active are skipped, matching the control-plane semantics of
     /// paused and closed markets.
     fn dispatch(self: &Arc<Self>, post: ExtractedPost) {
         let market_ids = self.registry.matching_markets(&post.text);
 
         for market_id in market_ids {
-            let Some(market) = self.cache.get(&market_id) else {
+            let Some(market) = self.store.cached(&market_id) else {
                 continue;
             };
             if market.status != MarketStatus::Active {
@@ -485,10 +386,10 @@ impl Pipeline {
     async fn process(&self, job: TriageJob) {
         let TriageJob { market, post } = job;
 
-        // Refresh belief fields from the cache: several jobs for one market may
+        // Refresh belief fields from the store: several jobs for one market may
         // have been enqueued before the first one finished, and their snapshots
         // would otherwise overwrite each other's belief updates.
-        let market = self.cache.get(&market.id).unwrap_or(market);
+        let market = self.store.cached(&market.id).unwrap_or(market);
 
         self.emit(PipelineEvent::PostMatched {
             market_id: market.id.clone(),
@@ -643,7 +544,7 @@ impl Pipeline {
         });
     }
 
-    /// Applies one impulse to the market belief and refreshes the cache.
+    /// Applies one impulse to the market belief.
     ///
     /// Returns `(applied impulse, resulting probability)`. On a persistence
     /// failure the cached and stored state stay untouched.
@@ -667,11 +568,9 @@ impl Pipeline {
         );
         let after = belief::sigmoid(log_odds);
 
-        self.db
-            .update_belief(&market.id, log_odds, p_market, updated_at)
+        self.store
+            .record_belief(&market.id, log_odds, updated_at)
             .map_err(|error| format!("failed to persist belief update: {error}"))?;
-        self.cache
-            .record_belief(&market.id, log_odds, p_market, updated_at);
         Ok((applied, after))
     }
 
@@ -755,138 +654,6 @@ fn warn_queue_lag(market_id: &str, dropped: usize, last_warn: &Mutex<Option<Inst
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_market(id: &str, status: MarketStatus, created_at: i64) -> TrackedMarket {
-        TrackedMarket {
-            id: id.to_owned(),
-            slug: format!("slug-{id}"),
-            market_url: String::new(),
-            question: format!("Question {id}?"),
-            description: "Description".to_owned(),
-            resolution_criteria: "Resolves YES if the thing happens.".to_owned(),
-            close_time: Some(created_at + 86_400),
-            status,
-            budget_mana: 100.0,
-            invested_mana: 0.0,
-            realized_pnl_mana: 0.0,
-            yes_shares: 0.0,
-            no_shares: 0.0,
-            p_internal_log_odds: 0.0,
-            p_market_last: 0.5,
-            belief_updated_at: created_at,
-            sieve_source: "match Market { \"thing\" }".to_owned(),
-            discord_thread_id: String::new(),
-            created_at,
-            deleted_at: None,
-            outcome_type: "BINARY".to_owned(),
-            should_answers_sum_to_one: false,
-        }
-    }
-
-    fn market_ids(markets: &[TrackedMarket]) -> Vec<&str> {
-        markets.iter().map(|market| market.id.as_str()).collect()
-    }
-
-    #[test]
-    fn load_copies_markets() {
-        let db = Db::open_in_memory().expect("in-memory DB");
-        db.insert_market(&sample_market("m1", MarketStatus::Active, 1))
-            .expect("insert m1");
-        db.insert_market(&sample_market("m2", MarketStatus::Paused, 2))
-            .expect("insert m2");
-
-        let cache = MarketCache::load(&db).expect("load cache");
-
-        assert_eq!(cache.get("m1").expect("cached m1").question, "Question m1?");
-        assert_eq!(
-            cache.get("m2").expect("cached m2").status,
-            MarketStatus::Paused
-        );
-        assert!(cache.get("missing").is_none());
-
-        assert_eq!(
-            market_ids(&cache.active_markets()),
-            vec!["m1"],
-            "paused markets are not active"
-        );
-    }
-
-    #[test]
-    fn active_count_excludes_paused_markets() {
-        let db = Db::open_in_memory().expect("in-memory DB");
-        db.insert_market(&sample_market("m1", MarketStatus::Active, 1))
-            .expect("insert m1");
-        db.insert_market(&sample_market("m2", MarketStatus::Paused, 2))
-            .expect("insert m2");
-
-        let cache = MarketCache::load(&db).expect("load cache");
-        assert_eq!(cache.active_count(), 1, "paused markets are not counted");
-
-        cache.remove("m1");
-        assert_eq!(cache.active_count(), 0);
-    }
-
-    #[test]
-    fn upsert_and_remove_update_the_cache() {
-        let db = Db::open_in_memory().expect("in-memory DB");
-        let cache = MarketCache::load(&db).expect("load cache");
-        assert!(cache.get("m3").is_none());
-
-        cache.upsert(sample_market("m3", MarketStatus::Active, 3));
-
-        assert_eq!(
-            cache.get("m3").expect("upserted market").status,
-            MarketStatus::Active
-        );
-        assert_eq!(market_ids(&cache.active_markets()), vec!["m3"]);
-
-        cache.remove("m3");
-        assert!(cache.get("m3").is_none());
-    }
-
-    #[test]
-    fn upsert_replaces_state() {
-        let db = Db::open_in_memory().expect("in-memory DB");
-        let cache = MarketCache::load(&db).expect("load cache");
-        cache.upsert(sample_market("m1", MarketStatus::Active, 1));
-        cache.upsert(sample_market("m2", MarketStatus::Active, 2));
-
-        let mut updated = cache.get("m1").expect("cached m1");
-        updated.yes_shares = 12.5;
-        updated.invested_mana = 8.0;
-        updated.p_market_last = 0.61;
-        cache.upsert(updated);
-
-        let cached = cache.get("m1").expect("updated m1");
-        assert_eq!(cached.yes_shares, 12.5);
-        assert_eq!(cached.invested_mana, 8.0);
-        assert_eq!(cached.p_market_last, 0.61);
-
-        // Upserting an unknown market inserts it.
-        let mut fresh = sample_market("m3", MarketStatus::Paused, 3);
-        fresh.no_shares = 4.0;
-        cache.upsert(fresh);
-        assert_eq!(cache.get("m3").expect("inserted m3").no_shares, 4.0);
-    }
-
-    #[test]
-    fn reload_replaces_the_whole_snapshot() {
-        let db = Db::open_in_memory().expect("in-memory DB");
-        db.insert_market(&sample_market("m1", MarketStatus::Active, 1))
-            .expect("insert m1");
-        let cache = MarketCache::load(&db).expect("load cache");
-        assert!(cache.get("m1").is_some());
-
-        db.insert_market(&sample_market("m2", MarketStatus::Active, 2))
-            .expect("insert m2");
-        cache.reload(&db).expect("reload cache");
-
-        assert!(cache.get("m2").is_some());
-
-        db.delete_market("m1").expect("delete m1");
-        cache.reload(&db).expect("reload after delete");
-        assert!(cache.get("m1").is_none());
-    }
 
     #[test]
     fn queue_depth_tracks_adds_consumes_and_lag() {

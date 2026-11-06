@@ -6,9 +6,9 @@
 //! 1. [`OnboardingService::prepare`] fetches the market, runs the research agent
 //!    in [`crate::onboarding_agent`] to write a compiling Sieve rule, and
 //!    validates the rule. It performs no writes.
-//! 2. [`OnboardingService::activate`] persists the draft, registers the compiled
-//!    engine, and refreshes the market cache. Any failure after the database
-//!    insert rolls the new row back.
+//! 2. [`OnboardingService::activate`] persists the draft through the market
+//!    store, registers the compiled engine, and caches the new market. Any
+//!    failure after the database insert rolls the new row back.
 //!
 //! All Manifold HTTP calls use short timeouts and put the HTTP
 //! status plus a bounded body excerpt into errors. The Cloudflare credential
@@ -27,8 +27,8 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{anyhow, bail, AppResult, Context};
+use crate::market_store::MarketStore;
 use crate::onboarding_agent;
-use crate::pipeline::MarketCache;
 use crate::sieve::EngineRegistry;
 use crate::triage::{snippet, LlmClient};
 use crate::types::{MarketStatus, TrackedMarket};
@@ -258,7 +258,7 @@ pub struct OnboardingService {
     firecrawl: Arc<firecrawl::Client>,
     db: Db,
     registry: Arc<EngineRegistry>,
-    cache: Arc<MarketCache>,
+    store: Arc<MarketStore>,
 }
 
 impl OnboardingService {
@@ -267,7 +267,7 @@ impl OnboardingService {
         config: &Config,
         db: Db,
         registry: Arc<EngineRegistry>,
-        cache: Arc<MarketCache>,
+        store: Arc<MarketStore>,
     ) -> AppResult<Self> {
         Ok(Self {
             ai: LlmClient::new()?,
@@ -278,7 +278,7 @@ impl OnboardingService {
             ),
             db,
             registry,
-            cache,
+            store,
         })
     }
 
@@ -317,7 +317,7 @@ impl OnboardingService {
         let market = self.fetch_market(&http, &slug).await?;
         validate_market(&market)?;
 
-        if let Some(existing) = self.db.get_market(&market.id)? {
+        if let Some(existing) = self.store.load(&market.id)? {
             if existing.status != MarketStatus::Closed {
                 bail!("market {} ({slug}) is already tracked", market.id);
             }
@@ -358,9 +358,10 @@ impl OnboardingService {
 
     /// Persists a prepared draft and makes it live.
     ///
-    /// The market row is inserted first. If engine registration or the cache
-    /// update fails, the new row is removed and the engine is unregistered
-    /// (best effort) before the error is returned.
+    /// The market row is inserted first. If a later step fails, the new row is
+    /// removed and the engine is unregistered (best effort) before the error is
+    /// returned. The row insert also caches the market, so there is no separate
+    /// cache write at the end.
     pub fn activate(&self, draft: OnboardingDraft, thread_id: &str) -> AppResult<TrackedMarket> {
         let OnboardingDraft {
             mut market,
@@ -370,17 +371,17 @@ impl OnboardingService {
         } = draft;
 
         market.discord_thread_id = thread_id.to_owned();
-        if let Some(existing) = self.db.get_market(&market.id)? {
+        if let Some(existing) = self.store.load(&market.id)? {
             if existing.status == MarketStatus::Closed {
                 let _ = self.db.delete_answers_for_market(&market.id);
-                let _ = self.db.delete_market(&market.id);
+                let _ = self.store.delete(&market.id);
             }
         }
-        self.db.insert_market(&market)?;
+        self.store.insert(&market)?;
 
         let rollback = |market_id: &str| {
             let _ = self.db.delete_answers_for_market(market_id);
-            let _ = self.db.delete_market(market_id);
+            let _ = self.store.delete(market_id);
             let _ = self.registry.unregister(market_id);
         };
 
@@ -399,7 +400,6 @@ impl OnboardingService {
             return Err(error);
         }
 
-        self.cache.upsert(market.clone());
         Ok(market)
     }
 
@@ -617,7 +617,6 @@ async fn get_json(http: &Client, url: &str, query: &[(&str, &str)]) -> AppResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::MarketCache;
     use crate::sieve;
 
     const GOOD_SIEVE: &str = r#"
@@ -682,7 +681,7 @@ mod tests {
     fn service(
         db: Db,
         registry: Arc<EngineRegistry>,
-        cache: Arc<MarketCache>,
+        store: Arc<MarketStore>,
     ) -> OnboardingService {
         OnboardingService {
             ai: LlmClient::for_test(),
@@ -690,8 +689,15 @@ mod tests {
             firecrawl: Arc::new(firecrawl::Client::new("fc-test").expect("test Firecrawl client")),
             db,
             registry,
-            cache,
+            store,
         }
+    }
+
+    /// Builds an isolated database and the store that owns it.
+    fn state() -> (Db, Arc<MarketStore>) {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        (db, store)
     }
 
     #[test]
@@ -799,10 +805,9 @@ mod tests {
 
     #[test]
     fn activate_persists_market_engine_and_cache() {
-        let db = Db::open_in_memory().expect("in-memory DB");
+        let (db, store) = state();
         let registry = Arc::new(EngineRegistry::new());
-        let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
-        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&cache));
+        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&store));
 
         let market = service
             .activate(sample_draft("Market_test"), "thread-1")
@@ -810,8 +815,8 @@ mod tests {
 
         assert_eq!(market.discord_thread_id, "thread-1");
 
-        let stored = db
-            .get_market("Market_test")
+        let stored = store
+            .load("Market_test")
             .expect("read market")
             .expect("market row");
         assert_eq!(stored.discord_thread_id, "thread-1");
@@ -820,19 +825,18 @@ mod tests {
         assert!(registry.contains("Market_test"));
         assert_eq!(registry.len(), 1);
 
-        let cached = cache.get("Market_test").expect("cached market");
+        let cached = store.cached("Market_test").expect("cached market");
         assert_eq!(cached.discord_thread_id, "thread-1");
     }
 
     #[test]
     fn activating_a_duplicate_id_fails_without_touching_the_registry() {
-        let db = Db::open_in_memory().expect("in-memory DB");
+        let (db, store) = state();
         let existing = sample_draft("Market_test");
-        db.insert_market(&existing.market).expect("insert existing");
+        store.insert(&existing.market).expect("insert existing");
 
         let registry = Arc::new(EngineRegistry::new());
-        let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
-        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&cache));
+        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&store));
 
         let error = service
             .activate(sample_draft("Market_test"), "thread-2")
@@ -840,8 +844,8 @@ mod tests {
         assert!(error.to_string().contains("Market_test"), "{error}");
 
         assert!(!registry.contains("Market_test"));
-        let stored = db
-            .get_market("Market_test")
+        let stored = store
+            .load("Market_test")
             .expect("read market")
             .expect("original row");
         assert_eq!(stored.discord_thread_id, "");
@@ -849,14 +853,13 @@ mod tests {
 
     #[test]
     fn activate_replaces_previously_closed_market() {
-        let db = Db::open_in_memory().expect("in-memory DB");
+        let (db, store) = state();
         let mut existing = sample_draft("Market_test");
         existing.market.status = MarketStatus::Closed;
-        db.insert_market(&existing.market).expect("insert existing");
+        store.insert(&existing.market).expect("insert existing");
 
         let registry = Arc::new(EngineRegistry::new());
-        let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
-        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&cache));
+        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&store));
 
         let activated = service
             .activate(sample_draft("Market_test"), "thread-reopened")
@@ -864,8 +867,8 @@ mod tests {
         assert_eq!(activated.discord_thread_id, "thread-reopened");
         assert_eq!(activated.status, MarketStatus::Active);
 
-        let stored = db
-            .get_market("Market_test")
+        let stored = store
+            .load("Market_test")
             .expect("read market")
             .expect("market row");
         assert_eq!(stored.discord_thread_id, "thread-reopened");
@@ -875,16 +878,16 @@ mod tests {
 
     #[test]
     fn activate_replaces_a_previously_untracked_market() {
-        let db = Db::open_in_memory().expect("in-memory DB");
+        let (db, store) = state();
         let existing = sample_draft("Market_test");
-        db.insert_market(&existing.market).expect("insert existing");
-        db.soft_delete_market(&existing.market.id, 1_700_000_900)
-            .expect("soft delete existing");
-        assert!(db.get_market("Market_test").expect("read").is_some());
+        store.insert(&existing.market).expect("insert existing");
+        store
+            .untrack(&existing.market.id, 1_700_000_900)
+            .expect("untrack existing");
+        assert!(store.load("Market_test").expect("read").is_some());
 
         let registry = Arc::new(EngineRegistry::new());
-        let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
-        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&cache));
+        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&store));
 
         let activated = service
             .activate(sample_draft("Market_test"), "thread-retracked")
@@ -892,8 +895,8 @@ mod tests {
         assert_eq!(activated.discord_thread_id, "thread-retracked");
         assert_eq!(activated.status, MarketStatus::Active);
 
-        let stored = db
-            .get_market("Market_test")
+        let stored = store
+            .load("Market_test")
             .expect("read market")
             .expect("market row");
         assert_eq!(stored.status, MarketStatus::Active);
@@ -903,18 +906,20 @@ mod tests {
 
     #[test]
     fn activate_rolls_back_the_market_when_engine_registration_fails() {
-        let db = Db::open_in_memory().expect("in-memory DB");
+        let (db, store) = state();
         let registry = Arc::new(EngineRegistry::new());
-        let cache = Arc::new(MarketCache::load(&db).expect("load cache"));
-        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&cache));
+        let service = service(db.clone(), Arc::clone(&registry), Arc::clone(&store));
 
         let mut draft = sample_draft("Market_bad");
         draft.sieve_source = "not a Sieve program".to_owned();
         draft.market.sieve_source = draft.sieve_source.clone();
 
         assert!(service.activate(draft, "thread-3").is_err());
-        assert!(db.get_market("Market_bad").expect("read").is_none());
+        assert!(store.load("Market_bad").expect("read").is_none());
         assert!(!registry.contains("Market_bad"));
-        assert!(cache.get("Market_bad").is_none());
+        assert!(
+            store.cached("Market_bad").is_none(),
+            "the rolled-back market must leave the cache"
+        );
     }
 }
