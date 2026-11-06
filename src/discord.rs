@@ -26,9 +26,9 @@
 //! finishes its synchronous reads and drops the guard before the next `.await`;
 //! no lock is held across a Discord request.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serenity::all::*;
@@ -39,7 +39,9 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{bail, AppResult, Context as AnyhowContext};
-use crate::onboarding::{OnboardUpdate, OnboardingDraft, OnboardingService, SieveAttempt};
+use crate::onboarding::{
+    OnboardUpdate, OnboardingDraft, OnboardingService, ResearchStep, SieveAttempt,
+};
 use crate::pipeline::{MarketCache, Pipeline, PipelineEvent};
 use crate::sieve::EngineRegistry;
 use crate::trade::{LiquidationOutcome, TradeEvent, TradeExecutor, KILL_SWITCH_KEY};
@@ -84,6 +86,25 @@ const MAX_SIGNAL_LINES: usize = 10;
 /// synthesis attempts, which easily exceeds the 3-second interaction deadline;
 /// the command defers first and reports a timeout followup when hit.
 const ONBOARD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Minimum gap between edits of the `/track` progress message.
+///
+/// Onboarding can produce several updates within one second (a dry run, then a
+/// submit). Discord rate-limits edits per message, so updates are coalesced into
+/// one edit per interval and the newest state always wins.
+const TRACK_EDIT_INTERVAL: Duration = Duration::from_millis(1200);
+
+/// Maximum number of completed research actions kept in the `/track` message.
+const TRACK_MAX_ACTIVITY_LINES: usize = 8;
+
+/// Maximum characters of one research action line.
+const TRACK_MAX_ACTIVITY_CHARS: usize = 110;
+
+/// Space reserved for the latest Sieve attempt when an activity log exists.
+///
+/// The log never eats the whole message: the program and compiler error are the
+/// most useful part of the report, so they keep room for their fences.
+const TRACK_ATTEMPT_RESERVE: usize = 320;
 
 /// Runtime dependencies shared by the gateway handler and event consumers.
 ///
@@ -498,10 +519,7 @@ fn status_for_market(state: &DiscordState, query: &str) -> AppResult<CreateEmbed
     };
 
     let mut embed = CreateEmbed::new()
-        .title(truncate_chars(
-            &market.question,
-            MAX_TITLE_CHARS,
-        ))
+        .title(truncate_chars(&market.question, MAX_TITLE_CHARS))
         .field("ID", &market.id, true)
         .field("Slug", &market.slug, true)
         .field("Status", market.status.as_str(), true)
@@ -653,6 +671,198 @@ fn discord_timestamp(timestamp: i64) -> String {
     format!("<t:{timestamp}:R>")
 }
 
+/// Live state behind the `/track` progress message.
+///
+/// The message is a rolling log instead of a single frame. Every edit renders
+/// the current step, the recent completed actions with their counts, and the
+/// latest Sieve attempt. This keeps the result count of a fast search on
+/// screen instead of overwriting it before the operator can read it.
+struct TrackProgress {
+    started: Instant,
+    activity: VecDeque<String>,
+    current: Option<String>,
+    latest_attempt: Option<SieveAttempt>,
+    searches: usize,
+    results: usize,
+    pages: usize,
+    dry_runs: usize,
+}
+
+impl TrackProgress {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            activity: VecDeque::new(),
+            current: None,
+            latest_attempt: None,
+            searches: 0,
+            results: 0,
+            pages: 0,
+            dry_runs: 0,
+        }
+    }
+
+    /// Folds one update into the report state.
+    fn apply(&mut self, update: OnboardUpdate) {
+        match update {
+            OnboardUpdate::Phase(text) => self.current = Some(text),
+            OnboardUpdate::Activity(step) => {
+                self.current = None;
+                self.record(step);
+            }
+            OnboardUpdate::Sieve(attempt) => {
+                self.current = None;
+                self.latest_attempt = Some(attempt);
+            }
+        }
+    }
+
+    /// Appends one completed research action and updates the counters.
+    fn record(&mut self, step: ResearchStep) {
+        let line = match step {
+            ResearchStep::Search { query, results } => {
+                self.searches += 1;
+                self.results += results;
+                format!(
+                    "web search `{}` → {}",
+                    truncate_chars(&query, 60),
+                    plural(results, "result", "results")
+                )
+            }
+            ResearchStep::Page { url, chars } => {
+                self.pages += 1;
+                format!(
+                    "read page {} → {}",
+                    truncate_chars(&url, 70),
+                    format_char_count(chars)
+                )
+            }
+            ResearchStep::DryRun {
+                matched,
+                total,
+                warnings,
+            } => {
+                self.dry_runs += 1;
+                let warning_text = match warnings {
+                    0 => String::new(),
+                    1 => ", 1 warning".to_owned(),
+                    count => format!(", {count} warnings"),
+                };
+                format!("dry run → {matched}/{total} matched{warning_text}")
+            }
+            ResearchStep::DryRunFailed { error } => {
+                self.dry_runs += 1;
+                format!("dry run failed → {}", truncate_chars(&error, 70))
+            }
+        };
+
+        self.activity
+            .push_back(truncate_chars(&line, TRACK_MAX_ACTIVITY_CHARS));
+        while self.activity.len() > TRACK_MAX_ACTIVITY_LINES {
+            self.activity.pop_front();
+        }
+    }
+
+    /// Renders the whole report within Discord's content limit.
+    fn render(&self) -> String {
+        let mut out = String::from("Tracking market…\n");
+
+        let mut counters = vec![format!(
+            "{} elapsed",
+            format_elapsed(self.started.elapsed())
+        )];
+        if self.searches > 0 {
+            counters.push(plural(self.searches, "search", "searches"));
+            counters.push(plural(self.results, "result", "results"));
+        }
+        if self.pages > 0 {
+            counters.push(plural(self.pages, "page", "pages"));
+        }
+        if self.dry_runs > 0 {
+            counters.push(plural(self.dry_runs, "dry run", "dry runs"));
+        }
+        out.push_str(&counters.join(" · "));
+
+        if let Some(current) = &self.current {
+            out.push_str("\n\n");
+            out.push_str(&truncate_chars(current, TRACK_MAX_ACTIVITY_CHARS * 2));
+        }
+
+        if !self.activity.is_empty() {
+            let reserve = if self.latest_attempt.is_some() {
+                TRACK_ATTEMPT_RESERVE
+            } else {
+                0
+            };
+            let budget = DISCORD_CONTENT_LIMIT
+                .saturating_sub(out.chars().count() + 2)
+                .saturating_sub(reserve);
+
+            // Keep the newest lines that fit; older ones roll off the top.
+            let mut chosen: Vec<&String> = Vec::new();
+            let mut used = 0;
+            for line in self.activity.iter().rev() {
+                let cost = line.chars().count() + 3; // "• " and a newline
+                if used + cost > budget && !chosen.is_empty() {
+                    break;
+                }
+                used += cost;
+                chosen.push(line);
+            }
+            chosen.reverse();
+
+            if !chosen.is_empty() {
+                out.push_str("\n\n");
+                for (index, line) in chosen.into_iter().enumerate() {
+                    if index > 0 {
+                        out.push('\n');
+                    }
+                    out.push_str("• ");
+                    out.push_str(line);
+                }
+            }
+        }
+
+        if let Some(attempt) = &self.latest_attempt {
+            let header = sieve_header(attempt);
+            let budget = DISCORD_CONTENT_LIMIT.saturating_sub(out.chars().count() + 2);
+            out.push_str("\n\n");
+            out.push_str(&sieve_report_within(
+                &header,
+                &attempt.script,
+                attempt.error.as_deref(),
+                budget,
+            ));
+        }
+
+        truncate_chars(&out, DISCORD_CONTENT_LIMIT)
+    }
+}
+
+/// Formats an elapsed duration as `m:ss`.
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// Formats a character count as `830 chars` or `12.4k chars`.
+fn format_char_count(chars: usize) -> String {
+    if chars >= 1000 {
+        format!("{:.1}k chars", chars as f64 / 1000.0)
+    } else {
+        format!("{chars} chars")
+    }
+}
+
+/// Returns `1 search` or `3 searches`.
+fn plural(count: usize, singular: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {many}")
+    }
+}
+
 // -----------------------------------------------------------------------------
 // /track
 // -----------------------------------------------------------------------------
@@ -661,13 +871,12 @@ fn discord_timestamp(timestamp: i64) -> String {
 ///
 /// The heavy Manifold + LLM + Bluesky lookups are wrapped in
 /// [`ONBOARD_TIMEOUT`]. A progress message is posted after deferral so the
-/// operator knows the command is running while the lookups complete. Every
-/// [`OnboardUpdate`] replaces that message the moment it is produced: a phase
-/// line while a slow step runs, and one report per Sieve attempt showing the
-/// program in a code block and, below it, the validation error in a second code
-/// block. A failed synthesis leaves the last attempt on screen under a final
-/// attempt count, so the operator keeps a complete record without waiting for
-/// every try to run first.
+/// operator knows the command is running while the lookups complete. The
+/// message is edited live from every [`OnboardUpdate`]: the current step, a
+/// rolling log of searches and page reads with their result counts, and the
+/// latest Sieve attempt with its program and compiler error. A failed synthesis
+/// leaves the last attempt on screen under a final attempt count, so the
+/// operator keeps a complete record without waiting for every try to run first.
 async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInteraction) {
     let Some(url) = string_option(interaction, "url") else {
         respond_ephemeral(ctx, interaction, "Missing the required `url` option.").await;
@@ -690,7 +899,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
         tracing::error!(error = %error, "failed to defer /track");
         return;
     }
-    let mut progress = match interaction
+    let mut progress_message = match interaction
         .create_followup(
             &ctx.http,
             CreateInteractionResponseFollowup::new()
@@ -705,55 +914,71 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             return;
         }
     };
-    let progress_id = progress.id;
+    let progress_id = progress_message.id;
 
-    // Each update replaces the previous report on the progress message. A
-    // failed attempt is remembered so a failed synthesis can be closed out with
-    // a final attempt count.
-    let (updates_tx, mut updates_rx) = mpsc::channel::<OnboardUpdate>(4);
+    // Every update is folded into one live report: the current step, a rolling
+    // log of completed research actions with their counts, and the latest Sieve
+    // attempt. A failed attempt is remembered so a failed synthesis can be
+    // closed out with the program and its error.
+    let (updates_tx, mut updates_rx) = mpsc::channel::<OnboardUpdate>(16);
     let last_failure = Arc::new(Mutex::new(None));
     let update_ctx = ctx.clone();
     let last_for_update = Arc::clone(&last_failure);
     let updater = tokio::spawn(async move {
+        let mut progress = TrackProgress::new();
         let mut editing = true;
+        let mut last_edit: Option<Instant> = None;
+
         while let Some(update) = updates_rx.recv().await {
-            let content = match update {
-                OnboardUpdate::Phase(text) => text,
-                OnboardUpdate::Sieve(attempt) => {
-                    if attempt.error.is_some() {
-                        if let Ok(mut last) = last_for_update.lock() {
-                            *last = Some(attempt.clone());
-                        }
+            progress.apply(update);
+            // Fold in anything already queued so one edit shows the newest
+            // state instead of spending the rate limit on stale frames.
+            while let Ok(update) = updates_rx.try_recv() {
+                progress.apply(update);
+            }
+
+            if let Some(attempt) = progress.latest_attempt.as_ref() {
+                if attempt.error.is_some() {
+                    if let Ok(mut last) = last_for_update.lock() {
+                        *last = Some(attempt.clone());
                     }
-                    let header = sieve_header(&attempt);
-                    sieve_report(&header, &attempt.script, attempt.error.as_deref())
                 }
-            };
+            }
+
             // An edit failure must not stall onboarding: keep draining the
             // channel so senders never block, and report the first failure once.
             if !editing {
                 continue;
             }
-            if let Err(error) = progress
-                .edit(&update_ctx.http, EditMessage::new().content(content))
+
+            if let Some(previous) = last_edit {
+                let elapsed = previous.elapsed();
+                if elapsed < TRACK_EDIT_INTERVAL {
+                    tokio::time::sleep(TRACK_EDIT_INTERVAL - elapsed).await;
+                    while let Ok(update) = updates_rx.try_recv() {
+                        progress.apply(update);
+                    }
+                }
+            }
+
+            if let Err(error) = progress_message
+                .edit(
+                    &update_ctx.http,
+                    EditMessage::new().content(progress.render()),
+                )
                 .await
             {
-                tracing::warn!(error = %error, "failed to update the /track sieve status message");
+                tracing::warn!(error = %error, "failed to update the /track progress message");
                 editing = false;
+                continue;
             }
+            last_edit = Some(Instant::now());
         }
     });
 
     let result = tokio::time::timeout(
         ONBOARD_TIMEOUT,
-        onboard(
-            state,
-            ctx,
-            &url,
-            budget,
-            initial_prob,
-            updates_tx,
-        ),
+        onboard(state, ctx, &url, budget, initial_prob, updates_tx),
     )
     .await;
     let _ = updater.await;
@@ -850,7 +1075,10 @@ async fn onboard(
     initial_prob: Option<u8>,
     updates: mpsc::Sender<OnboardUpdate>,
 ) -> AppResult<()> {
-    let draft = state.onboarding.prepare(url, budget, initial_prob, &updates).await?;
+    let draft = state
+        .onboarding
+        .prepare(url, budget, initial_prob, &updates)
+        .await?;
 
     if let Some(existing) = state.db.get_market(&draft.market.id)? {
         if existing.status != MarketStatus::Closed {
@@ -988,8 +1216,10 @@ async fn untrack_market(
     }
 
     let positions_msg = match sell_failure {
-        Some(error) => format!(" Untracking continued because liquidation failed: `{error}`. The \
-                                position was not sold; handle it on Manifold directly."),
+        Some(error) => format!(
+            " Untracking continued because liquidation failed: `{error}`. The \
+                                position was not sold; handle it on Manifold directly."
+        ),
         None if liquidate && market.status != MarketStatus::Closed => {
             " Positions were liquidated.".to_owned()
         }
@@ -1310,23 +1540,41 @@ async fn send_followup(ctx: &Context, interaction: &CommandInteraction, content:
 /// Discord's character limit: the script is truncated first, and the error is
 /// bounded too, so both blocks and the closing fences always survive.
 fn sieve_report(header: &str, script: &str, error: Option<&str>) -> String {
+    sieve_report_within(header, script, error, DISCORD_CONTENT_LIMIT)
+}
+
+/// Renders a Sieve report inside `limit` characters.
+///
+/// Used by the live `/track` message, where the activity log and the attempt
+/// share one message. The error is capped first so the fence framing survives
+/// even when the caller has little space left.
+fn sieve_report_within(header: &str, script: &str, error: Option<&str>, limit: usize) -> String {
     const ERROR_LIMIT: usize = 700;
+    const ERROR_FRAMING: usize = "\n\nError\n```text\n\n```".len();
+
     let opening = "```sieve\n";
     let closing = "\n```";
+    let base = header.chars().count() + 1 + opening.chars().count() + closing.chars().count();
+    let minimum = if error.is_some() {
+        base + ERROR_FRAMING
+    } else {
+        base
+    };
+
+    if limit <= minimum {
+        return truncate_chars(&format!("{header}\n{opening}"), limit);
+    }
+
+    let error_budget = limit.saturating_sub(base + ERROR_FRAMING).min(ERROR_LIMIT);
     let suffix = error
         .map(|error| {
             format!(
                 "\n\nError\n```text\n{}\n```",
-                truncate_chars(error, ERROR_LIMIT)
+                truncate_chars(error, error_budget)
             )
         })
         .unwrap_or_default();
-    let overhead: usize = header.chars().count()
-        + 1
-        + opening.chars().count()
-        + closing.chars().count()
-        + suffix.chars().count();
-    let script = truncate_chars(script, DISCORD_CONTENT_LIMIT.saturating_sub(overhead));
+    let script = truncate_chars(script, limit.saturating_sub(base + suffix.chars().count()));
     format!("{header}\n{opening}{script}{closing}{suffix}")
 }
 
@@ -1689,7 +1937,10 @@ async fn consume_pipeline_events(
                 let channel = channel_for_market(&db, &config, Some(&market_id));
 
                 let mut embed = CreateEmbed::new()
-                    .title(truncate_chars(&format!("[SIGNAL] {question}"), MAX_TITLE_CHARS))
+                    .title(truncate_chars(
+                        &format!("[SIGNAL] {question}"),
+                        MAX_TITLE_CHARS,
+                    ))
                     .description(truncate_chars(&text, MAX_DESCRIPTION_CHARS))
                     .field(
                         "Author",
@@ -1914,10 +2165,7 @@ fn onboarded_embed(draft: &OnboardingDraft) -> CreateEmbed {
     let market = &draft.market;
 
     let mut embed = CreateEmbed::new()
-        .title(truncate_chars(
-            &market.question,
-            MAX_TITLE_CHARS,
-        ))
+        .title(truncate_chars(&market.question, MAX_TITLE_CHARS))
         .field(
             "Market",
             if market.market_url.trim().is_empty() {
@@ -2200,14 +2448,9 @@ mod tests {
 
     #[test]
     fn sieve_report_without_error_shows_only_the_script() {
-        let report = sieve_report(
-            "Attempt 3 compiled",
-            "match Market_x { \"launch\" }",
-            None,
-        );
+        let report = sieve_report("Attempt 3 compiled", "match Market_x { \"launch\" }", None);
         assert_eq!(
-            report,
-            "Attempt 3 compiled\n```sieve\nmatch Market_x { \"launch\" }\n```",
+            report, "Attempt 3 compiled\n```sieve\nmatch Market_x { \"launch\" }\n```",
             "report: {report}"
         );
         assert!(!report.contains("Error"));
@@ -2220,7 +2463,10 @@ mod tests {
         let long_error: String = "y".repeat(3000);
         let report = sieve_report("Attempt 1 failed", &long_script, Some(&long_error));
         assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
-        assert!(report.contains('…'), "truncation marker missing in: {report}");
+        assert!(
+            report.contains('…'),
+            "truncation marker missing in: {report}"
+        );
         assert_eq!(report.matches("```").count(), 4, "report: {report}");
         assert!(report.contains("Error\n```text\n"), "report: {report}");
         assert!(report.ends_with("```"), "report: {report}");
@@ -2240,6 +2486,119 @@ mod tests {
             ..failed
         };
         assert_eq!(sieve_header(&compiled), "Attempt 2 compiled");
+    }
+
+    // -- Live /track progress ----------------------------------------------
+
+    #[test]
+    fn track_progress_shows_search_counts_and_recent_actions() {
+        let mut progress = TrackProgress::new();
+        progress.apply(OnboardUpdate::Activity(ResearchStep::Search {
+            query: "trump tariffs".to_owned(),
+            results: 8,
+        }));
+        progress.apply(OnboardUpdate::Activity(ResearchStep::Search {
+            query: "tariff court ruling".to_owned(),
+            results: 0,
+        }));
+        progress.apply(OnboardUpdate::Activity(ResearchStep::Page {
+            url: "https://example.com/story".to_owned(),
+            chars: 12_400,
+        }));
+        progress.apply(OnboardUpdate::Activity(ResearchStep::DryRun {
+            matched: 3,
+            total: 8,
+            warnings: 2,
+        }));
+
+        let report = progress.render();
+        assert!(report.starts_with("Tracking market…\n"), "{report}");
+        assert!(
+            report.contains("2 searches · 8 results · 1 page · 1 dry run"),
+            "{report}"
+        );
+        assert!(
+            report.contains("web search `trump tariffs` → 8 results"),
+            "{report}"
+        );
+        assert!(
+            report.contains("web search `tariff court ruling` → 0 results"),
+            "{report}"
+        );
+        assert!(
+            report.contains("read page https://example.com/story → 12.4k chars"),
+            "{report}"
+        );
+        assert!(
+            report.contains("dry run → 3/8 matched, 2 warnings"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn track_progress_shows_the_running_phase_next_to_history() {
+        let mut progress = TrackProgress::new();
+        progress.apply(OnboardUpdate::Activity(ResearchStep::Search {
+            query: "rates".to_owned(),
+            results: 4,
+        }));
+        progress.apply(OnboardUpdate::Phase(
+            "Researching: reading `https://example.com`…".to_owned(),
+        ));
+
+        let report = progress.render();
+        assert!(report.contains("Researching: reading"), "{report}");
+        assert!(
+            report.contains("web search `rates` → 4 results"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn track_progress_rolls_old_actions_off_the_log() {
+        let mut progress = TrackProgress::new();
+        for index in 0..(TRACK_MAX_ACTIVITY_LINES + 2) {
+            progress.apply(OnboardUpdate::Activity(ResearchStep::Search {
+                query: format!("query-{index}"),
+                results: index,
+            }));
+        }
+
+        let report = progress.render();
+        assert!(!report.contains("query-0"), "{report}");
+        assert!(
+            report.contains(&format!("query-{}", TRACK_MAX_ACTIVITY_LINES + 1)),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn track_progress_keeps_the_attempt_report_within_the_content_limit() {
+        let mut progress = TrackProgress::new();
+        for index in 0..TRACK_MAX_ACTIVITY_LINES {
+            progress.apply(OnboardUpdate::Activity(ResearchStep::Page {
+                url: format!("https://example.com/very/long/path/{index}"),
+                chars: 20_000,
+            }));
+        }
+        progress.apply(OnboardUpdate::Sieve(SieveAttempt {
+            attempt: 4,
+            script: "match Market_x { \"launch\" }".repeat(200),
+            error: Some("unexpected token".repeat(200)),
+        }));
+
+        let report = progress.render();
+        assert!(
+            report.chars().count() <= DISCORD_CONTENT_LIMIT,
+            "{} chars",
+            report.chars().count()
+        );
+        assert!(report.contains("Attempt 4 failed"), "{report}");
+        assert!(report.contains("```sieve"), "{report}");
+        assert!(report.contains("Error\n```text"), "{report}");
+        // The closing fences of both blocks survive the shared budget.
+        assert_eq!(report.matches("```").count(), 4, "{report}");
+        assert!(report.ends_with("```"), "{report}");
     }
 
     #[test]
@@ -2420,19 +2779,13 @@ mod tests {
             Some("DeF456")
         );
         assert_eq!(
-            resolve_market(
-                &markets,
-                "https://manifold.markets/Alice/second-question"
-            )
-            .map(|market| market.id.as_str()),
+            resolve_market(&markets, "https://manifold.markets/Alice/second-question")
+                .map(|market| market.id.as_str()),
             Some("DeF456")
         );
         assert_eq!(
-            resolve_market(
-                &markets,
-                "https://manifold.markets/Alice/second-question/"
-            )
-            .map(|market| market.id.as_str()),
+            resolve_market(&markets, "https://manifold.markets/Alice/second-question/")
+                .map(|market| market.id.as_str()),
             Some("DeF456")
         );
         assert_eq!(
