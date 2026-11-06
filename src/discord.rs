@@ -963,7 +963,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
         tracing::error!(error = %error, "failed to defer /track");
         return;
     }
-    let mut progress_message = match interaction
+    let progress_id = match interaction
         .create_followup(
             &ctx.http,
             CreateInteractionResponseFollowup::new()
@@ -972,13 +972,12 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
         )
         .await
     {
-        Ok(progress) => progress,
+        Ok(progress) => progress.id,
         Err(error) => {
             tracing::error!(error = %error, "failed to send the /track progress message");
             return;
         }
     };
-    let progress_id = progress_message.id;
 
     // Every update is folded into one live report: the current step, a rolling
     // log of completed research actions with their counts, and the latest Sieve
@@ -987,11 +986,17 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
     let (updates_tx, mut updates_rx) = mpsc::channel::<OnboardUpdate>(16);
     let last_failure = Arc::new(Mutex::new(None));
     let update_ctx = ctx.clone();
+    // The progress message is ephemeral. Discord does not keep ephemeral
+    // messages in the channel, so `Message::edit` (a channel-message PATCH)
+    // fails with "Unknown Message". Ephemeral followups can only be edited
+    // through the interaction token, which is what `edit_followup` uses. The
+    // token lives for 15 minutes, longer than [`ONBOARD_TIMEOUT`].
+    let update_interaction = interaction.clone();
     let last_for_update = Arc::clone(&last_failure);
     let updater = tokio::spawn(async move {
         let mut progress = TrackProgress::new();
-        let mut editing = true;
         let mut last_edit: Option<Instant> = None;
+        let mut edit_failures = 0usize;
 
         while let Some(update) = updates_rx.recv().await {
             progress.apply(update);
@@ -1009,12 +1014,6 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
                 }
             }
 
-            // An edit failure must not stall onboarding: keep draining the
-            // channel so senders never block, and report the first failure once.
-            if !editing {
-                continue;
-            }
-
             if let Some(previous) = last_edit {
                 let elapsed = previous.elapsed();
                 if elapsed < TRACK_EDIT_INTERVAL {
@@ -1025,16 +1024,24 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
                 }
             }
 
-            if let Err(error) = progress_message
-                .edit(
+            let content = progress.render();
+            if let Err(error) = update_interaction
+                .edit_followup(
                     &update_ctx.http,
-                    EditMessage::new().content(progress.render()),
+                    progress_id,
+                    CreateInteractionResponseFollowup::new().content(content),
                 )
                 .await
             {
-                tracing::warn!(error = %error, "failed to update the /track progress message");
-                editing = false;
-                continue;
+                // One failed edit must not silence the rest of the run: log the
+                // first failure, keep draining so senders never block, and let
+                // the next update try again.
+                edit_failures += 1;
+                if edit_failures == 1 {
+                    tracing::warn!(error = %error, "failed to update the /track progress message");
+                } else {
+                    tracing::debug!(error = %error, edit_failures, "failed to update the /track progress message");
+                }
             }
             last_edit = Some(Instant::now());
         }
