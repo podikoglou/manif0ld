@@ -353,8 +353,8 @@ evidence judgment. `answers` is present only for multiple-choice markets.
 
 | ID | Type | Result |
 |---|---|---|
-| `is_evidence` | `noul` | p that the post carries genuine evidence |
-| `supports_yes` (binary) / `supported_answer` (MCQ) | `choice` | the favored alternative and its full distribution |
+| `is_evidence` | `noul` | p that the post carries genuine evidence. Binary markets ask about the market question; multiple-choice markets ask **about any of the market's answers**, because the question text there is often a bare title. |
+| `supports_yes` (binary) / `supported_answer` (MCQ) | `choice` | the favored alternative and its full distribution. The MCQ choice set always includes one extra labeled alternative, **"None of the market's answers"**: choosing it means the post bears on no tracked answer and no belief moves (`Target::NoAnswer` is never material). This is what keeps a genuine but unrelated race call from leaking an impulse onto a random answer. |
 | `evidence_strength` | `score` | expected position on the 4-level rubric (0 noise … 3 definitive) |
 | `already_priced` | `noul` | p that the market price already reflects it |
 
@@ -370,6 +370,12 @@ direction  = (p_target - 1/N) / (1 - 1/N)     /  N = number of alternatives
 novelty    = 1 - p_priced
 scale      = p_evidence * direction * novelty * (strength / 3)
 ```
+
+On an MCQ market, `p_target` is renormalized over the tracked answers only:
+mass the model places on the abstain alternative is a "supports no answer"
+judgment, not mass against the chosen alternative, and without the
+renormalization it would flip the direction of the chosen one. Answer mass
+that never names a choice fails the call closed.
 
 A post moves *no* belief when `p_evidence < TRIAGE_MIN_EVIDENCE` (default
 0.7), when `strength < 0.5`, when the direction is a draw (uniform mass), or
@@ -486,14 +492,27 @@ Triggered by `/track url:<url> budget:<mana>`:
 2. **Fetch market:** `GET https://api.manifold.markets/v0/slug/{slug}`. Verify `outcomeType == "BINARY"` and `isResolved == false`. Extract `{id, question, textDescription, resolutionCriteria?, closeTime, probability, url}`. The canonical `url` is persisted as `tracked_markets.market_url` and shown in the ONBOARDED embed; the bare slug cannot reconstruct it because the creator segment is not part of the slug.
 3. **Onboarding research agent:** `ONBOARDING_MODEL` runs as a `rig` agent in
    `onboarding_agent.rs`. The preamble is `SIEVE_SYSTEM_PROMPT` plus the agent
-   instructions, and the model must support tool calling. The agent has three
+   instructions, and the model must support tool calling. The agent has four
    tools:
    - `web_search` — Firecrawl search over web and news (at most 8 results per
      call). The agent uses at most 8 searches.
    - `read_page` — Firecrawl Markdown scrape of one http(s) page, truncated to
      20,000 characters. The agent uses at most 5 page reads.
-   - `submit_sieve` — compiles the submitted program with `sieve::compile` on a
-     blocking thread and returns `ok` or the compiler error.
+   - `dry_run_sieve` — compiles a candidate program on a blocking thread and
+     returns, per sample post, whether it matched, plus the engine's authoring
+     warnings (short literals, vacuous proximity windows). The agent is
+     instructed to test 6–10 sample posts, including off-topic look-alikes
+     (other languages, bots, deal spam) and posts that use a keyword in an
+     unrelated sense, and to narrow any arm that matched an off-topic post.
+   - `submit_sieve` — compiles the submitted program with `sieve::compile` on
+     a blocking thread, and returns `ok` (with any compile warnings) or the
+     root cause of the compiler error.
+
+   The engine rejects constructs that can never match — multi-token literals
+   (use adjacency instead) and case-sensitive `!` literals containing
+   uppercase letters — and warns on literals under 3 characters and
+   proximity windows whose operands share a literal. These surface through
+   both tools, so the agent can converge without a compile-time dead rule.
 
    The agent researches the market topic for names, aliases, tickers, people,
    organizations, and events that Bluesky posts would use. The research feeds
@@ -546,18 +565,23 @@ Triggered by `/track url:<url> budget:<mana>`:
 
 ## 7. Sieve DSL Reference (for onboarding LLM)
 
-Embed the following verbatim in `onboarding.rs` as `SIEVE_SYSTEM_PROMPT`; `onboarding_agent.rs` appends its agent instructions to it at run time. Note that lexical normalization (case folding, NFKC, leetspeak expansion, word-boundary handling) is the *engine's* job — the DSL below describes what Sieve does with each literal, not what our pipeline does.
+Embed the following verbatim in `onboarding.rs` as `SIEVE_SYSTEM_PROMPT`; `onboarding_agent.rs` appends its agent instructions to it at run time. Word content is matched verbatim apart from ASCII case folding; the engine's tokenizer, normalization, and word-boundary behavior are all described in the prompt itself, and must stay in sync with the engine.
 
 ```
 You are an expert filtration engineer writing a program in the Sieve DSL.
-Sieve is a declarative, zero-backtracking O(N) DSL that compiles into a SIMD
-Lookup Table, a Double-Array Aho-Corasick trie, and 64-bit Glushkov Shift-AND
-proximity state words.
+Sieve is a declarative, zero-backtracking O(N) DSL that compiles into an
+Aho-Corasick trie over case-folded tokens and native compiled proximity
+state machines.
 
-### 1. LEXICAL DEFAULTS (handled internally by the Sieve engine)
+### 1. LEXICAL FACTS (handled internally by the Sieve engine)
 - Case-Insensitive: "launch" matches "Launch", "LAUNCH".
-- Unicode Normalized: input is NFKC-normalized, zero-width joiners stripped.
-- Implicit Word Boundaries: "bot" matches "a bot!", "#bot", but NOT "robot".
+- A token is a contiguous run of ASCII letters, digits, and underscores.
+  Accented characters END a token: "após" tokenizes as "ap" + "s". This is
+  why short literals are dangerous: a 2-letter token in a Romance-language
+  post is almost always a fragment of a longer word.
+- Implicit word boundaries: "bot" matches "a bot!", "#bot", but NOT "robot".
+- Word content is matched verbatim apart from case folding. There is NO
+  Unicode normalization of word content.
 
 ### 2. LITERAL MODIFIERS
 - "word"    : exact token (case-insensitive)
@@ -565,12 +589,12 @@ proximity state words.
 - "word"~   : leetspeak/obfuscation normalization (@/4→a, 3→e, 1/!→i, 0→o, $/5→s, s.c.a.m→scam)
 - "word"*   : prefix wildcard ("gpt5"* matches "gpt5turbo")
 - *"word"   : suffix wildcard (*"coin" matches "bitcoin", "memecoin")
-- "word"!   : case-sensitive exact match (use on short acronyms: "API"!, "SEC"!, "AGI"!)
 - Chainable: *"coin"+~ = suffix + morphology + leetspeak
+- The case-sensitive `!` modifier is NOT supported. Do not use it.
 
 ### 3. COMBINATORS
 - A | B      : OR
-- A B        : adjacent sequence
+- A B        : adjacent sequence (ordered, distance 1)
 - A ..N B    : ordered proximity (≤ N intervening tokens, 1≤N≤16)
 - A &..N B   : unordered proximity window (1≤N≤16)
 - A & B      : document co-occurrence
@@ -589,17 +613,45 @@ seq_expr    = term { [ prox_op ] term } ;
 prox_op     = ".." INT | "&.." INT ;
 term        = literal | "@" IDENT | "(" expr ")" ;
 literal     = [ "*" ] STRING { modifier } ;
-modifier    = "+" | "~" | "*" | "!" ;
+modifier    = "+" | "~" | "*" ;
 
-### 5. DESIGN REQUIREMENTS FOR THIS USE CASE
+### 5. CONSTRUCTS THE COMPILER REJECTS
+1. A quoted literal containing a space fails to compile ("Donald Trump"),
+   because a pattern may not span tokens. Write phrases with adjacency:
+   "donald" "trump", or use a single distinctive token ("trump").
+2. A case-sensitive `!` literal containing uppercase letters ("SEC"!) fails
+   to compile: patterns are scanned on the case-folded stream. Drop `!`.
+
+### 6. WRITING RULES THAT DO NOT MISFIRE
+1. `&..N` and `..N` bind TIGHTER than `|`. Parenthesize the group a window
+   applies to: ("associated" "press" | "ap" | "reuters") &..8 ("call"+ | "win"+).
+   Written without the parentheses, only the last alternative is constrained
+   and the others match standalone.
+2. Never include the anchor token in its own context set. `"midterms" &..8
+   @terms` is vacuous when @terms contains "midterm"+: the same occurrence
+   satisfies the window at distance 0.
+3. Never rely on a 1-2 character token ("AP", "US", "FF") without a tight
+   proximity window, and never attach `+` to one. Wire-service abbreviations
+   need context: ("ap" | "associated" "press" | "nbc") &..6 ("call"+ |
+   "projection"+ | "race" | "win"+).
+4. Name people by their distinctive surname ("talarico"), or as an
+   adjacency phrase ("mary" "peltola"). Common first names alone match
+   the wrong people.
+5. The `-` exception guard is document-wide: only subtract RARE words
+   (airdrop, memecoin, fanfic), never common words like "job" or "call".
+6. Prefer verbs/events with strong signalling value ("call"+, "win"+,
+   "projection"+) over bare topic nouns.
+
+### 7. DESIGN REQUIREMENTS FOR THIS USE CASE
 1. Every @macro ends with ';'. The final `match Market_<id> { ... }` has no ';'.
 2. Polysemy guard: never match ambiguous nouns (e.g., "apple", "orion") standalone;
    always bind to a domain context via `(@codenames &..8 @domain_context)`.
 3. This rule's ONLY job is topical filtering — matching posts plausibly related to
-   the market. Direction (YES vs NO) is determined by a downstream LLM, so DO NOT
+   the market. Direction (YES vs NO) is determined by a downstream model, so DO NOT
    try to encode direction. Match both supportive and skeptical posts equally.
-4. Always include a `- @noise` exception at the end of the match block to subtract
-   crypto airdrops, memecoins, job postings, and fanfiction.
+4. Always include a `- @noise` exception at the end of the match block to
+   subtract rare noise words (airdrop/memecoin promo, giveaway spam,
+   fanfiction tags).
 ```
 
 ## 8. Implementation Milestones
