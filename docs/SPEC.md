@@ -4,7 +4,7 @@
 
 ## 1. Purpose & Invariants
 
-1. **Filter-first.** Sieve + one small LLM call per surviving post is the product. If the filter works, the bot works.
+1. **Filter-first.** Sieve + one decision-model call per surviving post is the product. If the filter works, the bot works.
 2. **Auto-trading is in scope, but simple.** Market buys only. Enter once per market per direction on strong edge, exit once on edge decay. No limit orders, no partial scaling, no stop-loss regimes.
 3. **Per-market isolated budgets.** Each market has `budget_mana`. Never invest more than `budget_mana` net in a market. Realized profits cycle back into that market's available budget only.
 4. **No autonomous market discovery.** Markets only enter via operator `/track`.
@@ -20,10 +20,10 @@ Jetstream WS ──► post extractor ──► EngineRegistry (N markets, N Com
                                           ├─ per-market Sieve match
                                           ▼
                                     Triage queue (bounded per market)
-                                          │  gemini-3.5-flash-lite via CF AI Gateway
+                                          │  baseten/joey-1 via OpenRouter decisions
                                           ▼
-                                    {material, direction, strength}
-                                          │  if material
+                                    {p_evidence, p_target, strength, p_priced}
+                                          │  assess() → impulse scale if material
                                           ▼
                                     Belief update (log-odds w/ time decay)
                                           │
@@ -34,7 +34,7 @@ Jetstream WS ──► post extractor ──► EngineRegistry (N markets, N Com
                                     Discord thread notification
 ```
 
-**Flow per post:** extract → loop 5 Sieve engines → if match, enqueue → single LLM call → belief update → trade check.
+**Flow per post:** extract → loop 5 Sieve engines → if match, enqueue → single decisions call → belief update → trade check.
 
 **Single binary, single tokio runtime, single process.** No worker threads for Sieve (in-process, ~microseconds), no batching (LLM calls are ~1/s at most), no separate services.
 
@@ -58,7 +58,7 @@ bsky-manifold-arb/
     ├── extract.rs       # Jetstream event → ExtractedPost (structural extraction only)
     ├── ingest.rs        # Jetstream websocket, reconnect, cursor persistence
     ├── sieve.rs         # EngineRegistry + per-market CompiledSieve wrapper
-    ├── triage.rs        # CF AI Gateway client, LLM triage call
+    ├── triage.rs        # OpenRouter decisions call, question wording, impulse fold
     ├── belief.rs        # log-odds state, decay, impulse
     ├── trade.rs         # Manifold client, Kelly sizing, order manager
     ├── onboarding.rs    # fetch market, prepare/activate a draft
@@ -83,8 +83,13 @@ JETSTREAM_URL=wss://jetstream2.us-east.bsky.network/subscribe
 CF_AI_GATEWAY_URL=https://gateway.ai.cloudflare.com/v1/{account_id}
 CF_AI_GATEWAY_ID=manif0ld
 CF_API_KEY=...
-TRIAGE_MODEL=@cf/google/gemini-3.5-flash-lite          # verify exact identifier
-ONBOARDING_MODEL=@cf/deepseek/deepseek-v4.1-flash-1017 # verify exact identifier
+
+# OpenRouter
+# The same key serves triage (decisions endpoint) and an openrouter/ chat model.
+OPENROUTER_API_KEY=...
+TRIAGE_MODEL=openrouter-decisions/baseten/joey-1       # decision model
+ONBOARDING_MODEL=@cf/deepseek/deepseek-v4.1-flash-1017 # chat model, tool calling
+TRIAGE_MIN_EVIDENCE=0.7                                # probability of evidence gate
 
 # Manifold
 MANIFOLD_API_KEY=...
@@ -111,23 +116,24 @@ BELIEF_HALFLIFE_HOURS=4.0
 DB_PATH=./data/arb.db
 ```
 
-**Note on the Cloudflare call.** The triage client uses the Workers AI REST
-endpoint with the AI Gateway header:
+**Note on the transport.** Triage never calls a chat endpoint. The decisions
+call is:
 
 ```
-POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run
-Authorization: Bearer {CF_API_KEY}
-cf-aig-gateway-id: {CF_AI_GATEWAY_ID}
+POST https://openrouter.ai/api/alpha/decisions
+Authorization: Bearer {OPENROUTER_API_KEY}
 Content-Type: application/json
 
-{"model": "{TRIAGE_MODEL}", "input": {"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]}}
+{"model": "baseten/joey-1",
+ "state": {...},
+ "questions": {"is_evidence": {"type": "noul", ...}, ...}}
 ```
 
-The account ID is the last path segment of `CF_AI_GATEWAY_URL`. Confirm the
-exact model strings that the account accepts before going live. If a model is
-only available through the OpenAI-compatible route
-(`/ai/v1/chat/completions`), change the client to that route and use the
-OpenAI chat-completions body shape.
+The reply is `{"answers": {"<id>": {"type": "noul"|"choice"|"score", ...}},
+"usage": {"input_tokens", "output_tokens", "cost"}}`. Onboarding still goes
+through a chat model; when that model is Cloudflare, the call is
+`POST /accounts/{account_id}/ai/run` with the `cf-aig-gateway-id` header, as
+before.
 
 ## 5. Data Model (SQLite)
 
@@ -161,10 +167,14 @@ CREATE TABLE signal_ledger (
   author_handle  TEXT NOT NULL,
   post_text      TEXT NOT NULL,
   material       INTEGER NOT NULL,
-  direction      TEXT NOT NULL,          -- 'strong_yes'|'yes'|'neutral'|'no'|'strong_no'
-  strength       INTEGER NOT NULL,       -- 0..3
+  direction      TEXT NOT NULL,          -- display bucket derived from impulse
+  strength       INTEGER NOT NULL,       -- rounded expected rubric position
   impulse        REAL NOT NULL,          -- applied log-odds delta
   p_after        REAL NOT NULL,
+  p_evidence     REAL,                   -- p the post carried evidence
+  p_target       REAL,                   -- mass on the favored alternative
+  strength_real  REAL,                   -- expected rubric position, 0..3
+  p_priced       REAL,                   -- p the market already knew this
   created_at     INTEGER NOT NULL
 );
 
@@ -313,39 +323,69 @@ impl EngineRegistry {
 - The matching loop reads from `RwLock` and calls `.matches(text).is_empty()` per engine. 5 engines × ~1000 posts/s = 5000 `.matches()` calls/s. Trivial for Sieve.
 - Hot-swap on `/track`, `/untrack` = insert/remove from the map. `std::sync::RwLock` is fine at this scale.
 
-### 6.4 LLM Triage (`triage.rs`)
+### 6.4 Decision Model Triage (`triage.rs`)
 
-One call per matched post. No batching, no tiering.
+One decisions call per matched post. No batching, no tiering.
 
-**Prompt:**
+Triage is a **System One / decision model** (`baseten/joey-1` via OpenRouter),
+not a chat model. It never generates text. It reads a `state` object and four
+typed questions in one forward pass, and returns calibrated probabilities.
+OpenRouter serves this on `POST /api/alpha/decisions`; the crate calls it
+through the vendored `rig::typesafeai` surface with
+`TRIAGE_MODEL=openrouter-decisions/baseten/joey-1`.
 
-```
-System: You evaluate Bluesky posts as signal for a prediction market.
+**State (shared by all questions):**
 
-User:
-Market question: {question}
-Resolution criteria: {resolution_criteria}
-Market description: {description}
-Market close time: {close_time_iso}
-Current market probability: {p_market:.2}
-
-Bluesky post:
-Author: @{handle} ({followers} followers)
-Posted: {post_time_iso}
-Text: {text}
-
-Evaluate this post. Respond as JSON only:
+```json
 {
-  "material": true if the post contains genuine evidence, news, or insider commentary that should shift a rational trader's probability; false if it is a coincidence match, joke, spam, or off-topic,
-  "direction": one of "strong_yes" | "yes" | "neutral" | "no" | "strong_no",
-  "strength": integer 0-3 where 0=noise, 1=weak circumstantial, 2=strong secondary evidence, 3=definitive proof,
-  "rationale": one sentence
+  "market": {"question": "...", "resolution_criteria": "...",
+              "close_time": "RFC 3339 or unknown", "market_probability": 0.63},
+  "post":   {"author_handle": "@x", "author_followers": 1234,
+              "posted_at": "RFC 3339", "text": "..."},
+  "answers": [{"text": "...", "market_probability": 0.25}]
 }
 ```
 
-**Threshold:** Post is *material* if `material == true` **and** `direction != "neutral"` **and** `strength >= 1`. Otherwise logged, ignored.
+`market.description` is deliberately absent: it is long and it sways the
+evidence judgment. `answers` is present only for multiple-choice markets.
 
-**Rate limit:** Bound the per-market triage queue at 30 in-flight. If a market is queue-saturated, drop oldest and log `warn!`. Surface this count in `/status` per market.
+**Questions:**
+
+| ID | Type | Result |
+|---|---|---|
+| `is_evidence` | `noul` | p that the post carries genuine evidence |
+| `supports_yes` (binary) / `supported_answer` (MCQ) | `choice` | the favored alternative and its full distribution |
+| `evidence_strength` | `score` | expected position on the 4-level rubric (0 noise … 3 definitive) |
+| `already_priced` | `noul` | p that the market price already reflects it |
+
+JSON parsing is gone by design. A missing question key, an unknown answer
+type, or a non-finite probability fails the call, and a triage failure leaves
+belief untouched.
+
+**From probabilities to an impulse:** `assess()` folds them into one signed
+scale in `[-1, 1]`:
+
+```
+direction  = (p_target - 1/N) / (1 - 1/N)     /  N = number of alternatives
+novelty    = 1 - p_priced
+scale      = p_evidence * direction * novelty * (strength / 3)
+```
+
+A post moves *no* belief when `p_evidence < TRIAGE_MIN_EVIDENCE` (default
+0.7), when `strength < 0.5`, when the direction is a draw (uniform mass), or
+when the fold lands inside `0.01`. Direction and strength in the signal
+ledger are display buckets derived from the scale, never inputs to belief
+arithmetic.
+
+**Threshold:** `TRIAGE_MIN_EVIDENCE` is the only knob. Log
+`p_evidence`, `p_target`, `strength_real` and `p_priced` per post
+(`signal_ledger` columns) so the threshold can be tuned against resolution
+outcomes later.
+
+**Rate limit:** Bound the per-market triage queue at 30 in-flight. If a market
+is queue-saturated, drop oldest and log `warn!`. Surface this count in
+`/status` per market. A decisions call times out after 10 seconds and sends
+again on the queue's next turn; nothing is retried inside the call.
 
 ### 6.5 Belief Engine (`belief.rs`)
 
@@ -366,24 +406,21 @@ pub fn current_p_internal(
     (1.0 / (1.0 + (-l).exp())).clamp(0.01, 0.99)
 }
 
-pub fn apply_post(
+pub fn apply_scaled(
     l_stored: &mut f64,
     belief_updated_at: &mut i64,
-    direction: Direction,   // maps to ±1.0, ±0.5, 0.0
-    strength: u8,           // 0..3
+    impulse_scale: f64,     // [-1, 1], from triage::assess
     p_market_now: f64,
     now: i64,
+    kappa: f64,
+    halflife_hours: f64,
 ) {
-    let l_market = (p_market_now / (1.0 - p_market_now)).ln();
-    // (implementation: decay l_stored toward l_market first using
-    //  current_p_internal, then add impulse)
-    let impulse = BELIEF_KAPPA * direction.polarity() * (strength as f64 / 3.0);
-    *l_stored = (l_stored.clamp(-4.595, 4.595) + impulse).clamp(-4.595, 4.595);
+    let decayed = decayed_log_odds(*l_stored, *belief_updated_at, p_market_now, now, halflife_hours);
+    let impulse = kappa * impulse_scale;
+    *l_stored = (decayed + impulse).clamp(-4.595, 4.595);
     *belief_updated_at = now;
 }
 ```
-
-**Direction mapping:** `strong_yes=+1.0, yes=+0.5, neutral=0.0, no=-0.5, strong_no=-1.0`.
 
 **Decay behavior:** Belief pulls toward the *current market price* with a 4-hour half-life. If the market catches up to the bot's belief → edge disappears → trade exits via edge-decay rule. If the bot was wrong and the market moves away → belief also pulls toward the market → trade exits. This is the only stop-loss mechanism. It's simple, automatic, and hard to get wrong.
 
@@ -493,7 +530,7 @@ Triggered by `/track url:<url> budget:<mana>`:
 **Embeds emitted into threads:**
 
 1. `[ONBOARDED]` — market question, link, budget, initial `P_market`, Sieve source block.
-2. `[SIGNAL]` — author handle + followers, link to Bluesky post, direction, strength, rationale, `P_internal` before → after.
+2. `[SIGNAL]` — author handle + followers, link to Bluesky post, answer (MCQ), evidence / direction / strength / priced probabilities, `P_internal` before → after.
 3. `[TRADE]` — action (BUY_YES / SELL_YES / etc.), amount, shares delta, `P_internal` vs `P_market`, remaining available budget.
 4. `[ERROR]` — any trade rejection, Manifold API error, LLM call failure, or rate-limit breach.
 

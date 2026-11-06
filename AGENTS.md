@@ -21,8 +21,8 @@ and API contracts.
   + image alts + quoted text). Never lowercase, strip, NFKC, or leet-expand
   there — the Sieve engine normalizes internally. Text that must be matched
   differently changes in the Sieve rule, not in `extract.rs`.
-- **Filter-first.** One LLM call per surviving post; the pipeline exists to
-  make that call rare.
+- **Filter-first.** One decision-model call per surviving post; the pipeline
+  exists to make that call rare.
 - **Onboarding is a rig agent.** It researches with Firecrawl and submits Sieve
   programs through a tool. Do not reintroduce a fixed attempt loop.
 - **Per-market isolated budgets.** `available_budget = budget + realized_pnl
@@ -34,6 +34,11 @@ and API contracts.
   not the legacy gateway/compat route (see `docs/SPEC.md` §4 and §6.4). Never
   replace that provider with a hand-rolled client; patch the `rig/` vendor if
   the wire must change.
+- **Triage is a decision model, not a chat model.** It goes through
+  `rig::typesafeai` to OpenRouter's `POST /api/alpha/decisions`
+  (`TRIAGE_MODEL=openrouter-decisions/...`), in-process, with the question
+  wording in `src/triage.rs` only. Do not route it through chat completions
+  or add a second HTTP client beside the vendored `rig`.
 - **Position truth = Manifold `/positions`**, and the bot user ID comes from
   `/v0/me` — there is no bot-user env var (`docs/SPEC.md` §4 and §6.6).
 
