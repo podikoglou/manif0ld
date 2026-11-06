@@ -5713,6 +5713,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "tracing-futures",
 ]
@@ -5755,6 +5756,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "web-time",

@@ -29,6 +29,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
+# Tests build a scripted rig model, which `test-utils` provides. The feature is
+# dev-only, so release builds do not carry it.
+[dev-dependencies]
+rig = { path = "rig", default-features = false, features = ["reqwest", "rustls", "agent", "typesafeai", "test-utils"] }
+
 [workspace]
 members = ["sieve"]
 # `rig` is its own workspace (vendored); Cargo must treat it as an external
