@@ -430,7 +430,7 @@ pub fn apply_scaled(
 
 **Decay behavior:** Belief pulls toward the *current market price* with a 4-hour half-life. If the market catches up to the bot's belief → edge disappears → trade exits via edge-decay rule. If the bot was wrong and the market moves away → belief also pulls toward the market → trade exits. This is the only stop-loss mechanism. It's simple, automatic, and hard to get wrong.
 
-**Manual override:** `/override market probability:X` sets `p_internal_log_odds = logit(X)` and updates `belief_updated_at = now`.
+**Manual override:** `/override market probability:X` sets `p_internal_log_odds = logit(X)` and updates `belief_updated_at = now`. It does not write `p_market_last`: that column is written by the trade sync only, never by triage or override.
 
 ### 6.6 Trade Execution (`trade.rs`)
 

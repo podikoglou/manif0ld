@@ -31,7 +31,7 @@ flowchart LR
     subgraph SHARED["Shared Arc state, no single owner"]
         CFG["Config"]
         DB[("Db<br/>Arc Mutex Connection")]
-        CACHE["MarketCache<br/>RwLock HashMap"]
+        STORE["MarketStore<br/>Db + RwLock HashMap"]
         REG["EngineRegistry<br/>RwLock HashMap"]
         PIPE["Pipeline<br/>queues + event sender"]
         EXEC["TradeExecutor<br/>execution_lock + event sender"]
@@ -41,23 +41,23 @@ flowchart LR
     JS -->|"commit/create"| T_ING
     T_ING -->|"broadcast ExtractedPost<br/>cap 1024"| T_PIPE
     T_PIPE -->|"matching_markets(text)"| REG
-    T_PIPE -->|"cache.get(id), Active check"| CACHE
+    T_PIPE -->|"cached(id), Active check"| STORE
     T_PIPE -->|"TriageJob<br/>broadcast cap 30 per market"| T_WORK
     T_WORK -->|"evaluate()"| CF
-    T_WORK -->|"update_belief, insert_signal"| DB
-    T_WORK -->|"record_belief"| CACHE
+    T_WORK -->|"insert_signal"| DB
+    T_WORK -->|"record_belief"| STORE
     T_WORK -->|"broadcast PipelineEvent<br/>cap 1024"| T_TRADE
     T_WORK -->|"PipelineEvent"| T_DPC
     T_WORK -->|"PipelineEvent"| T_LOG
     T_TRADE -->|"material Signal, 60 s tick"| EXEC
     EXEC <-->|"HTTPS"| MA
-    EXEC -->|"insert_trade, update_position"| DB
-    EXEC -->|"upsert"| CACHE
+    EXEC -->|"insert_trade"| DB
+    EXEC -->|"record_position,<br/>record_price"| STORE
     EXEC -->|"broadcast TradeEvent"| T_DTC
     T_DISC <-->|"slash commands, buttons"| DAPI
     T_DISC -->|"/track prepare/activate"| ONB
-    T_DISC -->|"/status, /budget, /untrack,<br/>/override, /panic, buttons"| DB
-    T_DISC -->|"cache upsert/remove"| CACHE
+    T_DISC -->|"/status, /panic kv,<br/>answers"| DB
+    T_DISC -->|"record_budget, record_belief,<br/>record_status, close, untrack"| STORE
     T_DISC -->|"register/unregister"| REG
     T_DISC -->|"evaluate_market, liquidate"| EXEC
     T_DPC -->|"SIGNAL, ERROR embeds"| DAPI
@@ -98,7 +98,8 @@ flowchart BT
     SIEVE["sieve.rs<br/>EngineRegistry"]
     BEL["belief.rs<br/>pure math"]
     TRIAGE["triage.rs<br/>LlmClient + TriageClient<br/>+ prompt + parser"]
-    PIPE["pipeline.rs<br/>Pipeline + MarketCache<br/>+ PipelineEvent"]
+    STORE["market_store.rs<br/>MarketStore<br/>single writer of tracked_markets"]
+    PIPE["pipeline.rs<br/>Pipeline + PipelineEvent"]
     TRADE["trade.rs<br/>ManifoldClient + TradeExecutor<br/>+ TradeEvent"]
     ONB["onboarding.rs<br/>prepare + activate"]
     AGENT["onboarding_agent.rs<br/>rig agent + Firecrawl tools"]
@@ -118,23 +119,28 @@ flowchart BT
     TRIAGE --> CFG
     TRIAGE --> TYPES
     TRIAGE --> ERR
+    STORE --> DB
+    STORE --> ERR
+    STORE --> TYPES
     PIPE --> BEL
     PIPE --> CFG
     PIPE --> DB
     PIPE --> SIEVE
+    PIPE --> STORE
     PIPE --> TRIAGE
     PIPE --> TYPES
     TRADE --> BEL
     TRADE --> CFG
     TRADE --> DB
+    TRADE --> STORE
     TRADE --> TYPES
-    TRADE -->|"MarketCache,<br/>PipelineEvent"| PIPE
+    TRADE -->|"PipelineEvent"| PIPE
     ONB --> BEL
     ONB --> CFG
     ONB --> DB
     ONB --> SIEVE
+    ONB --> STORE
     ONB --> TYPES
-    ONB -->|"MarketCache"| PIPE
     ONB -->|"LlmClient,<br/>json helpers"| TRIAGE
     ONB -->|"delegates the run"| AGENT
     AGENT -->|"model, prompt,<br/>OnboardUpdate"| ONB
@@ -149,6 +155,7 @@ flowchart BT
     DISCORD --> ONB
     DISCORD --> PIPE
     DISCORD --> SIEVE
+    DISCORD --> STORE
     DISCORD --> TRADE
     DISCORD --> TYPES
     MAIN --> ALL
@@ -159,13 +166,12 @@ flowchart BT
 1. **No module cycles.** The graph is acyclic. `pipeline` does not import `trade`,
    and `trade` does not import `discord`. This is good news: you can split modules
    without breaking a cycle.
-2. **`pipeline.rs` is three modules in one file.** It contains:
-   - `MarketCache` — a state store used by `trade`, `onboarding`, `discord`, `main`.
-   - `Pipeline` — orchestration and per-market queues.
-   - `PipelineEvent` — the event API used by `trade`, `discord`, `main`.
-
-   That is why `trade.rs` and `onboarding.rs` import `pipeline`. They want a cache
-   and an event type, not the orchestration.
+2. **`pipeline.rs` used to hold a third module.** `MarketCache` lived there and
+   was used by `trade`, `onboarding`, `discord`, and `main`, which is why those
+   modules imported `pipeline`. Market state now lives in `market_store.rs`, so
+   `pipeline.rs` is only `Pipeline` (orchestration and per-market queues) plus
+   `PipelineEvent`. `trade.rs` and `onboarding.rs` still import `pipeline` for the
+   event type and nothing else.
 3. **`trade.rs` has two entry points.** It consumes `PipelineEvent` in `run()` and
    exposes `evaluate_market()`, `sync_market()`, `liquidate()`, `liquidate_all()`
    directly to Discord. It is both a subscriber and a service.
@@ -176,8 +182,8 @@ flowchart BT
    agent owns the tools and imports the prompt, market type, and progress events
    from the service. The import edge goes both ways, but it is one workflow, not
    two features.
-5. **`discord.rs` has the widest fan-in** (7 internal modules). Every command
-   handler orchestrates DB + cache + registry + trade + onboarding by hand.
+5. **`discord.rs` has the widest fan-in** (8 internal modules). Every command
+   handler orchestrates store + DB + registry + trade + onboarding by hand.
 6. **`types.rs` is a shared kernel.** All modules depend on it, and it contains both
    pure domain values (`TrackedMarket`, `Direction`) and workflow payloads
    (`TriageResult`, `TradeDecision`, `SignalRecord`). This is acceptable, but a
@@ -188,33 +194,54 @@ flowchart BT
 ## 3. State ownership and sources of truth
 
 This is the most important section for restructuring. Several facts live in
-**two or three places at once**.
+**two or three places at once**: the row, a snapshot of it, and sometimes a
+third store such as `EngineRegistry` or Manifold itself.
 
 | Fact | Authoritative store | Mirrors | Writers | Readers |
 |---|---|---|---|---|
-| Market lifecycle `status` | `tracked_markets.status` | `MarketCache` entry | onboarding.activate, `/budget`, `/override`, Pause button, `/untrack`, Liquidate button, trade.persist_market | dispatch, trade, `/status`, autocomplete |
+| Market lifecycle `status` | `tracked_markets.status` | `MarketStore` snapshot | `record_status` (Pause/Resume), `close` (Liquidate), `untrack` (`/untrack`), `insert` (onboarding) | dispatch, trade, `/status`, autocomplete |
 | Presence of a Sieve engine | `EngineRegistry` map | none | `main` startup, onboarding.activate, `/untrack`, Liquidate button | dispatch |
 | Compiled rule text | `tracked_markets.sieve_source` | none | onboarding.activate | `/status` embed |
-| Budget / invested / PnL / shares | `tracked_markets` | `MarketCache` | trade (position), `/budget`, onboarding | trade, `/status` |
-| Belief `p_internal_log_odds`, `belief_updated_at` | `tracked_markets` and `market_answers` | `MarketCache` (market only) | pipeline worker, `/override`, onboarding | pipeline, trade, `/status` |
-| Market price `p_market_last` | Manifold `/v0/market` | `tracked_markets` + cache | trade.sync / evaluate | triage prompt, trade, `/status` |
+| Budget `budget_mana` | `tracked_markets` | `MarketStore` | `record_budget` (`/budget`), `insert` | trade, `/status` |
+| Position `invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares` | `tracked_markets` | `MarketStore` | `record_position` (trade only) | trade, `/status` |
+| Belief `p_internal_log_odds`, `belief_updated_at` | `tracked_markets` and `market_answers` | `MarketStore` (market only) | `record_belief` (pipeline, `/override`), `insert` | pipeline, trade, `/status` |
+| Market price `p_market_last` | Manifold `/v0/market` | `tracked_markets` + `MarketStore` | `record_price` (trade sync only) | triage prompt, trade, `/status` |
+| Market kind `outcome_type`, `should_answers_sum_to_one` | `tracked_markets` | `MarketStore` | `record_kind` (trade sync) | trade, `/status` |
 | Position truth | Manifold `/v0/market/{id}/positions` | local shares + invested | trade.reconcile | trade, `/status` |
 | Global kill switch | `kv.global_kill_switch` | none | `/panic` | trade.evaluate_market |
 | Signal history | `signal_ledger` | none | pipeline worker | `/status` |
 | Trade history | `trade_ledger` | none | trade | `/status` |
-| Discord thread per market | `tracked_markets.discord_thread_id` | none | onboarding.activate (via `/track`) | embed consumers, `/untrack`, Liquidate |
+| Discord thread per market | `tracked_markets.discord_thread_id` | `MarketStore` | onboarding.activate (via `/track`) | embed consumers, `/untrack`, Liquidate |
 | In-flight triage count | `QueueDepth` AtomicUsize | none | pipeline enqueue/dequeue | `/status` |
+
+### One writer per column group
+
+`Db` has no market methods at all. Every read and write of `tracked_markets`
+goes through `MarketStore`, which exposes one intent per column group
+(`record_belief`, `record_price`, `record_position`, `record_status`,
+`record_budget`, `record_kind`) plus the lifecycle transitions (`insert`,
+`close`, `untrack`, `delete`). Each intent writes SQLite first and then patches
+only its own fields in the snapshot; if the row write fails, the snapshot is
+left untouched.
+
+Belief and price are separate intents on purpose. Decay reads the current price
+as a parameter, so a newer price next to an older `belief_updated_at` is the
+intended model. A writer that carried both groups could revert a belief (or a
+pause) from a snapshot taken before an HTTP call. The pipeline and `/override`
+therefore never touch `p_market_last`; the 60-second trade sync is its only
+writer.
+
 
 ### Lifecycle state machine (three stores must agree)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: /track activate<br/>DB insert + registry register<br/>+ cache upsert + thread
-    Active --> Paused: Pause button<br/>DB status + cache only<br/>engine stays registered
-    Paused --> Active: Resume button<br/>DB status + cache only
-    Active --> Closed: Liquidate button<br/>sell + DB CLOSED<br/>+ unregister + cache remove
+    [*] --> Active: /track activate<br/>store.insert + registry register<br/>+ thread
+    Active --> Paused: Pause button<br/>store.record_status<br/>engine stays registered
+    Paused --> Active: Resume button<br/>store.record_status
+    Active --> Closed: Liquidate button<br/>sell + store.close<br/>+ unregister
     Paused --> Closed: Liquidate button
-    Active --> SoftDeleted: /untrack<br/>sell optional + DB CLOSED<br/>+ deleted_at + unregister + cache remove
+    Active --> SoftDeleted: /untrack<br/>sell optional + store.untrack<br/>(CLOSED + deleted_at) + unregister
     Paused --> SoftDeleted: /untrack
     Closed --> Active: /track again<br/>hard delete old row + answers<br/>then insert new lifecycle
     SoftDeleted --> Active: /track again<br/>same hard delete path
@@ -225,11 +252,11 @@ stateDiagram-v2
 Rules encoded only by convention, not by a type:
 
 - A **paused** market keeps its engine. `dispatch` matches it, then skips it because
-  the cache says `PAUSED` (`pipeline.rs:353-358`). So "registered" does not mean
-  "live".
+  `MarketStore::cached` returns `PAUSED`. So "registered" does not mean "live".
 - A **closed** market may or may not have `deleted_at`. `/untrack` sets both. The
-  Liquidate button sets `CLOSED` only. `list_markets` hides only soft deletes, so a
-  closed-but-tracked market still appears in `/status` and autocomplete.
+  Liquidate button sets `CLOSED` only. `MarketStore::list` hides only soft
+  deletes, so a closed-but-tracked market still appears in `/status` and
+  autocomplete.
 - Re-`/track` on a `CLOSED` row hard-deletes the row and answers, then inserts a new
   one. The ledgers keep the old history.
 - Position reconciliation can change shares/invested **without** a trade.
@@ -239,12 +266,12 @@ Rules encoded only by convention, not by a type:
 
 | Operation | Steps | Failure handling |
 |---|---|---|
-| `onboarding.activate` (`onboarding.rs:320`) | delete old closed row + answers → insert market → insert answers → register engine → cache upsert | manual rollback of DB row, answers, engine; cache is not rolled back if `upsert` fails |
-| `/track` (`discord.rs:845`) | prepare (read only) → create Discord thread → activate → post embed | archive thread if activate fails; post failure is logged only |
-| `/untrack` (`discord.rs:947`) | resolve row → liquidate → unregister → soft delete → cache remove → archive thread | liquidation error aborts before cleanup; archive failure is logged only |
-| Liquidate button (`discord.rs:1507`) | check status → `executor.liquidate` → DB CLOSED → unregister → cache remove → archive thread → disable buttons | each cleanup step is best effort; a sell error still closes the market |
-| Pause button (`discord.rs:1390`) | read row → validate → DB status → reload → cache upsert → edit buttons | DB and cache can diverge if reload/upsert fails |
-| `/override` (`discord.rs:1054`) | compute logit → DB update → reload → cache upsert → spawn trade check | trade check is fire-and-forget; errors are logged only |
+| `onboarding.activate` | delete old closed row + answers → `store.insert` (row and snapshot) → insert answers → register engine | manual rollback of answers, market row, and engine; the snapshot entry goes with the row |
+| `/track` | prepare (read only) → create Discord thread → activate → post embed | archive thread if activate fails; post failure is logged only |
+| `/untrack` | resolve row → liquidate → unregister → `store.untrack` → archive thread | liquidation error does not abort cleanup; archive failure is logged only |
+| Liquidate button | check status → `executor.liquidate` → `store.close` → unregister → archive thread → disable buttons | each cleanup step is best effort; a sell error still closes the market |
+| Pause button | read row → validate → `store.record_status` → edit buttons | one call; the row and the snapshot cannot diverge |
+| `/override` | compute logit → `store.record_belief` → spawn trade check | trade check is fire-and-forget; errors are logged only |
 
 These are the main **consistency seams**. Any restructure should decide whether
 these become a single `MarketService` transaction, or stay as sagas with explicit
@@ -265,17 +292,7 @@ pub struct Db { conn: Arc<Mutex<Connection>> }
 Db::open(path) -> AppResult<Db>
 Db::open_in_memory() -> AppResult<Db>
 
-Db::insert_market(&TrackedMarket)
-Db::get_market(id) -> Option<TrackedMarket>          // includes soft-deleted
-Db::list_markets() -> Vec<TrackedMarket>             // excludes soft-deleted
-Db::list_markets_including_deleted()
-Db::list_markets_by_status(status) -> Vec<TrackedMarket>
-Db::update_market_status(id, status)
-Db::update_budget(id, budget)
-Db::update_belief(id, log_odds, p_market, updated_at)
-Db::update_position(id, invested, realized_pnl, yes_shares, no_shares)
-Db::set_thread_id(id, thread_id)
-Db::delete_market(id) / soft_delete_market(id, deleted_at)
+// no market rows: see market_store.rs
 
 Db::insert_signal(&SignalRecord) -> i64
 Db::recent_signals(id, limit) / latest_signal_time(id)
@@ -290,6 +307,47 @@ Db::get_kv(key) / set_kv(key, value) / delete_kv(key)
 
 All calls are **synchronous** and hold the single connection mutex. Callers use
 them from async tasks but never hold the guard across `.await`.
+
+`Db::lock`, `ensure_updated`, and `invalid_text` are `pub(crate)` because
+`market_store.rs` shares the connection and the same row-mapping conventions.
+
+### `market_store.rs`
+
+```rust
+pub struct MarketStore {
+    db: Db,
+    markets: RwLock<HashMap<MarketId, TrackedMarket>>,
+}
+
+MarketStore::new(&Db) -> AppResult<Self>          // live snapshot
+
+MarketStore::cached(id) -> Option<TrackedMarket>
+MarketStore::active() -> Vec<TrackedMarket>       // sorted by id
+MarketStore::active_count() -> usize
+
+MarketStore::load(id) -> AppResult<Option<TrackedMarket>>   // includes soft-deleted
+MarketStore::list() -> AppResult<Vec<TrackedMarket>>        // excludes soft-deleted
+MarketStore::list_including_deleted() -> AppResult<Vec<TrackedMarket>>
+
+MarketStore::insert(&TrackedMarket)
+MarketStore::close(id)                            // CLOSED, deleted_at NULL, cache remove
+MarketStore::untrack(id, at)                      // CLOSED + deleted_at, cache remove
+MarketStore::delete(id)                           // hard delete, cache remove
+
+MarketStore::record_status(id, MarketStatus)      // Active or Paused only
+MarketStore::record_budget(id, budget_mana)
+MarketStore::record_belief(id, log_odds, updated_at)
+MarketStore::record_price(id, p_market)
+MarketStore::record_position(id, invested, realized_pnl, yes_shares, no_shares)
+MarketStore::record_kind(id, outcome_type, sum_to_one)
+```
+
+`MarketStore` is the only path to `tracked_markets`. Every method is
+synchronous: it takes the connection guard, releases it, then patches the
+snapshot under its own lock, so no lock is held across an `.await`. An intent
+never inserts into the snapshot; a late write to an untracked market updates the
+row and leaves the snapshot alone. See the module docs for the column-ownership
+table.
 
 ### `sieve.rs`
 
@@ -347,12 +405,6 @@ is_material(&TriageResult) -> bool
 ### `pipeline.rs`
 
 ```rust
-pub struct MarketCache { markets: RwLock<HashMap<MarketId, TrackedMarket>> }
-
-MarketCache::load(&Db) / get(id) / active_markets() / active_count()
-upsert(TrackedMarket) / remove(id) / reload(&Db)
-// private record_belief(id, log_odds, p_market, updated_at)
-
 pub enum PipelineEvent {
     PostMatched { market_id, post_uri, author_handle },
     Signal { market_id, question, post_uri, author_handle, author_did,
@@ -363,13 +415,13 @@ pub enum PipelineEvent {
 
 pub struct Pipeline {
     config: Arc<Config>, db: Db, registry: Arc<EngineRegistry>,
-    cache: Arc<MarketCache>, triage: TriageClient,
+    store: Arc<MarketStore>, triage: TriageClient,
     events: broadcast::Sender<PipelineEvent>,
     queues: Mutex<HashMap<MarketId, QueueHandle>>,
     processed_posts: AtomicU64,
 }
 
-Pipeline::new(config, db, registry, cache) -> Self
+Pipeline::new(config, db, registry, store) -> Self
 events() -> broadcast::Sender<PipelineEvent>
 queue_depth(id) / queue_depths() / processed_posts()
 run(self: Arc<Self>, posts: broadcast::Receiver<ExtractedPost>)
@@ -403,13 +455,13 @@ pub enum TradeEvent {
 }
 
 pub struct TradeExecutor {
-    client: ManifoldClient, db: Db, cache: Arc<MarketCache>,
+    client: ManifoldClient, db: Db, store: Arc<MarketStore>,
     params: TradeParams, halflife_hours: f64,
     execution_lock: tokio::sync::Mutex<()>,
     events: broadcast::Sender<TradeEvent>,
 }
 
-TradeExecutor::new(&Config, Db, Arc<MarketCache>).await
+TradeExecutor::new(&Config, Db, Arc<MarketStore>).await
 events() / client()
 evaluate_market(market_id, trigger_post_uri) -> Option<TradeRecord>
 sync_market(market_id) -> TrackedMarket
@@ -426,12 +478,12 @@ serializes all markets on one `execution_lock`.
 ### `onboarding.rs`
 
 ```rust
-OnboardingService::new(&Config, Db, Arc<EngineRegistry>, Arc<MarketCache>)
+OnboardingService::new(&Config, Db, Arc<EngineRegistry>, Arc<MarketStore>)
 
 prepare(url, budget, initial_prob, &mpsc::Sender<OnboardUpdate>)
     -> AppResult<OnboardingDraft>          // read only: Manifold + agent + compile
 activate(draft, thread_id)
-    -> AppResult<TrackedMarket>            // DB + answers + engine + cache
+    -> AppResult<TrackedMarket>            // row (cached by the store) + answers + engine
 ```
 
 `OnboardingDraft { market, sieve_source, answers }`. The split exists only because
@@ -464,7 +516,7 @@ the run ends with an empty slot, the error carries the last compiler error.
 ```rust
 pub struct DiscordState {
     config: Arc<Config>, db: Db, registry: Arc<EngineRegistry>,
-    cache: Arc<MarketCache>, pipeline: Arc<Pipeline>,
+    store: Arc<MarketStore>, pipeline: Arc<Pipeline>,
     onboarding: Arc<OnboardingService>, executor: Arc<TradeExecutor>,
 }
 
@@ -501,7 +553,7 @@ sequenceDiagram
     participant PB as post broadcast
     participant PL as Pipeline dispatch
     participant RG as EngineRegistry
-    participant CA as MarketCache
+    participant ST as MarketStore
     participant Q as per-market queue
     participant WK as worker
     participant TR as TriageClient
@@ -519,12 +571,12 @@ sequenceDiagram
     PB->>PL: recv
     PL->>RG: matching_markets(post.text)
     RG-->>PL: [market_id ...]
-    PL->>CA: get(market_id)
-    CA-->>PL: TrackedMarket
+    PL->>ST: cached(market_id)
+    ST-->>PL: TrackedMarket
     alt status is ACTIVE
         PL->>Q: send TriageJob
         Q->>WK: recv, sequential per market
-        WK->>CA: refresh belief fields
+        WK->>ST: cached(id), refresh belief fields
         WK->>EV: PostMatched
         WK->>BE: current_p_internal(...)
         WK->>DB: list_answers(market_id)
@@ -535,8 +587,7 @@ sequenceDiagram
         alt answers is empty
             alt material
                 WK->>BE: apply_post(...)
-                WK->>DB: update_belief
-                WK->>CA: record_belief
+                WK->>ST: record_belief
             end
             WK->>DB: insert_signal
         else multiple choice
@@ -551,17 +602,16 @@ sequenceDiagram
 
     EV->>TE: Signal, only if material
     TE->>TE: execution_lock
-    TE->>DB: get_market
+    TE->>ST: load(id)
     TE->>DB: get_kv("global_kill_switch")
     TE->>MA: GET /v0/market/{id}
     TE->>MA: GET /v0/market/{id}/positions
     TE->>TE: reconcile_position + current_p_internal
-    TE->>DB: update_position
-    TE->>CA: upsert
+    TE->>ST: record_position + record_price
     alt edge above threshold and no position
         TE->>MA: POST /v0/bet
-        TE->>DB: insert_trade + update_position
-        TE->>CA: upsert
+        TE->>DB: insert_trade
+        TE->>ST: record_position + record_price
         TE->>DC: TradeEvent::Trade
     end
     EV->>DC: Signal or Error
@@ -581,7 +631,7 @@ sequenceDiagram
     participant MA as Manifold
     participant DB as SQLite
     participant RG as EngineRegistry
-    participant CA as MarketCache
+    participant ST as MarketStore
     participant TH as Discord thread
 
     OP->>D: /track url budget initial_prob
@@ -590,7 +640,7 @@ sequenceDiagram
     D->>O: prepare(url, budget, initial_prob, tx)
     O->>MA: GET /v0/slug/{slug}
     MA-->>O: market + answers
-    O->>DB: get_market(id), duplicate check
+    O->>ST: load(id), duplicate check
     O->>AG: synthesize(model, firecrawl, market, updates)
     loop until submit_sieve compiles (no attempt limit)
         AG->>FC: web_search / read_page
@@ -602,13 +652,12 @@ sequenceDiagram
     end
     AG-->>O: first compiling program
     O-->>D: OnboardingDraft
-    D->>DB: duplicate check again
+    D->>ST: duplicate check again
     D->>TH: create public thread under control channel
     D->>O: activate(draft, thread_id)
-    O->>DB: delete old closed row + answers if any
-    O->>DB: insert_market + upsert_answer
+    O->>ST: delete old closed row, then insert(market)
+    O->>DB: delete old answers, upsert_answer
     O->>RG: register_source(id, sieve_source)
-    O->>CA: upsert(market)
     alt activate fails
         D->>TH: archive thread
     else success
@@ -628,25 +677,24 @@ sequenceDiagram
     participant EX as TradeExecutor
     participant MA as Manifold
     participant RG as EngineRegistry
-    participant CA as MarketCache
+    participant ST as MarketStore
     participant TH as Discord thread
 
     rect rgb(245, 245, 245)
     note over OP,TH: /untrack, liquidate defaults true
     OP->>D: /untrack market liquidate
-    D->>DB: get_market, include soft-deleted
+    D->>ST: load, include soft-deleted
     alt already deleted
         D-->>OP: already untracked
     else live and liquidate
         D->>EX: liquidate(market_id)
         EX->>MA: GET market + GET positions
         EX->>MA: POST sell for each held side
-        EX->>DB: insert_trade + update_position
-        EX->>CA: upsert
+        EX->>DB: insert_trade
+        EX->>ST: record_position + record_price
     end
     D->>RG: unregister
-    D->>DB: soft_delete_market, status CLOSED + deleted_at
-    D->>CA: remove
+    D->>ST: untrack, CLOSED + deleted_at
     D->>TH: archive
     D-->>OP: summary
     end
@@ -654,11 +702,10 @@ sequenceDiagram
     rect rgb(250, 245, 245)
     note over OP,TH: Liquidate and Close button
     OP->>D: component liquidate:<id>
-    D->>DB: get_market, validate not closed or deleted
+    D->>ST: load, validate not closed or deleted
     D->>EX: liquidate(market_id)
-    D->>DB: update_market_status CLOSED
+    D->>ST: close, CLOSED + deleted_at NULL
     D->>RG: unregister
-    D->>CA: remove
     D->>TH: archive
     D->>D: disable buttons on source message
     end
@@ -666,10 +713,8 @@ sequenceDiagram
     rect rgb(245, 250, 245)
     note over OP,TH: Pause / Resume button
     OP->>D: component pause:<id>
-    D->>DB: get_market, validate
-    D->>DB: update_market_status ACTIVE or PAUSED
-    D->>DB: get_market reload
-    D->>CA: upsert
+    D->>ST: load, validate
+    D->>ST: record_status ACTIVE or PAUSED
     D->>D: swap button label
     end
 ```
@@ -692,7 +737,7 @@ appears in `/status`. `/untrack` sets `deleted_at` and hides the row. These are
 | Discord → services | direct async calls | none | command handlers catch errors and reply |
 | services → SQLite | `Arc<Mutex<Connection>>` | one connection, WAL | busy timeout 5 s; poisoned mutex returns an error |
 | trade state changes | `tokio::sync::Mutex<()>` | one at a time | serializes evaluate/sync/liquidate across all markets |
-| registry / cache | `std::sync::RwLock` | short critical sections | poison recovered by `into_inner` |
+| registry / market store | `std::sync::RwLock` | short critical sections | poison recovered by `into_inner` |
 
 Properties to preserve:
 
@@ -710,30 +755,29 @@ Properties to preserve:
 Ordered by expected payoff. Each item states what exists, why it hurts, and a safe
 cut.
 
-### A. `MarketCache` lives in `pipeline.rs` but is used everywhere
+### A. `MarketCache` lived in `pipeline.rs` and had no owner — **resolved**
 
-**Today:** `trade`, `onboarding`, `discord`, and `main` import `pipeline::MarketCache`.
-`pipeline` also owns the queues and event bus.
+**Then:** `trade`, `onboarding`, `discord`, and `main` imported
+`pipeline::MarketCache`. Four modules called `upsert`/`remove`, and each writer
+read a whole `TrackedMarket`, changed one field group, and wrote the whole struct
+back. A stale snapshot could revert a newer belief or a pause.
 
-**Why it hurts:** a cache change forces a rebuild of the orchestrator's module. The
-cache has no owner: four modules call `upsert`/`remove` and can write stale
-snapshots.
+**Now:** `market_store.rs` owns the snapshot and every `tracked_markets` write.
+`Pipeline`, `TradeExecutor`, `OnboardingService`, and `DiscordState` hold
+`Arc<MarketStore>`; `MarketCache` is gone. Each intent writes SQLite first and
+then patches only its own column group, so one writer cannot revert another's
+fields. `Db` no longer has market methods at all, which is what makes the rule
+structural rather than conventional.
 
-**Candidate cut:** create `store.rs` or `market_state.rs` that owns:
-
-- `MarketCache`
-- the invariant "DB row and cache agree"
-- methods like `update_budget`, `set_status`, `record_belief`, `record_position`,
-  `remove`
-
-Then `pipeline`, `trade`, `discord`, and `onboarding` depend on `MarketState`, not
-on `Pipeline`. `PipelineEvent` moves to `events.rs` or `types.rs`, which removes the
-`trade → pipeline` and `onboarding → pipeline` edges entirely.
+**Residual:** `PipelineEvent` and `TradeEvent` still live inside the modules that
+own them, so `trade` and `discord` import `pipeline` for the event type. Moving
+the events to `events.rs` is still open and would remove those edges.
 
 ### B. Three sources of truth for "is this market live"
 
-**Today:** DB status + cache entry + registry membership. Pause touches two, untrack
-touches three, and dispatch re-checks the cache.
+**Today:** DB status + snapshot entry + registry membership. `MarketStore` keeps
+the first two in step in one call, so pause and resume touch two stores and
+untrack touches three. `dispatch` re-checks the snapshot status.
 
 **Why it hurts:** a bug in any writer produces a market that matches but does not
 trade, or trades but is not visible, or has no Discord thread.
@@ -747,15 +791,15 @@ close(id)             // no deletion, row visible
 untrack(id)           // close + soft delete
 ```
 
-Each transition updates DB, cache, and registry in one place, with a documented
+Each transition updates DB, snapshot, and registry in one place, with a documented
 compensation order. Keep `EngineRegistry` internal to this service so callers cannot
 forget to unregister.
 
 ### C. Discord handlers are orchestrators
 
 **Today:** `untrack_market`, `liquidate_market`, `pause_button`, `budget`,
-`override_belief` each combine DB reads/writes, cache reloads, registry changes,
-executor calls, thread archiving, and embed edits. `untrack_market` and
+`override_belief` each combine store reads/writes, registry changes, executor
+calls, thread archiving, and embed edits. `untrack_market` and
 `liquidate_market` duplicate most of the teardown.
 
 **Why it hurts:** the same lifecycle transition exists twice with different end
@@ -911,7 +955,7 @@ flowchart TB
         POLICY["trade policy / Kelly"]
     end
     subgraph INFRA["Infrastructure"]
-        STORE["MarketStore<br/>DB + cache, one writer"]
+        STORE["MarketStore<br/>DB + snapshot, one writer"]
         REG2["EngineRegistry"]
         LLM2["LlmClient"]
         MANIFOLD["ManifoldClient"]
@@ -942,11 +986,12 @@ flowchart TB
 
 If you make only three cuts, make these:
 
-1. **Move `MarketCache` out of `pipeline`** and give it a single writer
-   (`MarketStore`). This removes the `trade → pipeline` and `onboarding → pipeline`
-   dependencies.
-2. **Move lifecycle transitions into one service** so DB, cache, and registry
-   cannot disagree. This removes duplicated teardown in Discord.
+1. ~~**Move `MarketCache` out of `pipeline`** and give it a single writer
+   (`MarketStore`).~~ Done: `market_store.rs` owns the snapshot and the market
+   SQL, and `onboarding` no longer imports `pipeline`.
+2. **Move lifecycle transitions into one service** so status, `deleted_at`, and
+   registry membership cannot disagree. This removes duplicated teardown in
+   Discord.
 3. **Move `LlmClient` into `llm.rs`** so triage and onboarding are peers, not parent
    and child.
 
