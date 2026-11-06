@@ -1086,6 +1086,10 @@ mod tests {
             belief_kappa: 1.1,
             belief_halflife_hours: 4.0,
             triage_min_evidence: 0.7,
+            trading_dry_run: true,
+            mc_max_positions: 6,
+            mc_max_new_per_tick: 2,
+            mc_max_answer_fraction: 0.25,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-live.db"),
         }
     }

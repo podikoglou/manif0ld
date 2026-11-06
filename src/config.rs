@@ -18,6 +18,11 @@ const DEFAULT_MIN_TRADE_SIZE: f64 = 1.0;
 const DEFAULT_BELIEF_KAPPA: f64 = 1.1;
 const DEFAULT_BELIEF_HALFLIFE_HOURS: f64 = 4.0;
 const DEFAULT_TRIAGE_MIN_EVIDENCE: f64 = 0.7;
+/// Dry run is the safe default until the canary phase is approved.
+const DEFAULT_TRADING_DRY_RUN: bool = true;
+const DEFAULT_MC_MAX_POSITIONS: usize = 6;
+const DEFAULT_MC_MAX_NEW_PER_TICK: usize = 2;
+const DEFAULT_MC_MAX_ANSWER_FRACTION: f64 = 0.25;
 
 /// Runtime configuration for the bot.
 ///
@@ -46,6 +51,15 @@ pub struct Config {
     pub belief_halflife_hours: f64,
     /// Probability of evidence a post must reach before it moves belief.
     pub triage_min_evidence: f64,
+    /// When true, planned bets are sent with `dryRun: true` and nothing is
+    /// persisted. Defaults to true until the canary phase is approved.
+    pub trading_dry_run: bool,
+    /// Maximum answers of one multiple-choice market that may hold shares.
+    pub mc_max_positions: usize,
+    /// Maximum new answer entries in one evaluation.
+    pub mc_max_new_per_tick: usize,
+    /// Maximum share of a market budget committed to one answer.
+    pub mc_max_answer_fraction: f64,
     pub db_path: PathBuf,
 }
 
@@ -123,6 +137,20 @@ impl Config {
             f64_or(&get, "BELIEF_HALFLIFE_HOURS", DEFAULT_BELIEF_HALFLIFE_HOURS)?;
         let triage_min_evidence =
             f64_or(&get, "TRIAGE_MIN_EVIDENCE", DEFAULT_TRIAGE_MIN_EVIDENCE)?;
+        let trading_dry_run = bool_or(&get, "TRADING_DRY_RUN", DEFAULT_TRADING_DRY_RUN)?;
+        let mc_max_positions = usize_or(&get, "MC_MAX_POSITIONS", DEFAULT_MC_MAX_POSITIONS)?;
+        let mc_max_new_per_tick =
+            usize_or(&get, "MC_MAX_NEW_PER_TICK", DEFAULT_MC_MAX_NEW_PER_TICK)?;
+        let mc_max_answer_fraction = f64_or(
+            &get,
+            "MC_MAX_ANSWER_FRACTION",
+            DEFAULT_MC_MAX_ANSWER_FRACTION,
+        )?;
+        if !(mc_max_answer_fraction > 0.0 && mc_max_answer_fraction <= 1.0) {
+            bail!(
+                "MC_MAX_ANSWER_FRACTION must be in (0, 1], got {mc_max_answer_fraction}"
+            );
+        }
 
         let db_path = optional(&get, "DB_PATH")
             .map(PathBuf::from)
@@ -147,6 +175,10 @@ impl Config {
             belief_kappa,
             belief_halflife_hours,
             triage_min_evidence,
+            trading_dry_run,
+            mc_max_positions,
+            mc_max_new_per_tick,
+            mc_max_answer_fraction,
             db_path,
         };
 
@@ -269,6 +301,30 @@ fn f64_or(get: &impl Fn(&str) -> Option<String>, key: &str, default: f64) -> App
     }
 }
 
+/// Reads an optional boolean variable, falling back to `default`.
+///
+/// Accepts `true`/`false` in any case and the digits `1`/`0`.
+fn bool_or(get: &impl Fn(&str) -> Option<String>, key: &str, default: bool) -> AppResult<bool> {
+    match optional(get, key) {
+        None => Ok(default),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(anyhow!("{key} must be true or false")),
+        },
+    }
+}
+
+/// Reads an optional non-negative integer variable, falling back to `default`.
+fn usize_or(get: &impl Fn(&str) -> Option<String>, key: &str, default: usize) -> AppResult<usize> {
+    match optional(get, key) {
+        None => Ok(default),
+        Some(raw) => raw
+            .parse::<usize>()
+            .with_context(|| format!("{key} must be a non-negative integer")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +366,10 @@ mod tests {
         assert_eq!(config.belief_kappa, 1.1);
         assert_eq!(config.belief_halflife_hours, 4.0);
         assert_eq!(config.triage_min_evidence, 0.7);
+        assert!(config.trading_dry_run, "dry run must default to true");
+        assert_eq!(config.mc_max_positions, 6);
+        assert_eq!(config.mc_max_new_per_tick, 2);
+        assert_eq!(config.mc_max_answer_fraction, 0.25);
         assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
@@ -325,6 +385,10 @@ mod tests {
             ("MIN_TRADE_SIZE", "2.5"),
             ("BELIEF_KAPPA", "2.0"),
             ("BELIEF_HALFLIFE_HOURS", "6.5"),
+            ("TRADING_DRY_RUN", "false"),
+            ("MC_MAX_POSITIONS", "3"),
+            ("MC_MAX_NEW_PER_TICK", "1"),
+            ("MC_MAX_ANSWER_FRACTION", "0.5"),
             ("DB_PATH", "/tmp/test.db"),
         ]);
 
@@ -341,6 +405,10 @@ mod tests {
         assert_eq!(config.min_trade_size, 2.5);
         assert_eq!(config.belief_kappa, 2.0);
         assert_eq!(config.belief_halflife_hours, 6.5);
+        assert!(!config.trading_dry_run);
+        assert_eq!(config.mc_max_positions, 3);
+        assert_eq!(config.mc_max_new_per_tick, 1);
+        assert_eq!(config.mc_max_answer_fraction, 0.5);
         assert_eq!(config.db_path, PathBuf::from("/tmp/test.db"));
     }
 
@@ -387,6 +455,29 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("KELLY_FRACTION"), "{message}");
         assert!(!message.contains("a quarter"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_malformed_dry_run_flag() {
+        let mut vars = required_vars();
+        vars.push(("TRADING_DRY_RUN", "sometimes"));
+
+        let error = config_from(&vars).expect_err("malformed flag should fail");
+        assert!(error.to_string().contains("TRADING_DRY_RUN"));
+    }
+
+    #[test]
+    fn rejects_an_answer_fraction_outside_the_unit_interval() {
+        for value in ["0", "-0.1", "1.5"] {
+            let mut vars = required_vars();
+            vars.push(("MC_MAX_ANSWER_FRACTION", value));
+
+            let error = config_from(&vars).expect_err("out-of-range fraction should fail");
+            assert!(
+                error.to_string().contains("MC_MAX_ANSWER_FRACTION"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
