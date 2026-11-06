@@ -961,12 +961,15 @@ async fn untrack_market(
         ));
     }
 
+    // Liquidation runs before the cleanup, but its failure must not stop the
+    // cleanup: a market that stays tracked keeps its Sieve engine and crashes
+    // the trade executor again. The failure is reported instead of aborting.
+    let mut sell_failure = None;
     if liquidate && market.status != MarketStatus::Closed {
-        state
-            .executor
-            .liquidate(&market_id)
-            .await
-            .with_context(|| format!("liquidating market {market_id}"))?;
+        if let Err(error) = state.executor.liquidate(&market_id).await {
+            tracing::error!(market_id = %market_id, error = %error, "liquidation during /untrack failed");
+            sell_failure = Some(error);
+        }
     }
 
     state.registry.unregister(&market_id);
@@ -984,12 +987,16 @@ async fn untrack_market(
         }
     }
 
-    let positions_msg = if liquidate && market.status != MarketStatus::Closed {
-        " Positions were liquidated."
-    } else if market.status != MarketStatus::Closed {
-        " Positions were left untouched."
-    } else {
-        " The position was already closed."
+    let positions_msg = match sell_failure {
+        Some(error) => format!(" Untracking continued because liquidation failed: `{error}`. The \
+                                position was not sold; handle it on Manifold directly."),
+        None if liquidate && market.status != MarketStatus::Closed => {
+            " Positions were liquidated.".to_owned()
+        }
+        None if market.status != MarketStatus::Closed => {
+            " Positions were left untouched.".to_owned()
+        }
+        None => " The position was already closed.".to_owned(),
     };
     Ok(format!(
         "Untracked **{}** (`{market_id}`).{positions_msg} The row and its history were kept; the \
