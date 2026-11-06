@@ -350,14 +350,9 @@ impl OnboardingService {
         updates: &mpsc::Sender<OnboardUpdate>,
     ) -> AppResult<String> {
         let model = self.ai.completion_model(&self.model)?;
-        onboarding_agent::synthesize(
-            model,
-            Arc::clone(&self.firecrawl),
-            market,
-            updates,
-        )
-        .await
-        .with_context(|| format!("synthesizing a Sieve rule with model {}", self.model))
+        onboarding_agent::synthesize(model, Arc::clone(&self.firecrawl), market, updates)
+            .await
+            .with_context(|| format!("synthesizing a Sieve rule with model {}", self.model))
     }
 }
 
@@ -689,9 +684,7 @@ mod tests {
         assert!(prompt.contains("A market about the Bitcoin ETF approval."));
         assert!(prompt.contains("Resolves YES if a spot ETF launches."));
         assert!(prompt.contains("Market close time: 2023-11-14T22:13:20+00:00"));
-        assert!(prompt.contains(
-            "Research this market, then write and submit one Sieve program."
-        ));
+        assert!(prompt.contains("Research this market, then write and submit one Sieve program."));
         assert!(!prompt.contains("vip"));
     }
 

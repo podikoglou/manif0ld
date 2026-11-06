@@ -23,15 +23,14 @@ use std::sync::{Arc, Mutex};
 use firecrawl::{
     Client, Document, Format, ScrapeOptions, SearchOptions, SearchResultOrDocument, SearchSource,
 };
-use rig::tool::{DynamicTool, ToolErrorKind, ToolExecutionError, ToolOutput};
 use rig::message::ToolName;
+use rig::tool::{DynamicTool, ToolErrorKind, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::error::{bail, AppResult};
 use crate::onboarding::{
-    build_sieve_user_prompt, ManifoldSlugMarket, OnboardUpdate, SieveAttempt,
-    SIEVE_SYSTEM_PROMPT,
+    build_sieve_user_prompt, ManifoldSlugMarket, OnboardUpdate, SieveAttempt, SIEVE_SYSTEM_PROMPT,
 };
 use crate::sieve;
 
@@ -165,10 +164,7 @@ pub async fn synthesize(
 /// `Result<(), String>`, so the compiled engine never crosses the task
 /// boundary. A compiler error is returned as ordinary tool text so the model
 /// can read it and retry.
-fn submit_sieve_tool(
-    state: SubmitState,
-    updates: mpsc::Sender<OnboardUpdate>,
-) -> DynamicTool {
+fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
     let parameters = json!({
         "type": "object",
         "properties": {
@@ -212,7 +208,9 @@ fn submit_sieve_tool(
                 let attempt = state.attempts.fetch_add(1, Ordering::SeqCst) + 1;
                 let source = program.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
-                    sieve::compile(&source).map(|_compiled| ()).map_err(|error| error.to_string())
+                    sieve::compile(&source)
+                        .map(|_compiled| ())
+                        .map_err(|error| error.to_string())
                 })
                 .await
                 .map_err(|error| {
