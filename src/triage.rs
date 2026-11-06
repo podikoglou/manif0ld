@@ -977,6 +977,7 @@ mod tests {
             mc_max_positions: 6,
             mc_max_new_per_tick: 2,
             mc_max_answer_fraction: 0.25,
+            rate_limit_per_min: 500,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-live.db"),
         }
     }

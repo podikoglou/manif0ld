@@ -23,6 +23,7 @@ mod market_store;
 mod onboarding;
 mod onboarding_agent;
 mod pipeline;
+mod rate;
 mod sieve;
 mod trade;
 mod triage;

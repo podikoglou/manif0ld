@@ -29,6 +29,16 @@
 //! seconds. [`millis_to_seconds`] is the single conversion point at this
 //! boundary.
 //!
+//! # Rate budget
+//!
+//! Every outgoing write sits in the global token bucket in [`crate::rate`]: a
+//! buy, a sell, and a dry-run buy (which sends a real `dryRun: true` request)
+//! each spend one Trade-class token before the call. When the bucket cannot
+//! spare the trade floor, the write is skipped exactly like a kill-switch
+//! refusal — the next material signal or the 60-second ticker re-runs the
+//! decision. Reads are not metered yet; phase 2 replaces them with the
+//! websocket stream.
+//!
 //! # Secrets
 //!
 //! The API key is stored in [`ManifoldClient`] and sent in the `Authorization`
@@ -54,6 +64,7 @@ use crate::db::Db;
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::market_store::MarketStore;
 use crate::pipeline::PipelineEvent;
+use crate::rate::{Priority, RateLimiter, SystemClock, WRITE_COST_TOKENS};
 use crate::types::{
     available_budget, MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision,
     TradeRecord,
@@ -592,6 +603,8 @@ pub struct TradeExecutor {
     policy: TradePolicy,
     dry_run: bool,
     halflife_hours: f64,
+    /// Global Manifold token bucket; writes spend Trade-class tokens.
+    rate: RateLimiter,
     execution_lock: Mutex<()>,
     events: broadcast::Sender<TradeEvent>,
 }
@@ -614,6 +627,7 @@ impl TradeExecutor {
             policy: TradePolicy::from_config(config),
             dry_run: config.trading_dry_run,
             halflife_hours: config.belief_halflife_hours,
+            rate: RateLimiter::per_minute(config.rate_limit_per_min, Box::new(SystemClock)),
             execution_lock: Mutex::new(()),
             events,
         })
@@ -1023,6 +1037,10 @@ impl TradeExecutor {
                 );
             }
 
+            if !self.acquire_write_token(book, decision.action) {
+                return Ok(None);
+            }
+
             let outcome = decision.action.outcome();
             let result = self
                 .client
@@ -1090,6 +1108,10 @@ impl TradeExecutor {
             return Ok(None);
         }
 
+        if !self.acquire_write_token(book, decision.action) {
+            return Ok(None);
+        }
+
         let outcome = decision.action.outcome();
         let result = self
             .client
@@ -1154,6 +1176,31 @@ impl TradeExecutor {
             .db
             .get_kv(KILL_SWITCH_KEY)?
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("true")))
+    }
+
+    /// Spends one Trade-class token for an upcoming Manifold write.
+    ///
+    /// Every write costs the bucket one token, matching Manifold's per-request
+    /// limit. When the bucket is at the trade floor the write is refused here,
+    /// the same shape as a kill-switch buy refusal: the caller skips the REST
+    /// call and the next material signal or 60-second tick re-runs it.
+    /// Returning `false` instead of an error keeps a rate refusal out of the
+    /// per-market error path, where it would be indistinguishable from a
+    /// broken market.
+    fn acquire_write_token(&self, book: &Book, action: TradeAction) -> bool {
+        match self.rate.try_acquire(Priority::Trade, WRITE_COST_TOKENS) {
+            Ok(_) => true,
+            Err(denied) => {
+                tracing::warn!(
+                    market_id = %book.id(),
+                    action = %action,
+                    remaining_tokens = denied.remaining,
+                    floor_tokens = denied.threshold,
+                    "Manifold rate bucket is at the trade floor; skipping write"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -1602,6 +1649,7 @@ mod tests {
             mc_max_positions: 6,
             mc_max_new_per_tick: 2,
             mc_max_answer_fraction: 0.25,
+            rate_limit_per_min: 500,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-mcq-live.db"),
         }
     }

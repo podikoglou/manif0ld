@@ -23,6 +23,8 @@ const DEFAULT_TRADING_DRY_RUN: bool = true;
 const DEFAULT_MC_MAX_POSITIONS: usize = 6;
 const DEFAULT_MC_MAX_NEW_PER_TICK: usize = 2;
 const DEFAULT_MC_MAX_ANSWER_FRACTION: f64 = 0.25;
+/// Manifold allows 500 requests/minute per IP; the bucket starts at that.
+const DEFAULT_RATE_LIMIT_PER_MIN: usize = 500;
 
 /// Runtime configuration for the bot.
 ///
@@ -60,6 +62,9 @@ pub struct Config {
     pub mc_max_new_per_tick: usize,
     /// Maximum share of a market budget committed to one answer.
     pub mc_max_answer_fraction: f64,
+    /// Manifold REST requests per minute shared by every consumer, refilled
+    /// continuously; trade writes have priority over housekeeping.
+    pub rate_limit_per_min: usize,
     pub db_path: PathBuf,
 }
 
@@ -152,6 +157,11 @@ impl Config {
             );
         }
 
+        let rate_limit_per_min = usize_or(&get, "RATE_LIMIT_PER_MIN", DEFAULT_RATE_LIMIT_PER_MIN)?;
+        if rate_limit_per_min == 0 {
+            bail!("RATE_LIMIT_PER_MIN must be a positive number of requests per minute");
+        }
+
         let db_path = optional(&get, "DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
@@ -179,6 +189,7 @@ impl Config {
             mc_max_positions,
             mc_max_new_per_tick,
             mc_max_answer_fraction,
+            rate_limit_per_min,
             db_path,
         };
 
@@ -370,6 +381,7 @@ mod tests {
         assert_eq!(config.mc_max_positions, 6);
         assert_eq!(config.mc_max_new_per_tick, 2);
         assert_eq!(config.mc_max_answer_fraction, 0.25);
+        assert_eq!(config.rate_limit_per_min, DEFAULT_RATE_LIMIT_PER_MIN);
         assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
@@ -389,6 +401,7 @@ mod tests {
             ("MC_MAX_POSITIONS", "3"),
             ("MC_MAX_NEW_PER_TICK", "1"),
             ("MC_MAX_ANSWER_FRACTION", "0.5"),
+            ("RATE_LIMIT_PER_MIN", "400"),
             ("DB_PATH", "/tmp/test.db"),
         ]);
 
@@ -409,6 +422,7 @@ mod tests {
         assert_eq!(config.mc_max_positions, 3);
         assert_eq!(config.mc_max_new_per_tick, 1);
         assert_eq!(config.mc_max_answer_fraction, 0.5);
+        assert_eq!(config.rate_limit_per_min, 400);
         assert_eq!(config.db_path, PathBuf::from("/tmp/test.db"));
     }
 
@@ -455,6 +469,15 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("KELLY_FRACTION"), "{message}");
         assert!(!message.contains("a quarter"), "{message}");
+    }
+
+    #[test]
+    fn rejects_a_zero_rate_limit() {
+        let mut vars = required_vars();
+        vars.push(("RATE_LIMIT_PER_MIN", "0"));
+
+        let error = config_from(&vars).expect_err("zero budget should fail");
+        assert!(error.to_string().contains("RATE_LIMIT_PER_MIN"), "{error}");
     }
 
     #[test]
