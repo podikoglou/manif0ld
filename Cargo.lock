@@ -686,32 +686,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "manif0ld"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "dotenvy",
- "firecrawl",
- "futures-util",
- "reqwest 0.12.28",
- "rig",
- "rusqlite",
- "rustls 0.23.46",
- "serde",
- "serde_json",
- "serenity",
- "sieve",
- "thiserror 2.0.21",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4269,6 +4243,32 @@ name = "macro_rules_attribute-proc_macro"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
+
+[[package]]
+name = "manif0ld"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dotenvy",
+ "firecrawl",
+ "futures-util",
+ "reqwest 0.12.28",
+ "rig",
+ "rusqlite",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "serenity",
+ "sieve",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
 
 [[package]]
 name = "matchers"
