@@ -899,7 +899,7 @@ mod tests {
             belief_kappa: 1.1,
             belief_halflife_hours: 4.0,
             triage_min_evidence: 0.7,
-            db_path: std::path::PathBuf::from("/tmp/opencode/arb-live.db"),
+            db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-live.db"),
         }
     }
 
