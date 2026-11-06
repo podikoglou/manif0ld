@@ -63,18 +63,26 @@ pub enum Direction {
 }
 
 impl Direction {
-    /// Signed weight used by the belief engine.
-    pub fn polarity(self) -> f64 {
-        match self {
-            Self::StrongYes => 1.0,
-            Self::Yes => 0.5,
-            Self::Neutral => 0.0,
-            Self::No => -0.5,
-            Self::StrongNo => -1.0,
+    /// Buckets a signed impulse scale into the ledger's coarse direction.
+    ///
+    /// The scale comes from [`crate::triage::assess`] and is in `[-1, 1]`. The
+    /// buckets exist for display and for the `signal_ledger.direction` column;
+    /// they never feed belief arithmetic.
+    pub fn from_scale(scale: f64) -> Self {
+        if scale >= 0.66 {
+            Self::StrongYes
+        } else if scale >= 0.2 {
+            Self::Yes
+        } else if scale <= -0.66 {
+            Self::StrongNo
+        } else if scale <= -0.2 {
+            Self::No
+        } else {
+            Self::Neutral
         }
     }
 
-    /// Database and LLM encoding.
+    /// Database encoding.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::StrongYes => "strong_yes",
@@ -83,14 +91,6 @@ impl Direction {
             Self::No => "no",
             Self::StrongNo => "strong_no",
         }
-    }
-
-    /// Whether this direction can carry a material signal.
-    ///
-    /// A neutral direction never moves belief, regardless of the model's
-    /// `material` flag or strength score.
-    pub fn is_material_candidate(&self) -> bool {
-        !matches!(self, Self::Neutral)
     }
 }
 
@@ -217,33 +217,6 @@ impl fmt::Display for TradeAction {
     }
 }
 
-/// Parsed response from the triage LLM.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct TriageResult {
-    pub material: bool,
-    #[serde(default)]
-    pub direction: Option<Direction>,
-    /// Evidence strength, 0 = noise through 3 = definitive.
-    #[serde(default)]
-    pub strength: u8,
-    #[serde(default)]
-    pub rationale: String,
-    /// Answers affected by the post for multiple choice markets.
-    #[serde(default)]
-    pub affected_answers: Vec<AnswerTriage>,
-}
-
-/// An individual answer evaluation in a multiple choice market.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct AnswerTriage {
-    pub answer_id: String,
-    pub direction: Direction,
-    #[serde(default)]
-    pub strength: u8,
-    #[serde(default)]
-    pub rationale: String,
-}
-
 /// Tracked answer within a multiple choice market.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackedAnswer {
@@ -280,9 +253,18 @@ pub struct SignalRecord {
     pub post_text: String,
     pub material: bool,
     pub direction: Direction,
+    /// Rounded expected strength, kept for the pre-probability column.
     pub strength: u8,
     pub impulse: f64,
     pub p_after: f64,
+    /// Probability that the post carried evidence.
+    pub p_evidence: Option<f64>,
+    /// Probability mass on the alternative the post favored.
+    pub p_target: Option<f64>,
+    /// Expected evidence strength on the 0-3 rubric.
+    pub strength_real: Option<f64>,
+    /// Probability that the market already reflected the information.
+    pub p_priced: Option<f64>,
     pub created_at: i64,
 }
 
@@ -317,12 +299,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direction_polarity_maps_to_expected_weights() {
-        assert_eq!(Direction::StrongYes.polarity(), 1.0);
-        assert_eq!(Direction::Yes.polarity(), 0.5);
-        assert_eq!(Direction::Neutral.polarity(), 0.0);
-        assert_eq!(Direction::No.polarity(), -0.5);
-        assert_eq!(Direction::StrongNo.polarity(), -1.0);
+    fn direction_from_scale_buckets_the_impulse() {
+        assert_eq!(Direction::from_scale(1.0), Direction::StrongYes);
+        assert_eq!(Direction::from_scale(0.66), Direction::StrongYes);
+        assert_eq!(Direction::from_scale(0.65), Direction::Yes);
+        assert_eq!(Direction::from_scale(0.2), Direction::Yes);
+        assert_eq!(Direction::from_scale(0.19), Direction::Neutral);
+        assert_eq!(Direction::from_scale(0.0), Direction::Neutral);
+        assert_eq!(Direction::from_scale(-0.19), Direction::Neutral);
+        assert_eq!(Direction::from_scale(-0.2), Direction::No);
+        assert_eq!(Direction::from_scale(-0.65), Direction::No);
+        assert_eq!(Direction::from_scale(-0.66), Direction::StrongNo);
+        assert_eq!(Direction::from_scale(-1.0), Direction::StrongNo);
     }
 
     #[test]
@@ -359,19 +347,6 @@ mod tests {
         let parsed: Direction = serde_json::from_str("\"strong_yes\"")
             .expect("snake_case direction should deserialize");
         assert_eq!(parsed, Direction::StrongYes);
-    }
-
-    #[test]
-    fn neutral_is_not_a_material_candidate() {
-        assert!(!Direction::Neutral.is_material_candidate());
-        for direction in [
-            Direction::StrongYes,
-            Direction::Yes,
-            Direction::No,
-            Direction::StrongNo,
-        ] {
-            assert!(direction.is_material_candidate());
-        }
     }
 
     #[test]
@@ -471,29 +446,5 @@ mod tests {
         assert_eq!(available_budget(&market), -20.0);
         market.invested_mana = 0.0;
         assert_eq!(available_budget(&market), 5.0);
-    }
-
-    #[test]
-    fn triage_result_deserializes() {
-        let parsed: TriageResult = serde_json::from_str(
-            r#"{
-                "material": true,
-                "direction": "no",
-                "strength": 2,
-                "rationale": "Official denial."
-            }"#,
-        )
-        .expect("triage JSON should deserialize");
-
-        assert_eq!(
-            parsed,
-            TriageResult {
-                material: true,
-                direction: Some(Direction::No),
-                strength: 2,
-                rationale: "Official denial.".into(),
-                affected_answers: Vec::new(),
-            }
-        );
     }
 }

@@ -1668,9 +1668,12 @@ async fn consume_pipeline_events(
                 author_handle,
                 author_did,
                 text,
+                answer,
                 direction,
+                p_evidence,
+                p_target,
                 strength,
-                rationale,
+                p_priced,
                 p_before,
                 p_after,
                 p_market,
@@ -1688,17 +1691,21 @@ async fn consume_pipeline_events(
                             MAX_FIELD_CHARS,
                         ),
                         false,
-                    )
+                    );
+
+                if let Some(answer) = answer {
+                    embed = embed.field("Answer", truncate_chars(&answer, MAX_FIELD_CHARS), false);
+                }
+
+                embed = embed
+                    .field("Evidence", format!("{p_evidence:.2}"), true)
                     .field(
                         "Direction",
-                        format!("{} (strength {strength})", direction.as_str()),
+                        format!("{} ({p_target:.2})", direction.as_str()),
                         true,
                     )
-                    .field(
-                        "Rationale",
-                        truncate_chars(&rationale, MAX_FIELD_CHARS),
-                        false,
-                    )
+                    .field("Strength", format!("{strength:.1} / 3"), true)
+                    .field("Priced", format!("{p_priced:.2}"), true)
                     .field("P_internal", format!("{p_before:.3} → {p_after:.3}"), true)
                     .field("P_market", format!("{p_market:.3}"), true);
 
@@ -1722,12 +1729,14 @@ async fn consume_pipeline_events(
                 material: false,
                 market_id,
                 direction,
+                p_evidence,
                 strength,
                 ..
             }) => {
                 tracing::debug!(
                     market_id = %market_id,
                     direction = %direction,
+                    p_evidence,
                     strength,
                     "non-material signal not posted to Discord"
                 );

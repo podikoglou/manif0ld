@@ -14,9 +14,6 @@
 //! previous update, then the post moves it. Decaying after the impulse would
 //! immediately discount fresh evidence.
 
-use crate::config::Config;
-use crate::types::Direction;
-
 /// Maximum absolute log-odds value, approximately `logit(0.99)`.
 pub const LOG_ODDS_CLAMP: f64 = 4.595;
 
@@ -25,25 +22,6 @@ pub const LOG_ODDS_CLAMP: f64 = 4.595;
 /// The maximum probability is `1.0 - PROB_CLAMP`; both bounds keep `logit` away
 /// from infinities.
 pub const PROB_CLAMP: f64 = 0.01;
-
-/// Belief-engine parameters, usually sourced from [`Config`].
-#[derive(Debug, Clone, Copy)]
-pub struct BeliefParams {
-    pub kappa: f64,
-    pub halflife_hours: f64,
-}
-
-impl BeliefParams {
-    /// Reads the belief parameters from process configuration.
-    ///
-    /// Defaults are `BELIEF_KAPPA=1.1` and `BELIEF_HALFLIFE_HOURS=4.0`.
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            kappa: config.belief_kappa,
-            halflife_hours: config.belief_halflife_hours,
-        }
-    }
-}
 
 /// Converts a probability to log-odds, clamping it to `[0.01, 0.99]` first.
 pub fn logit(p: f64) -> f64 {
@@ -104,29 +82,22 @@ pub fn current_p_internal(
     ))
 }
 
-/// Nominal log-odds impulse for one post, before clamping.
-///
-/// `strength` is clamped to `3`; a neutral direction yields zero.
-pub fn nominal_impulse(direction: Direction, strength: u8, kappa: f64) -> f64 {
-    let strength = f64::from(strength.min(3)) / 3.0;
-    kappa * direction.polarity() * strength
-}
-
 /// Applies one post to the belief state.
 ///
-/// Decays the stored log-odds toward `p_market_now` using the elapsed time
-/// since `*belief_updated_at`, then adds [`nominal_impulse`], clamps, and
-/// records `now` as the new update time.
+/// `impulse_scale` is the signed strength of the evidence in `[-1, 1]`. The
+/// triage layer folds the probability of evidence, the direction, the novelty,
+/// and the relative strength into it, so this function only scales it by
+/// `kappa`. Decay runs first, then the impulse is added, clamped, and `now` is
+/// recorded.
 ///
 /// Returns the impulse actually applied, `new_l - decayed_l`. This differs from
-/// the nominal impulse when the log-odds clamp is reached, and callers should
-/// use the returned value for logging and the signal ledger.
+/// `kappa * impulse_scale` when the log-odds clamp is reached, and callers
+/// should use the returned value for logging and the signal ledger.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_post(
+pub fn apply_scaled(
     l_stored: &mut f64,
     belief_updated_at: &mut i64,
-    direction: Direction,
-    strength: u8,
+    impulse_scale: f64,
     p_market_now: f64,
     now: i64,
     kappa: f64,
@@ -139,36 +110,13 @@ pub fn apply_post(
         now,
         halflife_hours,
     );
-    let impulse = nominal_impulse(direction, strength, kappa);
+    let impulse = kappa * impulse_scale;
     let new_l = (decayed + impulse).clamp(-LOG_ODDS_CLAMP, LOG_ODDS_CLAMP);
 
     *l_stored = new_l;
     *belief_updated_at = now;
 
     new_l - decayed
-}
-
-/// Applies one post using [`BeliefParams`].
-#[allow(clippy::too_many_arguments)]
-pub fn apply_post_with_params(
-    l_stored: &mut f64,
-    belief_updated_at: &mut i64,
-    direction: Direction,
-    strength: u8,
-    p_market_now: f64,
-    now: i64,
-    params: BeliefParams,
-) -> f64 {
-    apply_post(
-        l_stored,
-        belief_updated_at,
-        direction,
-        strength,
-        p_market_now,
-        now,
-        params.kappa,
-        params.halflife_hours,
-    )
 }
 
 /// Returns `(log-odds, clamped probability)` for an operator `/override`.
@@ -235,84 +183,33 @@ mod tests {
     }
 
     #[test]
-    fn strong_yes_impulse_uses_full_strength() {
+    fn full_scale_impulse_uses_kappa() {
         let mut l = 0.0;
         let mut updated = 0;
-        let delta = apply_post(
-            &mut l,
-            &mut updated,
-            Direction::StrongYes,
-            3,
-            0.5,
-            0,
-            1.1,
-            4.0,
-        );
+        let delta = apply_scaled(&mut l, &mut updated, 1.0, 0.5, 0, 1.1, 4.0);
         assert!((delta - 1.1).abs() < EPS);
         assert!((l - 1.1).abs() < EPS);
     }
 
     #[test]
-    fn negative_and_neutral_directions_behave_as_expected() {
+    fn impulse_scale_sign_and_magnitude_are_respected() {
         let mut l = 0.0;
         let mut updated = 0;
-        let no_delta = apply_post(
-            &mut l,
-            &mut updated,
-            Direction::No,
-            3,
-            0.5,
-            0,
-            1.1,
-            4.0,
-        );
-        assert!(no_delta < 0.0);
+        let no_delta = apply_scaled(&mut l, &mut updated, -0.5, 0.5, 0, 1.1, 4.0);
+        assert!((no_delta + 0.55).abs() < EPS);
 
         let mut strong_no_l = 0.0;
         let mut strong_no_updated = 0;
-        let strong_no_delta = apply_post(
-            &mut strong_no_l,
-            &mut strong_no_updated,
-            Direction::StrongNo,
-            3,
-            0.5,
-            0,
-            1.1,
-            4.0,
-        );
-        assert!(strong_no_delta < 0.0);
+        let strong_no_delta =
+            apply_scaled(&mut strong_no_l, &mut strong_no_updated, -1.0, 0.5, 0, 1.1, 4.0);
+        assert!((strong_no_delta + 1.1).abs() < EPS);
 
         let mut neutral_l = 0.0;
         let mut neutral_updated = 0;
-        let neutral_delta = apply_post(
-            &mut neutral_l,
-            &mut neutral_updated,
-            Direction::Neutral,
-            3,
-            0.5,
-            0,
-            1.1,
-            4.0,
-        );
+        let neutral_delta =
+            apply_scaled(&mut neutral_l, &mut neutral_updated, 0.0, 0.5, 0, 1.1, 4.0);
         assert_eq!(neutral_delta, 0.0);
         assert_eq!(neutral_l, 0.0);
-
-        let zero_strength = apply_post(
-            &mut neutral_l,
-            &mut neutral_updated,
-            Direction::StrongYes,
-            0,
-            0.5,
-            0,
-            1.1,
-            4.0,
-        );
-        assert_eq!(zero_strength, 0.0);
-    }
-
-    #[test]
-    fn strength_above_three_is_clamped() {
-        assert!((nominal_impulse(Direction::StrongYes, 9, 1.1) - 1.1).abs() < EPS);
     }
 
     #[test]
@@ -321,16 +218,7 @@ mod tests {
         let mut updated = 0;
 
         for _ in 0..100 {
-            apply_post(
-                &mut l,
-                &mut updated,
-                Direction::StrongYes,
-                3,
-                0.5,
-                0,
-                1.1,
-                4.0,
-            );
+            apply_scaled(&mut l, &mut updated, 1.0, 0.5, 0, 1.1, 4.0);
         }
 
         assert_eq!(l, LOG_ODDS_CLAMP);
@@ -342,16 +230,7 @@ mod tests {
     fn returned_impulse_reflects_clamping() {
         let mut l = LOG_ODDS_CLAMP - 0.05;
         let mut updated = 0;
-        let delta = apply_post(
-            &mut l,
-            &mut updated,
-            Direction::StrongYes,
-            3,
-            0.5,
-            0,
-            1.1,
-            4.0,
-        );
+        let delta = apply_scaled(&mut l, &mut updated, 1.0, 0.5, 0, 1.1, 4.0);
 
         assert!((delta - 0.05).abs() < 1e-12, "got {delta}");
         assert_eq!(l, LOG_ODDS_CLAMP);
@@ -360,19 +239,10 @@ mod tests {
     #[test]
     fn decay_is_applied_before_the_impulse() {
         // Start at logit(0.8). After one half-life toward 0.5 the belief is
-        // logit(2/3) ≈ 0.6931, then a zero-strength post changes nothing.
+        // logit(2/3) ≈ 0.6931, then a zero impulse changes nothing.
         let mut l = logit(0.8);
         let mut updated = 0;
-        let delta = apply_post(
-            &mut l,
-            &mut updated,
-            Direction::Neutral,
-            0,
-            0.5,
-            4 * HOUR,
-            1.1,
-            4.0,
-        );
+        let delta = apply_scaled(&mut l, &mut updated, 0.0, 0.5, 4 * HOUR, 1.1, 4.0);
 
         assert_eq!(delta, 0.0);
         assert!((l - std::f64::consts::LN_2).abs() < 1e-9, "got {l}");
@@ -389,25 +259,5 @@ mod tests {
         assert_eq!(clamped_low, PROB_CLAMP);
         let (_, clamped_high) = override_probability(1.0);
         assert_eq!(clamped_high, 1.0 - PROB_CLAMP);
-    }
-
-    #[test]
-    fn apply_post_with_params_delegates() {
-        let params = BeliefParams {
-            kappa: 1.1,
-            halflife_hours: 4.0,
-        };
-        let mut l = 0.0;
-        let mut updated = 0;
-        let delta = apply_post_with_params(
-            &mut l,
-            &mut updated,
-            Direction::StrongYes,
-            3,
-            0.5,
-            0,
-            params,
-        );
-        assert!((delta - 1.1).abs() < EPS);
     }
 }

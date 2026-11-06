@@ -39,9 +39,9 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::error::AppResult;
 use crate::sieve::EngineRegistry;
-use crate::triage::{self, TriageClient};
+use crate::triage::{Target, TriageClient};
 use crate::types::{
-    Direction, ExtractedPost, MarketId, MarketStatus, SignalRecord, TrackedMarket,
+    Direction, ExtractedPost, MarketId, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket,
 };
 
 /// Number of jobs one market's triage queue buffers before dropping the oldest.
@@ -241,9 +241,13 @@ pub enum PipelineEvent {
         author_handle: String,
         author_did: String,
         text: String,
+        /// Answer text for multiple-choice markets; `None` for binary markets.
+        answer: Option<String>,
         direction: Direction,
-        strength: u8,
-        rationale: String,
+        p_evidence: f64,
+        p_target: f64,
+        strength: f64,
+        p_priced: f64,
         material: bool,
         impulse: f64,
         p_before: f64,
@@ -475,7 +479,7 @@ impl Pipeline {
     /// Triages one post and applies the resulting belief update.
     ///
     /// A triage failure leaves belief untouched. A belief persistence failure
-    /// also leaves the cached and persisted state untouched, but the triage row
+    /// also leaves the cached and persisted state untouched, but the signal row
     /// is still written and the signal event is still emitted so the failure is
     /// visible downstream.
     async fn process(&self, job: TriageJob) {
@@ -494,9 +498,8 @@ impl Pipeline {
 
         let now = Utc::now().timestamp();
         let p_market = market.p_market_last;
-        let kappa = self.config.belief_kappa;
         let halflife = self.config.belief_halflife_hours;
-        let p_before = belief::current_p_internal(
+        let market_p_before = belief::current_p_internal(
             market.p_internal_log_odds,
             market.belief_updated_at,
             p_market,
@@ -505,8 +508,8 @@ impl Pipeline {
         );
 
         let answers = self.db.list_answers(&market.id).unwrap_or_default();
-        let result = match self.triage.evaluate(&market, &answers, &post, None, p_market).await {
-            Ok(result) => result,
+        let assessment = match self.triage.evaluate(&market, &answers, &post, None, p_market).await {
+            Ok(assessment) => assessment,
             Err(error) => {
                 self.emit(PipelineEvent::Error {
                     market_id: Some(market.id.clone()),
@@ -516,119 +519,84 @@ impl Pipeline {
             }
         };
 
-        let material = triage::is_material(&result);
+        let outcome = &assessment.outcome;
+        let material = assessment.impulse_scale.is_some();
+        let direction = direction_of(assessment.impulse_scale);
+        let answer_id = match &outcome.target {
+            Target::Answer(id) => Some(id.clone()),
+            Target::Binary => None,
+        };
+        let answer_text = answer_id.as_ref().and_then(|id| {
+            answers
+                .iter()
+                .find(|answer| &answer.id == id)
+                .map(|answer| answer.text.clone())
+        });
 
-        if !answers.is_empty() {
-            // Multiple-choice market processing
-            for ans_triage in &result.affected_answers {
-                if ans_triage.direction == Direction::Neutral || ans_triage.strength == 0 {
-                    continue;
-                }
-                if let Ok(Some(ans)) = self.db.get_answer(&market.id, &ans_triage.answer_id) {
-                    let mut log_odds = ans.p_internal_log_odds;
-                    let mut updated_at = ans.belief_updated_at;
-                    let ans_p_market = ans.p_market_last;
-                    let applied_impulse = belief::apply_post(
-                        &mut log_odds,
-                        &mut updated_at,
-                        ans_triage.direction,
-                        ans_triage.strength,
-                        ans_p_market,
-                        now,
-                        kappa,
-                        halflife,
-                    );
-                    let ans_p_after = belief::sigmoid(log_odds);
-                    let _ = self.db.update_answer_belief(&market.id, &ans.id, log_odds, ans_p_market, updated_at);
-
-                    let record = SignalRecord {
-                        id: 0,
-                        market_id: market.id.clone(),
-                        answer_id: Some(ans.id.clone()),
-                        post_uri: post.uri.clone(),
-                        author_handle: post.handle.clone(),
-                        post_text: post.text.clone(),
-                        material: true,
-                        direction: ans_triage.direction,
-                        strength: ans_triage.strength,
-                        impulse: applied_impulse,
-                        p_after: ans_p_after,
-                        created_at: now,
-                    };
-                    let _ = self.db.insert_signal(&record);
-                }
-            }
-
-            self.emit(PipelineEvent::Signal {
-                market_id: market.id,
-                question: market.question,
-                post_uri: post.uri,
-                author_handle: post.handle,
-                author_did: post.did,
-                text: post.text,
-                direction: result.direction.unwrap_or(Direction::Neutral),
-                strength: result.strength,
-                rationale: result.rationale,
-                material,
-                impulse: 0.0,
-                p_before,
-                p_after: p_before,
-                p_market,
-                created_at: now,
-            });
-            return;
-        }
-
-        let direction = result.direction.unwrap_or(Direction::Neutral);
         let mut impulse = 0.0;
-        let mut p_after = p_before;
+        let mut p_before = market_p_before;
+        let mut p_after = market_p_before;
 
-        if material {
-            let mut log_odds = market.p_internal_log_odds;
-            let mut updated_at = market.belief_updated_at;
-            let applied_impulse = belief::apply_post(
-                &mut log_odds,
-                &mut updated_at,
-                direction,
-                result.strength,
-                p_market,
-                now,
-                kappa,
-                halflife,
-            );
-            let candidate_after = belief::sigmoid(log_odds);
-
-            match self
-                .db
-                .update_belief(&market.id, log_odds, p_market, updated_at)
-            {
-                Ok(()) => {
-                    impulse = applied_impulse;
-                    p_after = candidate_after;
-                    self.cache
-                        .record_belief(&market.id, log_odds, p_market, updated_at);
-                }
-                Err(error) => {
-                    self.emit(PipelineEvent::Error {
+        if let Some(scale) = assessment.impulse_scale {
+            match &outcome.target {
+                Target::Binary => match self.apply_to_market(&market, scale, p_market, now) {
+                    Ok((applied, after)) => {
+                        impulse = applied;
+                        p_after = after;
+                    }
+                    Err(message) => self.emit(PipelineEvent::Error {
                         market_id: Some(market.id.clone()),
-                        message: format!("failed to persist belief update: {error}"),
-                    });
-                }
+                        message,
+                    }),
+                },
+                Target::Answer(id) => match self.db.get_answer(&market.id, id) {
+                    Ok(Some(answer)) => {
+                        p_before = belief::current_p_internal(
+                            answer.p_internal_log_odds,
+                            answer.belief_updated_at,
+                            answer.p_market_last,
+                            now,
+                            halflife,
+                        );
+                        match self.apply_to_answer(&market, &answer, scale, now) {
+                            Ok((applied, after)) => {
+                                impulse = applied;
+                                p_after = after;
+                            }
+                            Err(message) => self.emit(PipelineEvent::Error {
+                                market_id: Some(market.id.clone()),
+                                message,
+                            }),
+                        }
+                    }
+                    Ok(None) => self.emit(PipelineEvent::Error {
+                        market_id: Some(market.id.clone()),
+                        message: format!("triage targeted an untracked answer: {id}"),
+                    }),
+                    Err(error) => self.emit(PipelineEvent::Error {
+                        market_id: Some(market.id.clone()),
+                        message: format!("failed to load the targeted answer: {error}"),
+                    }),
+                },
             }
         }
 
         let record = SignalRecord {
             id: 0,
             market_id: market.id.clone(),
-            answer_id: None,
+            answer_id: answer_id.clone(),
             post_uri: post.uri.clone(),
             author_handle: post.handle.clone(),
             post_text: post.text.clone(),
             material,
             direction,
-            strength: result.strength,
+            strength: round_strength(outcome.strength),
             impulse,
             p_after,
+            p_evidence: Some(outcome.p_evidence),
+            p_target: Some(outcome.p_target),
+            strength_real: Some(outcome.strength),
+            p_priced: Some(outcome.p_priced),
             created_at: now,
         };
 
@@ -639,6 +607,16 @@ impl Pipeline {
             });
         }
 
+        tracing::debug!(
+            cost_usd = outcome.cost_usd,
+            p_evidence = outcome.p_evidence,
+            p_target = outcome.p_target,
+            strength = outcome.strength,
+            p_priced = outcome.p_priced,
+            impulse,
+            "triaged post"
+        );
+
         self.emit(PipelineEvent::Signal {
             market_id: market.id,
             question: market.question,
@@ -646,9 +624,12 @@ impl Pipeline {
             author_handle: post.handle,
             author_did: post.did,
             text: post.text,
+            answer: answer_text,
             direction,
-            strength: result.strength,
-            rationale: result.rationale,
+            p_evidence: outcome.p_evidence,
+            p_target: outcome.p_target,
+            strength: outcome.strength,
+            p_priced: outcome.p_priced,
             material,
             impulse,
             p_before,
@@ -657,6 +638,66 @@ impl Pipeline {
             created_at: now,
         });
     }
+
+    /// Applies one impulse to the market belief and refreshes the cache.
+    ///
+    /// Returns `(applied impulse, resulting probability)`. On a persistence
+    /// failure the cached and stored state stay untouched.
+    fn apply_to_market(
+        &self,
+        market: &TrackedMarket,
+        scale: f64,
+        p_market: f64,
+        now: i64,
+    ) -> Result<(f64, f64), String> {
+        let mut log_odds = market.p_internal_log_odds;
+        let mut updated_at = market.belief_updated_at;
+        let applied = belief::apply_scaled(
+            &mut log_odds,
+            &mut updated_at,
+            scale,
+            p_market,
+            now,
+            self.config.belief_kappa,
+            self.config.belief_halflife_hours,
+        );
+        let after = belief::sigmoid(log_odds);
+
+        self.db
+            .update_belief(&market.id, log_odds, p_market, updated_at)
+            .map_err(|error| format!("failed to persist belief update: {error}"))?;
+        self.cache
+            .record_belief(&market.id, log_odds, p_market, updated_at);
+        Ok((applied, after))
+    }
+
+    /// Applies one impulse to the targeted answer's belief.
+    fn apply_to_answer(
+        &self,
+        market: &TrackedMarket,
+        answer: &TrackedAnswer,
+        scale: f64,
+        now: i64,
+    ) -> Result<(f64, f64), String> {
+        let mut log_odds = answer.p_internal_log_odds;
+        let mut updated_at = answer.belief_updated_at;
+        let applied = belief::apply_scaled(
+            &mut log_odds,
+            &mut updated_at,
+            scale,
+            answer.p_market_last,
+            now,
+            self.config.belief_kappa,
+            self.config.belief_halflife_hours,
+        );
+        let after = belief::sigmoid(log_odds);
+
+        self.db
+            .update_answer_belief(&market.id, &answer.id, log_odds, answer.p_market_last, updated_at)
+            .map_err(|error| format!("failed to persist answer belief update: {error}"))?;
+        Ok((applied, after))
+    }
+
 
     fn emit(&self, event: PipelineEvent) {
         // No subscribers is normal before the Discord consumer starts.
@@ -668,6 +709,16 @@ impl Pipeline {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Coarse direction for the ledger and the Discord embed.
+fn direction_of(scale: Option<f64>) -> Direction {
+    scale.map(Direction::from_scale).unwrap_or(Direction::Neutral)
+}
+
+/// Rounds the expected strength onto the legacy integer column.
+fn round_strength(strength: f64) -> u8 {
+    strength.round().clamp(0.0, 3.0) as u8
 }
 
 /// Logs a saturation warning no more often than [`QUEUE_LAG_WARN_INTERVAL`].

@@ -23,7 +23,7 @@ const ANSWER_COLUMNS: &str = "id, market_id, text, p_internal_log_odds, p_market
      belief_updated_at, yes_shares, no_shares, created_at";
 
 const SIGNAL_COLUMNS: &str = "id, market_id, answer_id, post_uri, author_handle, post_text, material, \
-     direction, strength, impulse, p_after, created_at";
+     direction, strength, impulse, p_after, created_at, p_evidence, p_target, strength_real, p_priced";
 
 const TRADE_COLUMNS: &str = "id, market_id, answer_id, action, mana_amount, shares_delta, p_internal, \
      p_market, trigger_post_uri, manifold_bet_id, created_at";
@@ -98,6 +98,11 @@ impl Db {
         if !table_has_column(conn, "tracked_markets", "deleted_at")? {
             conn.execute_batch(include_str!("../migrations/003_soft_delete.sql"))
                 .context("applying database migration 003 (soft delete)")?;
+        }
+        // 004: calibrated triage probabilities on `signal_ledger`.
+        if !table_has_column(conn, "signal_ledger", "p_evidence")? {
+            conn.execute_batch(include_str!("../migrations/004_signal_probabilities.sql"))
+                .context("applying database migration 004 (signal probabilities)")?;
         }
         Ok(())
     }
@@ -336,8 +341,9 @@ impl Db {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO signal_ledger (market_id, answer_id, post_uri, author_handle, post_text, material, \
-             direction, strength, impulse, p_after, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             direction, strength, impulse, p_after, created_at, p_evidence, p_target, strength_real, \
+             p_priced) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 record.market_id,
                 record.answer_id,
@@ -350,6 +356,10 @@ impl Db {
                 record.impulse,
                 record.p_after,
                 record.created_at,
+                record.p_evidence,
+                record.p_target,
+                record.strength_real,
+                record.p_priced,
             ],
         )
         .with_context(|| format!("inserting signal for market {}", record.market_id))?;
@@ -662,6 +672,10 @@ fn signal_from_row(row: &Row<'_>) -> rusqlite::Result<SignalRecord> {
         impulse: row.get(9)?,
         p_after: row.get(10)?,
         created_at: row.get(11)?,
+        p_evidence: row.get(12)?,
+        p_target: row.get(13)?,
+        strength_real: row.get(14)?,
+        p_priced: row.get(15)?,
     })
 }
 
@@ -740,6 +754,10 @@ mod tests {
             strength: 2,
             impulse: 0.37,
             p_after: 0.62,
+            p_evidence: Some(0.81),
+            p_target: Some(0.88),
+            strength_real: Some(2.4),
+            p_priced: Some(0.1),
             created_at,
         }
     }
