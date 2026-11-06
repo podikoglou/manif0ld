@@ -558,6 +558,10 @@ Triggered by `/track url:<url> budget:<mana>`:
 **Embeds emitted into threads:**
 
 1. `[ONBOARDED]` — market question, link, budget, initial `P_market`, Sieve source block.
+   The rule arrives as up to three fields named `Sieve source #1`, `#2`, `#3`;
+   these are continuation chunks of one program, not onboarding attempts. The
+   same split and naming is used by `/status market`, so the two views never
+   disagree; the last field states how many chunks were dropped.
 2. `[SIGNAL]` — author handle + followers, link to Bluesky post, answer (MCQ), evidence / direction / strength / priced probabilities, `P_internal` before → after.
 3. `[TRADE]` — action (BUY_YES / SELL_YES / etc.), amount, shares delta, `P_internal` vs `P_market`, remaining available budget.
 4. `[ERROR]` — any trade rejection, Manifold API error, LLM call failure, or rate-limit breach.
