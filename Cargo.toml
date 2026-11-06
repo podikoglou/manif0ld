@@ -1,5 +1,5 @@
 [package]
-name = "bsky-manifold-arb"
+name = "manif0ld"
 version = "0.1.0"
 edition = "2021"
 description = "Bluesky to Manifold auto-trader driven by Sieve filtering"
