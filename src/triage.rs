@@ -60,8 +60,9 @@ const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// `reqwest` resets this on every successful read, so it bounds a stalled
 /// request and a stalled stream without capping how long a live stream may
 /// run. Without it a provider that stops sending holds the onboarding agent
-/// open until the whole `/track` run times out.
-const LLM_READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// open until the whole `/track` run times out. Observed model turns answer in
+/// a few seconds, so this only ever fires on a dead connection.
+const LLM_READ_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Expected evidence strength, on the 0-3 rubric, below which a post is noise.
 const MIN_STRENGTH: f64 = 0.5;
