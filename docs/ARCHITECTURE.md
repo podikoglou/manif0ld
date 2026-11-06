@@ -107,7 +107,8 @@ flowchart BT
     DB["db.rs<br/>repository"]
     SIEVE["sieve.rs<br/>EngineRegistry"]
     BEL["belief.rs<br/>pure math"]
-    TRIAGE["triage.rs<br/>LlmClient + TriageClient<br/>+ prompt + parser"]
+    TRIAGE["triage.rs<br/>TriageClient<br/>+ questions + assess"]
+    LLM["llm.rs<br/>LlmClient + chat transport"]
     STORE["market_store.rs<br/>MarketStore<br/>single writer of tracked_markets"]
     PIPE["pipeline.rs<br/>Pipeline + PipelineEvent"]
     BOOK["book.rs<br/>Book + legs + policy"]
@@ -132,6 +133,8 @@ flowchart BT
     TRIAGE --> CFG
     TRIAGE --> TYPES
     TRIAGE --> ERR
+    LLM --> CFG
+    LLM --> ERR
     STORE --> DB
     STORE --> ERR
     STORE --> TYPES
@@ -160,7 +163,7 @@ flowchart BT
     ONB --> SIEVE
     ONB --> STORE
     ONB --> TYPES
-    ONB -->|"LlmClient,<br/>json helpers"| TRIAGE
+    ONB -->|"LlmClient"| LLM
     ONB -->|"delegates the run"| AGENT
     AGENT -->|"model, prompt,<br/>OnboardUpdate"| ONB
     AGENT -->|"compile +<br/>SIEVE_SYSTEM_PROMPT"| ONB
@@ -207,8 +210,12 @@ flowchart BT
    accounting, and policy; `book` never imports `trade`. It depends on `types`,
    `db`, `market_store`, `belief`, `config`, and `error` only, so the trading
    rules are testable without the HTTP client.
-5. **`onboarding.rs` reaches into `triage.rs`** for `LlmClient` and `snippet`.
-   LLM transport is coupled to the triage feature.
+5. **The chat transport is its own leaf.** `onboarding.rs` imports `LlmClient`
+   from `crate::llm`. `triage.rs` imports nothing from `llm`, because triage is a
+   decision model that reaches OpenRouter's decisions endpoint through
+   `rig::typesafeai`; the two modules are peers, not parent and child. `llm`
+   depends only on `config`, `error`, and `rig`, so the transport can be read
+   without knowing a domain type.
    `onboarding.rs` and `onboarding_agent.rs` form one deliberate pair: the
    service prepares and activates a draft and delegates the model run, while the
    agent owns the tools and imports the prompt, market type, and progress events
@@ -444,34 +451,67 @@ apply_post(&mut l_stored, &mut updated_at, direction, strength, p_market, now, k
 sigmoid(log_odds) / logit(p) / override_probability(p) -> (log_odds, p)
 ```
 
-### `triage.rs`
+### `llm.rs`
+
+Chat transport only: provider construction and completion models, built on the
+vendored `rig`.
 
 ```rust
+const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20)
+const LLM_READ_TIMEOUT: Duration = Duration::from_secs(45)
+const ONBOARDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(120)
+
 pub struct LlmClient { cloudflare: Option<...>, openrouter: Option<...> }
 
 LlmClient::new() -> AppResult<Self>              // reads env through rig providers
-LlmClient::complete(model, system, user) -> String
 LlmClient::completion_model(model) -> rig::DynModel<rig::operation::Completion>
 
-pub struct TriageClient { client: LlmClient, model: String }
+chat_transport(total) -> AppResult<rig::http_client::ReqwestClient>   // private
+```
+
+`chat_transport` builds the one `reqwest` client both providers share. It sets a
+20 s connect timeout, a 45 s read timeout, and a total deadline (120 s for an
+onboarding turn). The total deadline is the one that ends a stalled streamed
+turn: OpenRouter holds a queued request open with `: OPENROUTER PROCESSING`
+comment lines, and every comment is a read that resets the read timeout.
+
+`onboarding.rs` is the only consumer. `triage.rs` is a decision model and has no
+edge to this module. The module doc states what must not move in: prompts,
+response parsers, retries, and feature logic belong to the feature module that
+needs them.
+
+### `triage.rs`
+
+The decision model: four typed questions to OpenRouter's
+`POST /api/alpha/decisions`, through `rig::typesafeai`.
+
+```rust
+pub enum Polarity { Yes, No }
+pub enum EvidenceLevel { Noise, Weak, Strong, Definitive }
+pub enum Target { Binary, Answer(String), NoAnswer }
+pub struct TriageOutcome { p_evidence, p_target, alternatives, strength,
+                           p_priced, target, cost_usd }
+pub struct TriagePolicy { min_evidence }
+pub struct TriageAssessment { outcome, impulse_scale }
+pub struct TriageClient { client: Jev, model: String, policy: TriagePolicy }
 
 TriageClient::new(&Config)
 TriageClient::evaluate(
     &TrackedMarket,
     &[TrackedAnswer],
     &ExtractedPost,
-    Option<&str>,          // currently always None
+    Option<u64>,           // follower count
     p_market: f64,
-) -> AppResult<TriageResult>
+) -> AppResult<TriageAssessment>
 
-build_prompt(...) / build_multiple_choice_prompt(...)
-parse_triage_response(raw) -> TriageResult
-is_material(&TriageResult) -> bool
+assess(&TriageOutcome, TriagePolicy) -> Option<f64>
 ```
 
-`TriageClient` is a thin feature wrapper. The reusable LLM transport is
-`LlmClient`. Triage uses `complete`; onboarding passes `completion_model` to the
-`rig` agent builder in `onboarding_agent.rs`.
+`TriageClient` is a thin feature wrapper over the decisions client. The question
+wording and the answer→outcome conversions live here and nowhere else. A decision
+model returns calibrated probabilities instead of generated text, so triage
+parses no JSON and keeps no output schema to drift. The chat transport for
+onboarding is `llm.rs`, not this module.
 
 ### `pipeline.rs`
 
@@ -1030,18 +1070,30 @@ refactor.
 - Split `ManifoldClient` (transport) from `TradeExecutor` (policy and persistence).
   The client is already close to that split.
 
-### F. `LlmClient` sits inside `triage.rs`
+### F. `LlmClient` sat inside `triage.rs` — **resolved**
 
-**Today:** `onboarding` imports `LlmClient`, `extract_json_object`, and `snippet`
-from `triage`.
+**Then:** `onboarding` imported `LlmClient` and `snippet` from `triage`, so the
+chat transport lived inside a feature that never called it. The review described
+a different `triage.rs`: it listed a JSON-extraction helper that no longer exists
+anywhere in `src/`, a chat client field on `TriageClient`, a text-completion
+method, a prompt builder, a response parser, and a materiality predicate. It also
+predicted two edges into the new module. Five counts of the review were stale
+against the code.
 
-**Why it hurts:** LLM transport is a shared infrastructure concern, but it is named
-after one feature.
+**Now:** `llm.rs` owns `LlmClient`, `chat_transport`, and the three chat
+deadlines (20 s connect, 45 s read, 120 s total). `onboarding.rs` imports
+`crate::llm::LlmClient`, and `snippet` — the byte-budget error-body trimmer it
+alone used — is private to `onboarding.rs` next to `get_json`. The only real edge
+is `onboarding → llm`; `triage` has no edge to `llm`, because it is a decision
+model on OpenRouter's decisions endpoint and never used the chat transport. The
+review's `triage → llm` arrow is therefore not drawn.
 
-**Candidate cut:** `llm.rs` holds `LlmClient` + JSON helpers. `triage.rs` keeps the
-prompt, model choice, `TriageResult` parsing, and `is_material`. `onboarding.rs`
-keeps the Sieve prompt and compile loop. This makes the dependency direction clean:
-`triage → llm`, `onboarding → llm`.
+**Residual:** the new `snippet` is still a near-duplicate of `trade::snippet`.
+They differ in unit (bytes vs characters), in trimming, and in the suffix
+condition, so a merge would change the error text of one of the two paths. The
+module is also small enough to become a grab bag; the module doc's "what this
+module must not become" paragraph is the guard, and the acceptance checks for
+that plan assert `llm.rs` defines no prompt, no parser, and no `serde` type.
 
 ### G. Event payloads are the de facto API
 
@@ -1153,7 +1205,7 @@ flowchart TB
     subgraph INFRA["Infrastructure"]
         STORE["MarketStore<br/>DB + snapshot, one writer"]
         REG2["EngineRegistry"]
-        LLM2["LlmClient"]
+        LLM2["llm.rs<br/>LlmClient<br/>chat transport"]
         MANIFOLD["ManifoldClient"]
         EVENTS["Event bus<br/>PipelineEvent, TradeEvent"]
         DB2[("SQLite")]
@@ -1169,7 +1221,6 @@ flowchart TB
     Onboarding --> REG2
     PIPELINE2 --> REG2
     PIPELINE2 --> STORE
-    PIPELINE2 --> LLM2
     PIPELINE2 --> EVENTS
     EVENTS --> TRADING
     TRADING --> POLICY
@@ -1189,8 +1240,10 @@ If you make only three cuts, make these:
    registry membership cannot disagree. This removes duplicated teardown in
    Discord.~~ Done: `control.rs` owns every operator-driven transition and calls
    `unregister` only from its one teardown body.
-3. **Move `LlmClient` into `llm.rs`** so triage and onboarding are peers, not parent
-   and child.
+3. ~~**Move `LlmClient` into `llm.rs`** so triage and onboarding are peers, not parent
+   and child.~~ Done: `llm.rs` holds `LlmClient` and the chat transport, and
+   `onboarding` imports it; `triage` keeps the decision model and has no edge to
+   `llm`.
 
 Preserve these invariants during any move (they are behavioral, not structural):
 

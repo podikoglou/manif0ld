@@ -59,6 +59,7 @@ manif0ld/
     ├── extract.rs       # Jetstream event → ExtractedPost (structural extraction only)
     ├── ingest.rs        # Jetstream websocket, reconnect, live-tail subscribe
     ├── sieve.rs         # EngineRegistry + per-market CompiledSieve wrapper
+    ├── llm.rs           # chat transport for onboarding (rig providers)
     ├── triage.rs        # OpenRouter decisions call, question wording, impulse fold
     ├── belief.rs        # log-odds state, decay, impulse
     ├── trade.rs         # Manifold client, Kelly sizing, order manager
