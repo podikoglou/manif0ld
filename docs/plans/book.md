@@ -1,6 +1,7 @@
 # Plan: one position book per market (`Book`)
 
-Status: ready to implement.
+Status: implemented (`6be938d`, `4401515`, `8b823de`). §6 items 9-11 were found
+during implementation and are recorded there.
 
 ## 1. Problem
 
@@ -333,11 +334,14 @@ behave identically; the tests in §8 are the enforcement.
 | 1 | Binary fetches `positions()` and uses `.root`; `position()` delegates to it | one parser, same URL | same numbers; `position()` kept for the live tests |
 | 2 | Binary entry has no price band and no fraction cap | `TradeLimits::binary()` sets both to `None` | deliberately identical; test 12 pins it |
 | 3 | A binary market holding **both** YES and NO shares sells both in one evaluation | one planner over legs | new; unreachable through the bot's own path (no scale-in), reachable if the operator traded manually. Test 14 documents it |
-| 4 | Multiple-choice liquidation now inserts answer rows it did not know | `liquidate` uses the same `observe_prices` as `evaluate` | harmless: a new answer has no position, so nothing is sold |
+| 4 | Multiple-choice liquidation refreshes answer prices and text, and inserts answers it did not know | `liquidate` shares `prepare` with `evaluate` | a new answer has no position, so nothing is sold; a sell now records the freshly observed `p_market` instead of the stored one |
 | 5 | An existing answer whose remote `probability` is absent is forced to `0.5` | today's `sync_answers` does exactly this (`1612-1628`) | preserved verbatim; recorded as residual §10 |
 | 6 | `sync_market` returns a row whose position columns equal the aggregate | `Book::market()` applies it | same values as today's mutated struct |
 | 7 | Root `p_market_last` still is not refreshed for a multiple-choice market | today only the binary path writes it | preserved; see residual §10 |
-| 8 | Log lines for reconciliation keep their fields and wording | operators grep them | moved into `book.rs`, text unchanged |
+| 8 | Reconciliation `warn!` lines keep their fields and wording; the other trade messages were unified | operators grep the reconcile lines | the kill-switch warn now always carries `action`; the resolved-liquidation and no-shares messages use the binary wording for both shapes; the dry-run plan message is `"planned trade"` |
+| 9 | The ledger row is written before the position rows | `execute` records the trade, the caller then calls `Book::persist` | only observable if a write fails mid-trade. Neither order is atomic, and the 60 s reconcile repairs the position either way |
+| 10 | A dry-run binary market logs one extra `"planned trade"` line | the planned-action log moved out of the multiple-choice path (§7) | log volume only |
+| 11 | `Book::load` reads answer rows before the `Active`/`Closed` guard | the book is loaded whole | a DB read error on answers surfaces where the old code returned `Ok(None)` / `AlreadyClosed` |
 
 ## 7. Call-site migration
 
@@ -520,6 +524,11 @@ files) and do not reformat unrelated files.
   plan only stops the executor from needing a whole `TrackedMarket` to build an event.
 - **Answer-level budget races are unchanged.** A sell on an answer leg updates the
   leg and then the root aggregate in one synchronous block, as today.
+- **`Position.profit` is always zero in `Book::aggregate`, and
+  `ManifoldClient::position()` now returns the root of `positions()`.** Nothing
+  reads `profit` today, and the book tracks cost basis rather than Manifold's
+  realized-plus-unrealized profit. A future caller that needs remote profit must
+  read `positions().root.profit` directly.
 - **Live tests cannot run here.** `live_dry_run_places_a_simulated_answer_bet` and
   `live_sync_reads_every_answer_of_both_mechanisms` call `sync_market`/`evaluate_market`
   with the new internals but keep the same public API, so they need no edit; they
