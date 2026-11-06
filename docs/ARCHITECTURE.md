@@ -17,7 +17,7 @@ flowchart LR
     end
 
     subgraph TASKS["Tokio tasks in one process"]
-        T_ING["ingest::run<br/>owns WS connection + cursor"]
+        T_ING["ingest::run<br/>owns WS connection, live tail"]
         T_PIPE["Pipeline::run<br/>owns dispatch loop"]
         T_WORK["per-market worker task<br/>one per market, sequential"]
         T_TRADE["TradeExecutor::run<br/>owns 60 s ticker + signal consumer"]
@@ -40,7 +40,6 @@ flowchart LR
 
     JS -->|"commit/create"| T_ING
     T_ING -->|"broadcast ExtractedPost<br/>cap 1024"| T_PIPE
-    T_ING -->|"cursor every 5 s"| DB
     T_PIPE -->|"matching_markets(text)"| REG
     T_PIPE -->|"cache.get(id), Active check"| CACHE
     T_PIPE -->|"TriageJob<br/>broadcast cap 30 per market"| T_WORK
@@ -76,7 +75,7 @@ Any module can hold any other module's state.
 
 | Task | Spawned in | Lifetime | Owns | Ends when |
 |---|---|---|---|---|
-| `ingest::run` | `main.rs:144` | process | WS stream, cursor tracker, `post_tx` | Ctrl-C (`abort`) |
+| `ingest::run` | `main.rs:144` | process | WS stream, `post_tx` | Ctrl-C (`abort`) |
 | `Pipeline::run` | `main.rs:126` | process | `post_rx`, dispatch loop | Ctrl-C |
 | per-market worker | `pipeline.rs:433`, lazily | process, detached | `TriageJob` receiver, queue depth | sender dropped / Ctrl-C |
 | `TradeExecutor::run` | `main.rs:135` | process | pipeline event receiver, 60 s ticker | Ctrl-C |
@@ -516,7 +515,6 @@ sequenceDiagram
     JS->>IN: commit/create app.bsky.feed.post
     IN->>EX: raw JSON event
     EX-->>IN: ExtractedPost, raw text
-    IN->>DB: set kv cursor, every 5 s
     IN->>PB: send ExtractedPost
     PB->>PL: recv
     PL->>RG: matching_markets(post.text)
