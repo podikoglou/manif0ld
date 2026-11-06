@@ -5,7 +5,8 @@
 //! 1. [`ManifoldClient`] wraps the REST API (`/v0/me`, `/v0/market/{id}`,
 //!    `/v0/market/{id}/positions`, `/v0/market-probs`,
 //!    `/v0/get-user-contract-metrics-with-contracts`, `/v0/bet`,
-//!    `/v0/market/{id}/sell`).
+//!    `/v0/market/{id}/sell`, `/v0/bet/cancel/{betId}`,
+//!    `/v0/bets?kinds=open-limit`).
 //! 2. [`TradeExecutor`] is the control flow: it keeps the price columns
 //!    current from two observation sources — the broadcast websocket
 //!    ([`crate::manifold_ws`], live) and a batched REST refresh (the slow
@@ -54,7 +55,7 @@
 //! spend Reconcile-class tokens and yield to trades below the housekeeping
 //! reserve (`docs/ALGO.md` §2).
 //!
-//! # Fair-capped buys
+//! # Fair-capped buys and the expiring rest
 //!
 //! Every buy sweeps with `limitProb = clamp(p_internal) − ε`
 //! (`LIMIT_EPSILON`, default 0.01; `docs/ALGO.md` §S1) instead of the old
@@ -65,10 +66,54 @@
 //! when the probability falls to it (so the per-NO-share ceiling is
 //! `1 − limitProb`) — which is why one expression caps both sides. The
 //! probability source is the same decayed `p_internal` the edge math used in
-//! that evaluation (normalized on sum-to-one multiple-choice markets). When
-//! the cap stops the sweep before the budget is spent, Manifold fills the
-//! first portion and rests the remainder as an open limit order; only the
-//! actual shares and mana are recorded, and nothing retries or cancels.
+//! that evaluation (normalized on sum-to-one multiple-choice markets).
+//!
+//! One `POST /v0/bet` with `limitProb + amount + expiresMillisAfter` runs the
+//! **whole execution ladder by itself** (probe-verified against the backend
+//! source, `/tmp/opencode/limit_probe/SOURCE_NOTES.md`): the call consumes
+//! opposing resting orders first — at *their* price, in price-time priority —
+//! then sweeps the AMM up to the cap, and rests whatever is left as the same
+//! bet row. The rest carries `LIMIT_EXPIRY_SECS` (default 60 s, validated
+//! into `[1, 300]`) as `expiresMillisAfter`, so an edge that drifts away is
+//! bounded in time without any cancel call; matching also rejects expired
+//! orders inline the moment their `expiresAt` passes.
+//!
+//! # Own resting-order lifecycle
+//!
+//! The unfilled remainder of a fair-capped buy is real committed money, so
+//! the executor tracks it in-memory ([`OwnRestingOrders`], no schema change),
+//! fed by the buy responses, the `global/new-bet` websocket broadcasts for
+//! the bot's own user (which carry maker fills), and one boot snapshot of
+//! `GET /v0/bets?userId={bot}&kinds=open-limit` (one REST call covering every
+//! market). Three rules retire an order:
+//!
+//! 1. **Reverse drift.** After the price-mirror step of every cached
+//!    evaluation each own order is compared against a freshly derived fair
+//!    value (`should_cancel_for_drift`): a YES order is cancelled when its
+//!    limit sits more than `LIMIT_DRIFT_CANCEL` above today's
+//!    fair-capped cap, a NO order equivalently on the YES scale — never leave
+//!    a resting order that would take us into a position at odds with current
+//!    belief. Orders younger than a few seconds are never cancelled by this
+//!    policy (they were placed against the same belief), and a resting
+//!    order on the opposite side of an entry executed in the same evaluation
+//!    is cancelled immediately.
+//! 2. **Maker fills.** A websocket `BetEvent` for one of our own bets that
+//!    grew by shares since we last saw it applies those shares as a real
+//!    buy ([`Book::apply_buy`] + ledger row, provenance `maker_fill`) at the
+//!    server-reported mana — the same book flow the original taker fill
+//!    used, with the budget invariant checked first. Duplicate broadcasts
+//!    are naturally idempotent: the fill read is a delta against the stored
+//!    cumulative counters.
+//! 3. **Death.** A cancelled, fully filled, or expired order is dropped from
+//!    the map. Expiry is *not* broadcast on any websocket topic (probe
+//!    finding: a 1-minute cron flips `isCancelled` silently), so rows are
+//!    filtered by their `expiresAt` locally.
+//!
+//! Deliberate S1 deviations (documented in `docs/SPEC.md` §6.6): the resting
+//! book of *other* traders is not mirrored (the wire already gives the
+//! price-time ladder through one bet call; a passive `contract/{id}/orders`
+//! mirror is deferred to the SNIPER phase), and there is no passive sell
+//! side — `/v0/market/{id}/sell` is an instant uncapped sweep.
 //!
 //! # Secrets
 //!
@@ -81,6 +126,7 @@ use std::sync::Arc;
 /// Synchronous mutex (aliased against tokio's). Used only for locks that are
 /// taken and released inside one synchronous block.
 use std::sync::Mutex as SyncMutex;
+use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -97,7 +143,7 @@ use crate::book::{
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{AppResult, Context, anyhow, bail};
-use crate::manifold_ws::{ContractProbs, ManifoldEvent};
+use crate::manifold_ws::{BetEvent, ContractProbs, ManifoldEvent};
 use crate::market_store::MarketStore;
 use crate::pipeline::PipelineEvent;
 use crate::rate::{Priority, RateLimiter, SystemClock, WRITE_COST_TOKENS};
@@ -119,6 +165,32 @@ const ERROR_SNIPPET_CHARS: usize = 500;
 /// ticker's freshness role: batched probabilities, one portfolio position
 /// snapshot, and a single summary line (`docs/ALGO.md` §1, §2).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Age of an own resting order below which the reverse-drift and
+/// opposite-entry cancel policies skip it, in milliseconds.
+///
+/// A seconds-old order was placed against the belief of the evaluation that
+/// created it, so it cannot have drifted within the wall-clock time of one
+/// tick, and a same-tick cancellation would fight the order the ladder just
+/// placed. Orders this fresh are re-checked by the next price update.
+const OWN_ORDER_GRACE_MILLIS: i64 = 5_000;
+
+/// Margin (in whole-percent units, `×100`) used while snapping a fair-capped
+/// cap onto Manifold's whole-percent `limitProb` grid.
+///
+/// A cap computed as `fair − ε` in floating point can land an ulp below the
+/// exact percent boundary it mathematically belongs to (for example
+/// `0.5 − 0.01` = `48.99999999999999…`), and a naive floor would shave a
+/// whole extra percent off. The margin covers only that representation
+/// error — real caps differ from a boundary by far more than `1e-7`.
+const LIMIT_SNAP_EPSILON: f64 = 1e-7;
+
+/// Minimum unfilled mana for a buy remainder to count as a resting order.
+const REMAINDER_EPSILON: f64 = 1e-9;
+
+/// Expiry assumed for snapshot rows that omit `expiresAt`, in seconds
+/// (`LIMIT_EXPIRY_SECS`'s default value; the field is optional on the wire).
+const FALLBACK_LIMIT_EXPIRY_SECS: i64 = 60;
 
 /// Markets per `GET /v0/market-probs` call. Manifold documents a maximum of
 /// 100 IDs per request.
@@ -308,7 +380,15 @@ impl ManifoldClient {
         Ok((by_contract, raw_entries, raw_entries < PORTFOLIO_PAGE_SIZE))
     }
 
-    /// Buys `amount` mana of `outcome` shares at up to `limit_prob`.
+    /// Buys `amount` mana of `outcome` shares at up to `limit_prob`, with any
+    /// unfilled remainder resting for `expires_millis_after` milliseconds.
+    ///
+    /// One call runs the whole execution ladder (probe-verified, `docs/SPEC.md`
+    /// §6.6): Manifold consumes opposing resting orders first at *their* price
+    /// in price-time priority, sweeps the AMM up to `limit_prob`, and rests
+    /// whatever is left as the same bet row — the rest dies on its own when
+    /// the expiry passes (`expiresMillisAfter`; `0` omits the field, which no
+    /// production path does).
     ///
     /// Manifold interprets `limitProb` as the market probability of YES for
     /// *both* outcomes: a YES sweep stops when the probability rises to the
@@ -316,8 +396,12 @@ impl ManifoldClient {
     /// stops when the probability falls to it (so the per-NO-share ceiling is
     /// `1 − limitProb`, and `limit_prob = p_internal − ε` prices every NO
     /// share at no more than `fair_NO + ε`). Manifold rejects limit values
-    /// outside `[0.01, 0.99]`; callers clamp with
-    /// [`fair_capped_limit_prob`].
+    /// outside `[0.01, 0.99]` and off the whole-percent grid; callers clamp
+    /// and quantize with [`fair_capped_limit_prob`].
+    //
+    // clippy too_many_arguments: the parameters mirror the `POST /v0/bet`
+    // wire fields one to one; a request struct would not reduce coupling.
+    #[allow(clippy::too_many_arguments)]
     pub async fn buy(
         &self,
         market_id: &str,
@@ -326,6 +410,7 @@ impl ManifoldClient {
         answer_id: Option<&str>,
         limit_prob: f64,
         dry_run: bool,
+        expires_millis_after: i64,
     ) -> AppResult<BetResult> {
         let outcome = validate_outcome(outcome)?;
         if !amount.is_finite() || amount <= 0.0 {
@@ -335,7 +420,15 @@ impl ManifoldClient {
             bail!("buy limitProb must be finite, got {limit_prob}");
         }
 
-        let body = bet_body(market_id, outcome, amount, answer_id, limit_prob, dry_run);
+        let body = bet_body(
+            market_id,
+            outcome,
+            amount,
+            answer_id,
+            limit_prob,
+            dry_run,
+            expires_millis_after,
+        );
         let request = self
             .http
             .post(self.url("/v0/bet"))
@@ -385,14 +478,44 @@ impl ManifoldClient {
         let request = self.http.get(self.url(&path));
         let value: Value = self.send(request, "GET /v0/bets").await?;
 
-        match value {
-            Value::Array(items) => Ok(items),
-            Value::Object(mut map) => match map.remove("bets") {
-                Some(Value::Array(items)) => Ok(items),
-                _ => bail!("Manifold GET /v0/bets response did not contain a bet array"),
-            },
-            _ => bail!("Manifold GET /v0/bets response was not an array"),
-        }
+        parse_bets_envelope(value)
+    }
+
+    /// Fetches the bot's own open limit orders across every market in one
+    /// call (`GET /v0/bets?userId={bot}&kinds=open-limit`).
+    ///
+    /// This is the executor's boot snapshot of the own resting layer
+    /// ([`TradeExecutor::seed_own_orders`]): one REST call, no `contractId`
+    /// filter, verified parameter combination (`kinds` and `userId` combinable;
+    /// backend filter is `is_filled=false AND is_cancelled=false` only).
+    ///
+    /// The endpoint has **no expiry filter**: a row whose `expiresAt` has
+    /// passed can appear for up to the ~1-minute cron lag, so the caller must
+    /// filter expired rows locally — matching on Manifold already rejects an
+    /// expired order inline.
+    pub async fn open_limit_orders(&self) -> AppResult<Vec<Value>> {
+        let path = format!("/v0/bets?userId={}&kinds=open-limit", self.bot_user_id);
+        let request = self.http.get(self.url(&path));
+        let value: Value = self
+            .send(request, "GET /v0/bets?userId&kinds=open-limit")
+            .await?;
+
+        parse_bets_envelope(value)
+    }
+
+    /// Cancels one of the bot's open limit orders
+    /// (`POST /v0/bet/cancel/{betId}`, one bet per request).
+    ///
+    /// Own orders only — Manifold rejects a foreign bet id. The cancel
+    /// response (the cancelled bet) is not read by callers; success is the
+    /// verdict.
+    pub async fn cancel_bet(&self, bet_id: &str) -> AppResult<()> {
+        let path = format!("/v0/bet/cancel/{}", bet_id);
+        let request = self.http.post(self.url(&path));
+        let _value: Value = self
+            .send(request, "POST /v0/bet/cancel/{betId}")
+            .await?;
+        Ok(())
     }
 
     /// Joins a path onto the configured base URL.
@@ -446,10 +569,25 @@ fn validate_outcome(outcome: &str) -> AppResult<&str> {
     }
 }
 
+/// Unwraps the `GET /v0/bets` response envelope.
+///
+/// Both observed shapes are accepted: a bare bet array, or an object with a
+/// `bets` array.
+fn parse_bets_envelope(value: Value) -> AppResult<Vec<Value>> {
+    match value {
+        Value::Array(items) => Ok(items),
+        Value::Object(mut map) => match map.remove("bets") {
+            Some(Value::Array(items)) => Ok(items),
+            _ => bail!("Manifold GET /v0/bets response did not contain a bet array"),
+        },
+        _ => bail!("Manifold GET /v0/bets response was not an array"),
+    }
+}
+
 /// Builds the `POST /v0/bet` request body for one buy.
 ///
 /// Pure so tests can pin the exact wire shape (`docs/SPEC.md` §6.6) without an
-/// HTTP round trip.
+/// HTTP round trip. `expires_millis_after` ≤ 0 omits the expiry field.
 fn bet_body(
     market_id: &str,
     outcome: &str,
@@ -457,6 +595,7 @@ fn bet_body(
     answer_id: Option<&str>,
     limit_prob: f64,
     dry_run: bool,
+    expires_millis_after: i64,
 ) -> Value {
     let mut body = json!({
         "contractId": market_id,
@@ -465,6 +604,9 @@ fn bet_body(
         "limitProb": limit_prob,
         "dryRun": dry_run,
     });
+    if expires_millis_after > 0 {
+        body["expiresMillisAfter"] = json!(expires_millis_after);
+    }
     if let Some(aid) = answer_id {
         body["answerId"] = json!(aid);
     }
@@ -868,6 +1010,255 @@ impl TerminalMirrors {
     }
 }
 
+/// One resting limit order the bot itself owns (executor-side truth).
+///
+/// In-memory only, no schema change: a restart re-seeds the whole map with
+/// one `GET /v0/bets?userId={bot}&kinds=open-limit` call
+/// ([`TradeExecutor::seed_own_orders`]). `limit_prob` and both amount
+/// counters are YES-scale wire values as Manifold reports them; the
+/// per-outcome price of the shares the order buys is `limit_prob` for YES
+/// and `1 − limit_prob` for NO.
+#[derive(Debug, Clone)]
+struct OwnRestingOrder {
+    /// Manifold bet id: the placement and its resting remainder are the
+    /// same bet row (probe-verified), and websocket maker updates come
+    /// under this id.
+    bet_id: String,
+    market_id: String,
+    /// `None` for the binary leg, the answer id otherwise.
+    answer_id: Option<String>,
+    /// `YES` or `NO`, the outcome the order buys.
+    outcome: String,
+    /// The limit the order rests at, YES scale, whole-percent quantized —
+    /// exactly what was sent and what Manifold accepted.
+    limit_prob: f64,
+    /// Full mana the request committed (`orderAmount`).
+    order_amount: f64,
+    /// Mana filled so far (cumulative `amount`).
+    filled_amount: f64,
+    /// Shares filled so far (cumulative `shares`).
+    filled_shares: f64,
+    /// Order creation, milliseconds since epoch.
+    created_ms: i64,
+    /// Expiry, milliseconds since epoch: the server's `expiresAt` when
+    /// known, otherwise the placement-time estimate
+    /// (`created_ms` + `LIMIT_EXPIRY_SECS`).
+    expires_ms: Option<i64>,
+}
+
+/// Every own resting order, keyed market → bet id.
+///
+/// Guarded by a [`SyncMutex`] exactly like [`TerminalMirrors`]: the guard is
+/// taken and released inside one synchronous block and never held across an
+/// await, so the REST cancels and fill applications can never deadlock with
+/// it (the fill path takes `execution_lock` first, and nothing takes
+/// `own_orders` after a lock anywhere).
+#[derive(Debug, Default)]
+struct OwnRestingOrders(HashMap<MarketId, HashMap<String, OwnRestingOrder>>);
+
+impl OwnRestingOrders {
+    /// Registers (or replaces) one order.
+    fn upsert(&mut self, order: OwnRestingOrder) {
+        self.0
+            .entry(order.market_id.clone())
+            .or_default()
+            .insert(order.bet_id.clone(), order);
+    }
+
+    fn get(&self, market_id: &str, bet_id: &str) -> Option<&OwnRestingOrder> {
+        self.0.get(market_id)?.get(bet_id)
+    }
+
+    /// Removes one order, returning it when it was tracked.
+    fn remove(&mut self, market_id: &str, bet_id: &str) -> Option<OwnRestingOrder> {
+        self.0.get_mut(market_id)?.remove(bet_id)
+    }
+
+    /// Snapshot of one market's orders (cloned, so the guard can drop
+    /// before any await).
+    fn of_market(&self, market_id: &str) -> Vec<OwnRestingOrder> {
+        self.0
+            .get(market_id)
+            .map(|orders| orders.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drops every order of one market `dead` accepts and returns how many
+    /// went. Pure sweep: used for expired orders that need no cancel call.
+    fn retain_market(&mut self, market_id: &str, dead: impl Fn(&OwnRestingOrder) -> bool) -> usize {
+        let Some(orders) = self.0.get_mut(market_id) else {
+            return 0;
+        };
+        let before = orders.len();
+        orders.retain(|_, order| !dead(order));
+        before - orders.len()
+    }
+
+    /// Total unfilled mana of one market's own resting layer.
+    ///
+    /// That is committed money which has not converted to an invested
+    /// position yet, so the pre-buy budget check must count it.
+    fn outstanding(&self, market_id: &str) -> f64 {
+        self.0
+            .get(market_id)
+            .map(|orders| {
+                orders
+                    .values()
+                    .map(|order| (order.order_amount - order.filled_amount).max(0.0))
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+}
+
+/// Whether a resting order's cap is now past the day's fair-capped cap by
+/// more than the configured staleness slack (`docs/SPEC.md` §6.6).
+///
+/// Precisely, with `cap_now = fair_capped_limit_prob(p_fair_now, ε, outcome)`
+/// (the cap a fresh entry into the same outcome would use today):
+///
+/// - **YES order** — it fills our YES shares at the YES-market price
+///   `limitProb`, so cancel iff `limitProb − cap_now > drift`.
+/// - **NO order** — measured on the same YES scale: the order buys NO shares
+///   at `1 − limitProb`, and today's ceiling is `1 − cap_now`, so cancel iff
+///   `cap_now − limitProb > drift`.
+///
+/// A favorable drift (the fair price moved *toward* the order, making its
+/// fill better than today's entry standard) yields a negative `overpay` and
+/// keeps the order: it fills at a price we could not replicate.
+///
+/// `outcome` is validated as `YES`/`NO` by every producer of an
+/// [`OwnRestingOrder`]; anything else is a shape bug and the safe verdict is
+/// "no cancel" (the expiry bounds the order anyway).
+fn should_cancel_for_drift(
+    outcome: &str,
+    limit_prob: f64,
+    fair_now: f64,
+    epsilon: f64,
+    drift: f64,
+) -> bool {
+    let cap_now = fair_capped_limit_prob(fair_now, epsilon, outcome);
+    let overpay = match outcome {
+        "YES" => limit_prob - cap_now,
+        "NO" => cap_now - limit_prob,
+        _ => {
+            tracing::debug!(outcome, "unknown outcome; no drift-cancel basis");
+            return false;
+        }
+    };
+    overpay > drift
+}
+
+/// The verdict for one websocket update of an own bet (pure, unit-tested).
+///
+/// The rule is delta-based: only shares *beyond* the last seen cumulative
+/// counters are a new fill, so a duplicate broadcast re-applies nothing (the
+/// idempotence requirement on duplicate `global/new-bet` events). A
+/// cancelled, fully filled, or expired order is reported dead — the server
+/// flips `isCancelled` for expired orders at the top of the minute, but
+/// matching already rejects an expired order inline, so expiry checks run on
+/// the local clock.
+struct OwnBetUpdate {
+    /// The order must leave the tracker (death).
+    removed: bool,
+    /// Newly filled mana and shares, when any.
+    fill: Option<(f64, f64)>,
+}
+
+fn own_bet_update(order: &OwnRestingOrder, bet: &BetEvent, now_ms: i64) -> OwnBetUpdate {
+    let expires_ms = bet.expires_at.or(order.expires_ms);
+    let dead = bet.is_cancelled
+        || bet.is_filled
+        || expires_ms.is_some_and(|expires| expires <= now_ms);
+
+    // Trust the server's cumulative counters; a negative delta (a replay of
+    // an older event) must never unwind a fill.
+    let fill_shares = (bet.shares - order.filled_shares).max(0.0);
+    let fill_mana = (bet.amount - order.filled_amount).max(0.0);
+    let fill = if fill_shares > 0.0 && fill_mana > 0.0 {
+        Some((fill_mana, fill_shares))
+    } else {
+        None
+    };
+
+    OwnBetUpdate { removed: dead, fill }
+}
+
+/// Parses one row of the boot snapshot
+/// `GET /v0/bets?userId={bot}&kinds=open-limit` into an own resting order.
+///
+/// Skipped rows (returning `None`): cancelled or fully filled bets, already
+/// expired ones (the snapshot has no expiry filter — the ~1-minute cron lag
+/// can still list them — but matching rejects expired orders inline, so we
+/// filter on the local clock), rows without a limit probability, redemptions,
+/// and rows whose committed mana already converted entirely. The REST query
+/// is user-filtered, so the `userId` check only guards against a response-
+/// shape change.
+fn parse_own_order_row(row: &Value, bot_user_id: &str, now_ms: i64) -> Option<OwnRestingOrder> {
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    if row
+        .get("userId")
+        .and_then(Value::as_str)
+        .is_some_and(|user| user != bot_user_id)
+    {
+        return None;
+    }
+    if row.get("isCancelled").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    if row.get("isFilled").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    if row.get("isRedemption").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let market_id = row
+        .get("contractId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?
+        .to_owned();
+    let outcome = row
+        .get("outcome")
+        .and_then(Value::as_str)
+        .filter(|outcome| validate_outcome(outcome).is_ok())?
+        .to_owned();
+    let limit_prob = row.get("limitProb").and_then(Value::as_f64)?;
+    let filled_amount = number_at(row.get("amount"));
+    let order_amount = number_at(row.get("orderAmount"));
+    let remainder = order_amount - filled_amount;
+    if !remainder.is_finite() || remainder <= REMAINDER_EPSILON {
+        return None;
+    }
+    let expires_at = row.get("expiresAt").and_then(Value::as_i64);
+    if expires_at.is_some_and(|expires| expires <= now_ms) {
+        return None;
+    }
+    let answer_id = row
+        .get("answerId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+
+    Some(OwnRestingOrder {
+        bet_id: id.to_owned(),
+        market_id,
+        answer_id,
+        outcome,
+        limit_prob,
+        order_amount,
+        filled_amount,
+        filled_shares: number_at(row.get("shares")),
+        created_ms: row
+            .get("createdTime")
+            .and_then(Value::as_i64)
+            .unwrap_or(now_ms),
+        expires_ms: Some(expires_at.unwrap_or_else(|| now_ms + FALLBACK_LIMIT_EXPIRY_SECS * 1_000)),
+    })
+}
+
 /// Per-market evaluation throttle for websocket price bursts.
 ///
 /// A market evaluated inside the window is skipped: its price has already
@@ -1010,6 +1401,10 @@ pub struct TradeExecutor {
     /// Slack over fair value in one buy's fill limit; see
     /// [`fair_capped_limit_prob`].
     limit_epsilon: f64,
+    /// Resting-layer lifetime sent as `expiresMillisAfter` on every bot buy.
+    limit_expiry_secs: u64,
+    /// Reverse-drift cancel slack; see [`should_cancel_for_drift`].
+    limit_drift_cancel: f64,
     /// Global Manifold token bucket; writes spend Trade-class tokens, the
     /// reconcile backstop spends Reconcile-class tokens.
     rate: RateLimiter,
@@ -1018,6 +1413,9 @@ pub struct TradeExecutor {
     /// [`TerminalMirrors`]. Guarded by [`SyncMutex`], released before
     /// anything awaits.
     terminal_mirrors: SyncMutex<TerminalMirrors>,
+    /// The bot's own resting limit orders; see [`OwnRestingOrders`]. Guarded
+    /// by [`SyncMutex`], never held across an await.
+    own_orders: SyncMutex<OwnRestingOrders>,
     events: broadcast::Sender<TradeEvent>,
 }
 
@@ -1032,7 +1430,7 @@ impl TradeExecutor {
             .context("initializing the Manifold client")?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
 
-        Ok(Self {
+        let executor = Self {
             client,
             db,
             store,
@@ -1040,11 +1438,92 @@ impl TradeExecutor {
             dry_run: config.trading_dry_run,
             halflife_hours: config.belief_halflife_hours,
             limit_epsilon: config.limit_epsilon,
+            limit_expiry_secs: config.limit_expiry_secs as u64,
+            limit_drift_cancel: config.limit_drift_cancel,
             rate: RateLimiter::per_minute(config.rate_limit_per_min, Box::new(SystemClock)),
             execution_lock: Mutex::new(()),
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
+            own_orders: SyncMutex::new(OwnRestingOrders::default()),
             events,
-        })
+        };
+
+        // Boot snapshot of the own resting layer: one REST call, best
+        // effort. The websocket and the buy path keep the map current from
+        // here on; a leftover order the snapshot missed simply expires.
+        if let Err(error) = executor.seed_own_orders().await {
+            tracing::warn!(
+                error = %error,
+                "boot snapshot of own open limit orders failed; own-order tracking starts empty"
+            );
+        }
+
+        Ok(executor)
+    }
+
+    /// The lifetime the resting layer gets, in milliseconds for the wire.
+    fn limit_expiry_millis(&self) -> i64 {
+        // The config validation bounds the seconds into [1, 300]; this only
+        // keeps the multiplication defensive.
+        (self.limit_expiry_secs.min(300) as i64).saturating_mul(1_000)
+    }
+
+    /// Locks the own resting-order map. The guard never crosses an await.
+    fn own_orders(&self) -> MutexGuard<'_, OwnRestingOrders> {
+        self.own_orders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Seeds the own resting-order map with one boot snapshot.
+    ///
+    /// One `GET /v0/bets?userId={bot}&kinds=open-limit` call (no
+    /// `contractId` filter) covers every market at once
+    /// ([`ManifoldClient::open_limit_orders`]); climbs one Reconcile-class
+    /// token like every other snapshot read. Orders on markets the process
+    /// does not track are skipped: their expiry still bounds them.
+    ///
+    /// Failure is not fatal: the websocket and the buy path keep the map
+    /// current from here on, and the boot-snapshot-only leftovers (orders
+    /// placed by a process that died before its response returned) cost at
+    /// most their own `LIMIT_EXPIRY_SECS`.
+    async fn seed_own_orders(&self) -> AppResult<usize> {
+        if self
+            .rate
+            .try_acquire(Priority::Reconcile, WRITE_COST_TOKENS)
+            .is_err()
+        {
+            bail!("rate bucket is at the housekeeping reserve; the boot snapshot was skipped");
+        }
+
+        let rows = self.client.open_limit_orders().await?;
+        let now_ms = Utc::now().timestamp_millis();
+        let bot_user_id = self.client.bot_user_id().to_owned();
+
+        let mut seeded = 0;
+        for row in &rows {
+            let Some(order) = parse_own_order_row(row, &bot_user_id, now_ms) else {
+                continue;
+            };
+            if self.store.cached(&order.market_id).is_none() {
+                continue;
+            }
+            tracing::debug!(
+                market_id = %order.market_id,
+                bet_id = %order.bet_id,
+                outcome = %order.outcome,
+                limit_prob = order.limit_prob,
+                order_amount = order.order_amount,
+                filled_amount = order.filled_amount,
+                "boot snapshot seeded an own resting order"
+            );
+            self.own_orders().upsert(order);
+            seeded += 1;
+        }
+
+        if seeded > 0 {
+            tracing::info!(seeded, "seeded own resting orders from the boot snapshot");
+        }
+        Ok(seeded)
     }
 
     /// Returns a sender that can be subscribed to for trade events.
@@ -1127,6 +1606,11 @@ impl TradeExecutor {
                 market_id = %market_id,
                 "last price observation was a resolution patch; skipping evaluation"
             );
+            // A settled market makes every own resting order moot (positions
+            // settle automatically, matching stops). Cancelling is best
+            // effort and cheap when nothing rests; this also covers orders
+            // the boot snapshot seeded on a resolved market.
+            self.cancel_market_orders(market_id, "terminal").await;
             return Ok(None);
         }
 
@@ -1139,6 +1623,18 @@ impl TradeExecutor {
 
         let kill_switch = self.kill_switch_on()?;
         let now = Utc::now().timestamp();
+
+        // §S1 ladder, own-order lifecycle: retire rests whose cap drifted
+        // past the fresh fair value before the planner sees the same state.
+        if let Err(error) = self.run_cancel_policy(&book, now).await {
+            tracing::error!(
+                market_id = %market_id,
+                error = %error,
+                "own-order cancel policy failed"
+            );
+            self.emit_error(Some(market_id.to_owned()), error.to_string());
+        }
+
         self.decide(&mut book, trigger_post_uri, kill_switch, now)
             .await
     }
@@ -1192,6 +1688,24 @@ impl TradeExecutor {
 
             book.persist(&self.store, &self.db)?;
             self.emit_trade(book, &record);
+
+            // §S1 ladder, own-order lifecycle: an entry executed in this
+            // evaluation invalidates resting orders on the opposite side of
+            // its leg — they would take the book into the position just bet
+            // against. Best effort: failures are logged inside.
+            if is_buy(planned_trade.decision.action) {
+                if let Err(error) =
+                    self.cancel_opposite_after_entry(book, &planned_trade.decision, now)
+                        .await
+                {
+                    tracing::error!(
+                        market_id = %market_id,
+                        error = %error,
+                        "opposite-side resting-order cancellation failed"
+                    );
+                }
+            }
+
             first.get_or_insert(record);
         }
 
@@ -1328,6 +1842,14 @@ impl TradeExecutor {
     /// The returned [`LiquidationOutcome`] tells the caller what happened.
     pub async fn liquidate(&self, market_id: &str) -> AppResult<LiquidationOutcome> {
         let _guard = self.execution_lock.lock().await;
+
+        // §S1 ladder: the control-plane exit is also the one hook /close and
+        // /untrack --liquidate share. Cancel own resting orders so exit
+        // capital is not idling in the book; best effort, failures are
+        // logged inside and the expiry bounds anything left. `/untrack`
+        // without a sale does not come through here — its rests simply
+        // expire (documented in `docs/SPEC.md` §6.6).
+        self.cancel_market_orders(market_id, "liquidation").await;
 
         let mut book = self.load_book(market_id)?;
         if book.status() == MarketStatus::Closed {
@@ -1535,6 +2057,11 @@ impl TradeExecutor {
                                     "probability patch is at an outcome extreme; \
                                      skipping evaluation"
                                 );
+                                // §S1 ladder: a settled market makes every own
+                                // resting order moot; cancel so no mana idles
+                                // in the book until the expiry.
+                                self.cancel_market_orders(&update.contract_id, "terminal")
+                                    .await;
                                 continue;
                             }
 
@@ -1586,10 +2113,27 @@ impl TradeExecutor {
                             );
                         }
                         Some(ManifoldEvent::Bet(bet)) => {
-                            tracing::debug!(
-                                contract_id = %bet.contract_id,
-                                "bet broadcast; copy-trading is a later phase"
-                            );
+                            if bet.user_id == self.client.bot_user_id() {
+                                // Our own resting layer: maker fills, cancels,
+                                // and expiry reports come through here.
+                                if let Err(error) = self.on_own_bet_event(&bet).await {
+                                    tracing::error!(
+                                        contract_id = %bet.contract_id,
+                                        bet_id = %bet.id,
+                                        error = %error,
+                                        "applying an own bet broadcast failed"
+                                    );
+                                    self.emit_error(
+                                        Some(bet.contract_id.clone()),
+                                        error.to_string(),
+                                    );
+                                }
+                            } else {
+                                tracing::debug!(
+                                    contract_id = %bet.contract_id,
+                                    "bet broadcast; copy-trading is a later phase"
+                                );
+                            }
                         }
                         // The channel closes only when the socket task is
                         // gone (all senders dropped). From here the 5-minute
@@ -1728,6 +2272,398 @@ impl TradeExecutor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear(market_id);
+    }
+
+    /// Cancels one own resting order (best effort, rate-checked).
+    ///
+    /// The write spends one Trade-class token, exactly like a buy or sell; a
+    /// rate refusal keeps the order resting (its expiry bounds it), and so
+    /// does a failed cancel. Success drops the tracker entry.
+    async fn cancel_own_order(&self, order: &OwnRestingOrder, market_id: &str, reason: &str) {
+        if !self.acquire_write_token_for(market_id, "CANCEL resting order") {
+            return;
+        }
+        match self.client.cancel_bet(&order.bet_id).await {
+            Ok(()) => {
+                self.own_orders().remove(market_id, &order.bet_id);
+                tracing::info!(
+                    market_id = %market_id,
+                    bet_id = %order.bet_id,
+                    outcome = %order.outcome,
+                    limit_prob = order.limit_prob,
+                    reason = reason,
+                    "cancelled own resting limit order"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    market_id = %market_id,
+                    bet_id = %order.bet_id,
+                    reason = reason,
+                    error = %error,
+                    "cancelling own resting limit order failed; it expires on Manifold"
+                );
+            }
+        }
+    }
+
+    /// Cancels every own resting order on one market (best effort).
+    ///
+    /// Used when a market becomes moot for trading: a terminal price patch
+    /// (the resolution signature) or an operator liquidation. No execution
+    /// lock: the map is guarded separately and no book column is touched,
+    /// so this can fire straight from the websocket arm.
+    async fn cancel_market_orders(&self, market_id: &str, reason: &str) {
+        let orders = self.own_orders().of_market(market_id);
+        for order in &orders {
+            self.cancel_own_order(order, market_id, reason).await;
+        }
+    }
+
+    /// Retires own resting orders on one market whose cap no longer agrees
+    /// with the current belief (`docs/SPEC.md` §6.6, reverse-drift policy).
+    ///
+    /// Runs inside [`TradeExecutor::evaluate_cached`] after the price mirror
+    /// step, before the plan: the fair value each order is compared against
+    /// is derived the same way [`fair_capped_limit_prob`] derives a fresh
+    /// entry cap (`entry_fair_value` with the sum-to-one normalization).
+    /// Expired orders are first swept locally without any REST call —
+    /// matching already rejects them inline (probe finding: expiry is not
+    /// broadcast; a 1-minute cron flips `isCancelled`). Orders younger than
+    /// [`OWN_ORDER_GRACE_MILLIS`] are never cancelled by this policy.
+    async fn run_cancel_policy(&self, book: &Book, now_secs: i64) -> AppResult<()> {
+        let market_id = book.id().to_owned();
+        let now_ms = Utc::now().timestamp_millis();
+
+        let expired = self.own_orders().retain_market(&market_id, |order| {
+            order.expires_ms.is_some_and(|expires| expires <= now_ms)
+        });
+        if expired > 0 {
+            tracing::info!(
+                market_id = %market_id,
+                expired,
+                "swept expired own resting orders without a cancel call"
+            );
+        }
+
+        let orders = self.own_orders().of_market(&market_id);
+        if orders.is_empty() {
+            return Ok(());
+        }
+
+        // The same leg views the entry caps were built from on this
+        // evaluation's price state.
+        let leg_p_values: Vec<f64> = (0..book.legs().len())
+            .map(|index| book.view(index, now_secs, self.halflife_hours).p_internal)
+            .collect();
+
+        for order in &orders {
+            if now_ms.saturating_sub(order.created_ms) < OWN_ORDER_GRACE_MILLIS {
+                continue;
+            }
+            let Some(leg) = leg_index_for(book, &order.answer_id) else {
+                tracing::debug!(
+                    market_id = %market_id,
+                    bet_id = %order.bet_id,
+                    answer_id = ?order.answer_id,
+                    "own resting order lost its leg; leaving it to expire"
+                );
+                continue;
+            };
+            let view = book.view(leg, now_secs, self.halflife_hours);
+            let fair = entry_fair_value(
+                view.p_internal,
+                &leg_p_values,
+                book.market().should_answers_sum_to_one,
+            );
+            if should_cancel_for_drift(
+                &order.outcome,
+                order.limit_prob,
+                fair,
+                self.limit_epsilon,
+                self.limit_drift_cancel,
+            ) {
+                self.cancel_own_order(order, &market_id, "reverse_drift").await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cancels own resting orders that buy the opposite side of an entry
+    /// executed in the same evaluation (best effort, same grace rule).
+    ///
+    /// The match is per leg: an entry on answer A does not touch a resting
+    /// order on answer B of the same multiple-choice market. When the entry
+    /// happened, the opposite order would take the book into a position this
+    /// evaluation just bet against.
+    async fn cancel_opposite_after_entry(
+        &self,
+        book: &Book,
+        decision: &TradeDecision,
+        now_secs: i64,
+    ) -> AppResult<()> {
+        if !is_buy(decision.action) {
+            return Ok(());
+        }
+        let entered_outcome = decision.action.outcome();
+        let opposite = if entered_outcome == "YES" { "NO" } else { "YES" };
+        let market_id = book.id().to_owned();
+        let now_ms = now_secs.saturating_mul(1_000);
+
+        let orders = self.own_orders().of_market(&market_id);
+        for order in &orders {
+            if order.outcome != opposite || order.answer_id != decision.answer_id {
+                continue;
+            }
+            if now_ms.saturating_sub(order.created_ms) < OWN_ORDER_GRACE_MILLIS {
+                continue;
+            }
+            self.cancel_own_order(order, &market_id, "opposite_entry").await;
+        }
+
+        Ok(())
+    }
+
+    /// Records the order any fair-capped sweep leaves resting.
+    ///
+    /// Probe-verified: one `POST /v0/bet` with a limit does the whole ladder
+    /// — the unfilled remainder (`orderAmount − amount`) rests automatically
+    /// as the same bet row, so the only bookkeeping is to track it. A dry
+    /// run places nothing; a fully filled bet rests nothing.
+    fn record_resting_order(
+        &self,
+        book: &Book,
+        outcome: &str,
+        answer_id: Option<&str>,
+        limit_prob: f64,
+        result: &BetResult,
+        dry_run: bool,
+    ) {
+        if dry_run || result.is_filled || result.is_cancelled {
+            return;
+        }
+        let order_amount = result.order_amount.unwrap_or(0.0);
+        let remainder = order_amount - result.amount;
+        if !remainder.is_finite() || remainder <= REMAINDER_EPSILON {
+            return;
+        }
+        if optional_id(result.bet_id()).is_none() {
+            tracing::warn!(
+                market_id = %book.id(),
+                remainder,
+                "a resting remainder has no bet id to track it; it simply expires"
+            );
+            return;
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let order = OwnRestingOrder {
+            bet_id: result.bet_id().to_owned(),
+            market_id: book.id().to_owned(),
+            answer_id: answer_id.map(str::to_owned),
+            outcome: outcome.to_owned(),
+            limit_prob,
+            order_amount,
+            filled_amount: result.amount,
+            filled_shares: result.shares,
+            created_ms: now_ms,
+            expires_ms: Some(now_ms + self.limit_expiry_millis()),
+        };
+        self.own_orders().upsert(order);
+        tracing::info!(
+            market_id = %book.id(),
+            bet_id = result.bet_id(),
+            outcome,
+            limit_prob,
+            remainder,
+            expires_in_secs = self.limit_expiry_secs,
+            "buy remainder rests as an own expiring limit order"
+        );
+    }
+
+    /// Applies one websocket update of the bot's own bet to the executor
+    /// state (`docs/SPEC.md` §6.6, maker-fill accounting).
+    ///
+    /// The `global/new-bet` stream carries our maker fills (probe-verified),
+    /// and `BetEvent` reports cumulative `amount`/`shares` per bet. A fill
+    /// delta beyond the stored counters is applied through the same book
+    /// flow as an ordinary buy: `Book::apply_buy` + a `trade_ledger` row
+    /// (provenance `maker_fill` in the trigger column) + a Discord
+    /// [`TradeEvent`], all under the execution lock. Duplicate broadcasts
+    /// are idempotent by construction — the delta is zero — and the stored
+    /// counters are overwritten with the server's values first, so a
+    /// double-send can never re-apply a consumed fill.
+    async fn on_own_bet_event(&self, bet: &BetEvent) -> AppResult<()> {
+        if bet.user_id != self.client.bot_user_id() {
+            // Not ours: the run arm normally filters these before calling,
+            // so this is a defensive no-op against future call sites.
+            return Ok(());
+        }
+        if bet.is_redemption {
+            tracing::debug!(
+                contract_id = %bet.contract_id,
+                bet_id = %bet.id,
+                "own redemption broadcast ignored"
+            );
+            return Ok(());
+        }
+
+        let Some(order) = self
+            .own_orders()
+            .get(&bet.contract_id, &bet.id)
+            .cloned()
+        else {
+            // Either the placement broadcast of a bet the POST response
+            // already accounts (our own taker bet), or an order placed
+            // before this process started: not tracked here, so the event
+            // would double-count.
+            tracing::debug!(
+                contract_id = %bet.contract_id,
+                bet_id = %bet.id,
+                outcome = %bet.outcome,
+                "own bet broadcast is not a tracked resting order"
+            );
+            return Ok(());
+        };
+
+        let now_ms = Utc::now().timestamp_millis();
+        let update = own_bet_update(&order, bet, now_ms);
+
+        // The server's counters are authoritative: overwrite the stored view
+        // before (rather than only after) applying, so an interrupted
+        // application can never re-apply from a duplicate event.
+        if update.fill.is_some() {
+            let refreshed = OwnRestingOrder {
+                filled_amount: bet.amount,
+                filled_shares: bet.shares,
+                expires_ms: bet.expires_at.or(order.expires_ms),
+                ..order.clone()
+            };
+            self.own_orders().upsert(refreshed);
+        }
+
+        let Some((fill_mana, fill_shares)) = update.fill else {
+            if update.removed {
+                self.own_orders().remove(&bet.contract_id, &bet.id);
+                tracing::debug!(
+                    contract_id = %bet.contract_id,
+                    bet_id = %bet.id,
+                    "own resting order is dead; dropped from tracking"
+                );
+            }
+            return Ok(());
+        };
+
+        self.apply_maker_fill(&order, fill_mana, fill_shares, bet)
+            .await?;
+        if update.removed {
+            self.own_orders().remove(&bet.contract_id, &bet.id);
+        }
+        Ok(())
+    }
+
+    /// Posts one maker fill into the same book flow a taker fill uses.
+    ///
+    /// The fill happened on Manifold already — this is accounting, not a
+    /// decision. The budget invariant still gates the *local* application:
+    /// a fill that would breach the ceiling (only possible after external
+    /// interference with the market's budget columns) is refused locally and
+    /// left to the next reconcile pass, which trusts Manifold's positions
+    /// (`docs/SPEC.md` §6.6); a Discord error is emitted.
+    async fn apply_maker_fill(
+        &self,
+        order: &OwnRestingOrder,
+        fill_mana: f64,
+        fill_shares: f64,
+        bet: &BetEvent,
+    ) -> AppResult<()> {
+        let _guard = self.execution_lock.lock().await;
+
+        if self.store.cached(&bet.contract_id).is_none() {
+            tracing::warn!(
+                contract_id = %bet.contract_id,
+                bet_id = %bet.id,
+                "maker fill arrived for an untracked market; not applied"
+            );
+            return Ok(());
+        }
+        let mut book = self.load_book(&bet.contract_id)?;
+
+        let market = book.market();
+        let committed = market.invested_mana + fill_mana;
+        let ceiling = market.budget_mana + market.realized_pnl_mana;
+        if committed > ceiling + BUDGET_EPSILON {
+            let message = format!(
+                "maker fill of {} mana on market {} would breach the budget invariant \
+                 (invested {committed} > budget plus realized PnL {ceiling}); \
+                 applied nothing locally, the reconcile pass will trust Manifold",
+                fill_mana,
+                bet.contract_id
+            );
+            tracing::error!(contract_id = %bet.contract_id, "{message}");
+            self.emit_error(Some(bet.contract_id.clone()), message);
+            return Ok(());
+        }
+
+        let Some(leg) = leg_index_for(&book, &order.answer_id) else {
+            tracing::error!(
+                contract_id = %bet.contract_id,
+                bet_id = %bet.id,
+                answer_id = ?order.answer_id,
+                "maker fill has no leg to apply to; not applied"
+            );
+            return Ok(());
+        };
+
+        let action = if order.outcome == "YES" {
+            TradeAction::BuyYes
+        } else {
+            TradeAction::BuyNo
+        };
+
+        let now = Utc::now().timestamp();
+        let view = book.view(leg, now, self.halflife_hours);
+        book.apply_buy(leg, action, fill_mana, fill_shares)?;
+        book.persist(&self.store, &self.db)?;
+
+        let record = TradeRecord {
+            id: 0,
+            market_id: bet.contract_id.clone(),
+            answer_id: order.answer_id.clone(),
+            action,
+            mana_amount: fill_mana,
+            shares_delta: fill_shares,
+            p_internal: view.p_internal,
+            p_market: view.p_market,
+            trigger_post_uri: Some(format!("maker_fill:{}", bet.id)),
+            manifold_bet_id: Some(bet.id.clone()),
+            created_at: now,
+        };
+        self.db.insert_trade(&record)?;
+        tracing::info!(
+            market_id = %bet.contract_id,
+            bet_id = %bet.id,
+            outcome = %order.outcome,
+            mana = fill_mana,
+            shares = fill_shares,
+            "maker fill applied to the book"
+        );
+
+        // Post-fill budget sanity: must never go negative net.
+        let after = book.market();
+        if available_budget(&after) + BUDGET_EPSILON < 0.0 {
+            let message = format!(
+                "maker fill on market {} left a negative available budget; \
+                 check the market's budget columns",
+                bet.contract_id
+            );
+            tracing::error!(contract_id = %bet.contract_id, "{message}");
+            self.emit_error(Some(bet.contract_id.clone()), message);
+        }
+
+        let _ = self.events.send(trade_event(&after, &record));
+        Ok(())
     }
 
     /// The slow REST reconcile backstop (every [`RECONCILE_INTERVAL`]).
@@ -1953,13 +2889,14 @@ impl TradeExecutor {
 
     /// Performs one planned action and writes its ledger row.
     ///
-    /// A buy keeps the budget invariant checks, sweeps with the fair-capped
+    /// A buy keeps the budget invariant checks (with the rested layer counted
+    /// as committed), sweeps with the fair-capped, whole-percent-quantized
     /// limit ([`fair_capped_limit_prob`], fed by [`entry_fair_value`]), sends
     /// `dryRun` when asked, and records the fill on its leg. A cap-stopped
-    /// short fill is logged with its shortfall, and the leg records the
-    /// *actual* shares and mana from the response — never the requested
-    /// amount; the unfilled remainder rests as a limit order for the
-    /// `TODO(S1-ladder)` expiry pass. A sell sends the requested share count
+    /// short fill is logged with its shortfall, the remainder is tracked as
+    /// an own expiring limit order ([`TradeExecutor::record_resting_order`]),
+    /// and the leg records the *actual* shares and mana from the response —
+    /// never the requested amount. A sell sends the requested share count
     /// and lets the book release the proportional cost basis. Neither branch
     /// writes a position column: the caller calls [`Book::persist`]
     /// afterwards.
@@ -1979,21 +2916,26 @@ impl TradeExecutor {
                 bail!("buy amount must be a positive finite mana value, got {amount}");
             }
 
-            let available = book.available_budget();
+            // The resting layer is committed mana that has not converted to a
+            // position yet: one POST fills a part and rests the remainder
+            // (probe-verified). Counting it in keeps a later maker fill of
+            // an own order inside the ceiling (`docs/SPEC.md` §6.6).
+            let outstanding = self.own_orders().outstanding(book.id());
+            let available = book.available_budget() - outstanding;
             if amount > available + BUDGET_EPSILON {
                 bail!(
                     "budget invariant violated for market {}: buy of {amount} mana exceeds \
-                     available budget {available}",
+                     available budget {available} (rested outstanding {outstanding})",
                     book.id()
                 );
             }
             let market = book.market();
-            let committed = market.invested_mana + amount;
+            let committed = market.invested_mana + outstanding + amount;
             let ceiling = market.budget_mana + market.realized_pnl_mana;
             if committed > ceiling + BUDGET_EPSILON {
                 bail!(
-                    "budget invariant violated for market {}: invested {committed} would exceed \
-                     budget plus realized PnL {ceiling}",
+                    "budget invariant violated for market {}: invested {committed} (rested \
+                     outstanding {outstanding}) would exceed budget plus realized PnL {ceiling}",
                     book.id()
                 );
             }
@@ -2015,7 +2957,7 @@ impl TradeExecutor {
                 &leg_p_values,
                 book.market().should_answers_sum_to_one,
             );
-            let limit_prob = fair_capped_limit_prob(fair, self.limit_epsilon);
+            let limit_prob = fair_capped_limit_prob(fair, self.limit_epsilon, outcome);
 
             let result = self
                 .client
@@ -2026,9 +2968,21 @@ impl TradeExecutor {
                     decision.answer_id.as_deref(),
                     limit_prob,
                     dry_run,
+                    self.limit_expiry_millis(),
                 )
                 .await
                 .with_context(|| format!("buying {outcome} on Manifold market {}", book.id()))?;
+
+            // Track the rest *before* the fill analysis: a cap-stopped sweep
+            // can fill nothing at all, and the remainder rests either way.
+            self.record_resting_order(
+                book,
+                outcome,
+                decision.answer_id.as_deref(),
+                limit_prob,
+                &result,
+                dry_run,
+            );
 
             // No retry and no resting-order layoff on a short fill (see
             // analyze_buy_fill): the ledger records the ACTUAL shares and
@@ -2174,12 +3128,18 @@ impl TradeExecutor {
     /// per-market error path, where it would be indistinguishable from a
     /// broken market.
     fn acquire_write_token(&self, book: &Book, action: TradeAction) -> bool {
+        self.acquire_write_token_for(book.id(), action.as_str())
+    }
+
+    /// [`TradeExecutor::acquire_write_token`] for writes keyed by market id
+    /// alone: a resting-order cancel has no trade action to name.
+    fn acquire_write_token_for(&self, market_id: &str, what: &str) -> bool {
         match self.rate.try_acquire(Priority::Trade, WRITE_COST_TOKENS) {
             Ok(_) => true,
             Err(denied) => {
                 tracing::warn!(
-                    market_id = %book.id(),
-                    action = %action,
+                    market_id = %market_id,
+                    write = what,
                     remaining_tokens = denied.remaining,
                     floor_tokens = denied.threshold,
                     "Manifold rate bucket is at the trade floor; skipping write"
@@ -2188,6 +3148,17 @@ impl TradeExecutor {
             }
         }
     }
+}
+
+/// The leg index a resting order's answer maps to.
+///
+/// `None` maps to the single binary leg; an answer id is matched against the
+/// legs' ids. `Some` answer on a binary book (or a lost answer row) has no
+/// leg: the caller leaves such an order to expire.
+fn leg_index_for(book: &Book, answer_id: &Option<String>) -> Option<usize> {
+    book.legs()
+        .iter()
+        .position(|leg| leg.answer_id == *answer_id)
 }
 
 /// Whether an action opens a position.
@@ -2258,15 +3229,43 @@ fn optional_id(id: &str) -> Option<String> {
 /// validation, and the result clamp keeps a boundary-probability belief
 /// (0.01 after the fair clamp) from sending `limitProb = 0.0`.
 ///
+/// The result is also **quantized onto Manifold's whole-percent grid**
+/// (probe-verified: finer values are rejected with HTTP 400), in the one
+/// direction that can only make the cap *less* aggressive for the outcome
+/// being bought — this is the single invariant: the sent cap never permits a
+/// worse per-share fill than the unquantized cap:
+///
+/// - YES buy: the per-share price IS `limitProb`, so round **down**
+///   (`floor`): the ceiling only gets tighter.
+/// - NO buy: the per-NO-share ceiling is `1 − limitProb`, so `floor` would
+///   *raise* it (a worse fill); round **up** (`ceil`), which keeps
+///   `1 − limit ≤ 1 − cap_exact = fair_NO + ε`.
+///
 /// Because `entry_fair_value` supplies `fair` and the config validation
 /// bounds `ε` only against the *default* entry-edge threshold (0.05), an
 /// operator could theoretically configure `ENTRY_EDGE_THRESHOLD < ε`; an
 /// entry with `edge < ε` would then send a limit at or below the market
 /// price, which rests unfilled instead of sweeping (see [`analyze_buy_fill`]).
 /// That is the documented limit of the guard, not a special-cased rejection.
-fn fair_capped_limit_prob(fair: f64, epsilon: f64) -> f64 {
+fn fair_capped_limit_prob(fair: f64, epsilon: f64, outcome: &str) -> f64 {
     let fair = fair.clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
-    (fair - epsilon).clamp(MIN_TRADING_PROB, MAX_TRADING_PROB)
+    let cap = (fair - epsilon).clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
+    quantize_limit_prob(cap, outcome)
+}
+
+/// Quantizes a fair-capped cap onto Manifold's whole-percent `limitProb`
+/// grid, rounded toward the less aggressive side for `outcome` ("YES" floors,
+/// "NO" ceils; see [`fair_capped_limit_prob`]).
+fn quantize_limit_prob(cap: f64, outcome: &str) -> f64 {
+    let scaled = cap * 100.0;
+    // `LIMIT_SNAP_EPSILON` covers representation error only (a `fair − ε`
+    // computed in floating point can sit an ulp below the boundary it
+    // belongs to); real caps never come this close to a percent boundary.
+    let snapped = match outcome {
+        "YES" => (scaled + LIMIT_SNAP_EPSILON).floor(),
+        _ => (scaled - LIMIT_SNAP_EPSILON).ceil(),
+    };
+    (snapped / 100.0).clamp(MIN_TRADING_PROB, MAX_TRADING_PROB)
 }
 
 /// The internal fair probability one planned buy must not fill past.
@@ -2297,14 +3296,10 @@ fn entry_fair_value(p_raw: f64, leg_p_values: &[f64], sum_to_one: bool) -> f64 {
 ///
 /// The buy path no longer demands a fully filled bet: the fair-capped sweep
 /// can stop short of the budget, and Manifold then fills what the cap allows
-/// and RESTS the remainder as an open limit order at the cap. Both short
-/// outcomes are logged at info with the requested mana against what the
-/// response actually reports (`orderAmount` for the request, `amount` and
-/// `shares` for the fill), never retried, and never laid off with an expiring
-/// resting order here — that resting-layoff is the next §S1 step, after a
-/// wire probe of the order fields:
-// TODO(S1-ladder): rest the remainder with an expiry
-/// so the leftover limit order cannot sit forever.
+/// and RESTS the remainder as an open limit order at the cap — the rest
+/// carries `LIMIT_EXPIRY_SECS` as `expiresMillisAfter` (see
+/// [`TradeExecutor::record_resting_order`], which ran before this analysis),
+/// so it is picked off or dies without a cancel call.
 ///
 /// `Ok(false)` (nothing filled, no position to record) happens when the price
 /// moved past the cap before the fill - the order then rests waiting for a
@@ -3016,27 +4011,37 @@ mod tests {
 
     #[test]
     fn bet_body_carries_the_capped_limit_prob() {
-        let body = bet_body("mkt", "YES", 10.0, None, 0.62, false);
+        let body = bet_body("mkt", "YES", 10.0, None, 0.62, false, 60_000);
 
         assert_eq!(body["contractId"], "mkt");
         assert_close(body["amount"].as_f64().unwrap(), 10.0);
         assert_eq!(body["outcome"], "YES");
         assert_close(body["limitProb"].as_f64().unwrap(), 0.62);
         assert_eq!(body["dryRun"], false);
+        assert_eq!(body["expiresMillisAfter"], 60_000);
         assert!(body.get("answerId").is_none(), "binary buys omit answerId");
 
-        let mc_body = bet_body("mkt", "YES", 10.0, Some("ans-a"), 0.49, true);
+        let mc_body = bet_body("mkt", "YES", 10.0, Some("ans-a"), 0.49, true, 120_000);
         assert_eq!(mc_body["answerId"], "ans-a");
         assert_eq!(mc_body["dryRun"], true);
+        assert_eq!(mc_body["expiresMillisAfter"], 120_000);
         assert_close(mc_body["limitProb"].as_f64().unwrap(), 0.49);
+    }
+
+    #[test]
+    fn bet_body_omits_the_expiry_field_when_it_is_not_requested() {
+        let body = bet_body("mkt", "NO", 10.0, None, 0.4, false, 0);
+
+        assert!(body.get("expiresMillisAfter").is_none());
     }
 
     #[test]
     fn fair_cap_for_a_yes_buy_is_fair_minus_epsilon() {
         // The §S1 example: a belief of 63 on a YES entry buys at up to 62
-        // with the default ε = 0.01.
-        assert_close(fair_capped_limit_prob(0.63, 0.01), 0.62);
-        assert_close(fair_capped_limit_prob(0.5, 0.01), 0.49);
+        // with the default ε = 0.01. Whole-percent quantization floors the
+        // YES cap (the per-share price IS limitProb).
+        assert_close(fair_capped_limit_prob(0.63, 0.01, "YES"), 0.62);
+        assert_close(fair_capped_limit_prob(0.5, 0.01, "YES"), 0.49);
     }
 
     #[test]
@@ -3045,7 +4050,7 @@ mod tests {
         // limitProb as the market probability of YES for both outcomes), so
         // the per-NO-share ceiling is 1 − cap = fair_NO + ε: for a belief of
         // YES 0.30, NO shares never cost more than 0.71.
-        let cap = fair_capped_limit_prob(0.30, 0.01);
+        let cap = fair_capped_limit_prob(0.30, 0.01, "NO");
         assert_close(cap, 0.29);
         assert_close(1.0 - cap, (1.0 - 0.30) + 0.01);
     }
@@ -3055,11 +4060,74 @@ mod tests {
         // A boundary belief of 0.01 with ε = 0.01 would undercut the
         // Manifold limitProb minimum (0.01), so the cap bottoms out there
         // instead of going zero or negative.
-        assert_close(fair_capped_limit_prob(0.01, 0.01), 0.01);
+        assert_close(fair_capped_limit_prob(0.01, 0.01, "YES"), 0.01);
         // Defense at the top edge: 0.99 − 0.01 stays valid.
-        assert_close(fair_capped_limit_prob(0.99, 0.01), 0.98);
+        assert_close(fair_capped_limit_prob(0.99, 0.01, "YES"), 0.98);
         // A pathological ε past the clamp never produces an invalid limit.
-        assert_close(fair_capped_limit_prob(0.01, 0.05), 0.01);
+        assert_close(fair_capped_limit_prob(0.01, 0.05, "NO"), 0.01);
+    }
+
+    #[test]
+    fn caps_are_quantized_to_whole_percents_toward_less_aggressive() {
+        // Manifold rejects off-grid limitProb values with HTTP 400
+        // (probe result). The quantization direction is outcome-sensitive:
+        // the one invariant is that the sent cap never permits a worse
+        // per-share fill than the unquantized exact cap.
+        let exact = 0.63_f64.clamp(0.01, 0.99) - 0.01; // 0.62 exactly on the grid
+        let yes = fair_capped_limit_prob(0.6389, 0.01, "YES");
+        let no = fair_capped_limit_prob(0.6389, 0.01, "NO");
+
+        assert!(yes <= exact, "YES quantization must floor: {yes} ≤ {exact}");
+        let grid = |value: f64| (value * 100.0) - (value * 100.0).round();
+        assert!(
+            grid(yes).abs() < 1e-9,
+            "YES cap is whole-percent grid: {yes}"
+        );
+
+        // NO differs per-share: ceil on the YES scale keeps 1 − cap ≤ fair_NO
+        // + ε (the exact cap's ceiling), never worse.
+        let exact_no_ceiling = 1.0 - exact;
+        assert!(
+            grid(no).abs() < 1e-9,
+            "NO cap is whole-percent grid: {no}"
+        );
+        assert!(
+            (1.0 - no) <= (1.0 - 0.6389) + 0.01 + 1e-9,
+            "NO ceiling never exceeds the unquantized one in any direction beyond representation: \
+             {no} vs {exact_no_ceiling}"
+        );
+    }
+
+    #[test]
+    fn quantization_rounds_yes_down_and_no_up_of_an_off_grid_exact_cap() {
+        // An exact cap of 0.295 (fair 0.305, ε 0.01):
+        // YES must send 0.29 (floors), NO must send 0.30 (ceils) so the
+        // per-NO ceiling 1 − 0.30 = 0.70 stays ≤ fair_NO + ε = 0.705.
+        assert_close(fair_capped_limit_prob(0.305, 0.01, "YES"), 0.29);
+        assert_close(fair_capped_limit_prob(0.305, 0.01, "NO"), 0.30);
+    }
+
+    #[test]
+    fn quantization_respects_the_whole_percent_grid_for_both_sides() {
+        for fair in [0.017, 0.123, 0.3456, 0.5555, 0.7777, 0.9012, 0.989] {
+            for epsilon in [0.01, 0.02, 0.049] {
+                let yes = fair_capped_limit_prob(fair, epsilon, "YES");
+                let no = fair_capped_limit_prob(fair, epsilon, "NO");
+                let exact = (fair.clamp(0.01, 0.99) - epsilon).clamp(0.01, 0.99);
+
+                let grid = |value: f64| (value * 100.0) - (value * 100.0).round();
+                assert!(
+                    grid(yes).abs() < 1e-9,
+                    "YES cap {yes} off grid"
+                );
+                assert!(
+                    grid(no).abs() < 1e-9,
+                    "NO cap {no} off grid"
+                );
+                assert!(yes <= exact + 1e-9, "YES {yes} worse than exact {exact}");
+                assert!(1.0 - no <= 1.0 - exact + 1e-9, "NO ceiling from {no} worse than exact");
+            }
+        }
     }
 
     #[test]
@@ -3079,12 +4147,635 @@ mod tests {
         assert_close(entry_fair_value(0.9, &[0.9, 0.9], true), 0.5);
         assert_close(entry_fair_value(0.2, &[0.2, 0.4, 0.4], true), 0.2);
 
-        let mc_cap = fair_capped_limit_prob(entry_fair_value(0.9, &[0.9, 0.9], true), 0.01);
+        let mc_cap = fair_capped_limit_prob(
+            entry_fair_value(0.9, &[0.9, 0.9], true),
+            0.01,
+            "YES",
+        );
         assert_close(mc_cap, 0.49);
 
         // A degenerate sum cannot happen after planner gating; the fallback
         // is the raw belief rather than a division by zero.
         assert_close(entry_fair_value(0.7, &[0.0, 0.0], true), 0.7);
+    }
+
+    // -- Reverse-drift cancel predicate ------------------------------------
+    //
+    // Caps land on the whole-percent grid, so an overpay at exactly the
+    // slack lies on a percent boundary and its floating-point direction is
+    // arbitrary (±4e-17). The truth table therefore keeps cases at least one
+    // percent step away from the slack: the policy is re-checked on every
+    // evaluation anyway, so a boundary wobble costs nothing.
+
+    #[test]
+    fn a_drifted_yes_resting_order_is_cancelled_and_a_fresh_one_is_kept() {
+        // YES order resting at 0.40. Fair dropped to 0.34 → today's cap is
+        // 0.33; paying 0.40 is 0.07 beyond it, more than the default slack.
+        assert!(should_cancel_for_drift("YES", 0.40, 0.34, 0.01, 0.05));
+
+        // Fair dropped a little less: cap 0.36, overpay 0.04, inside the
+        // slack → keep (re-checked on every evaluation).
+        assert!(!should_cancel_for_drift("YES", 0.40, 0.37, 0.01, 0.05));
+
+        // One percent step beyond the slack still cancels.
+        assert!(should_cancel_for_drift("YES", 0.40, 0.35, 0.01, 0.05));
+
+        // Favorable drift: fair rose; the order's price is better than we
+        // could replicate today, so it stays.
+        assert!(!should_cancel_for_drift("YES", 0.40, 0.60, 0.01, 0.05));
+    }
+
+    #[test]
+    fn a_drifted_no_resting_order_is_cancelled_on_the_yes_scale() {
+        // NO order resting at YES-scale 0.30 (per-NO price 0.70). Fair rose
+        // to 0.40 → today's NO cap is 0.39 → per-NO ceiling 0.61; waiting to
+        // fill at 0.70 is 0.09 worse than acceptable: cancel.
+        assert!(should_cancel_for_drift("NO", 0.30, 0.40, 0.01, 0.05));
+
+        // Fair rose a little less: NO cap 0.33, overpay 0.03 → keep
+        // (re-checked on every evaluation).
+        assert!(!should_cancel_for_drift("NO", 0.30, 0.34, 0.01, 0.05));
+
+        // One percent step beyond the slack still cancels (fair 0.41 → cap
+        // 0.40, overpay 0.10).
+        assert!(should_cancel_for_drift("NO", 0.30, 0.41, 0.01, 0.05));
+
+        // Fair sank toward NO: the order's per-NO price is now better than
+        // today's entry standard, so it stays.
+        assert!(!should_cancel_for_drift("NO", 0.30, 0.20, 0.01, 0.05));
+    }
+
+    #[test]
+    fn an_unknown_outcome_never_panics_and_never_cancels_by_drift() {
+        // Shape-bug guard: the expiry bounds such an order anyway.
+        assert!(!should_cancel_for_drift("dpm", 0.5, 0.99, 0.01, 0.05));
+    }
+
+    // -- Own resting-order bookkeeping --------------------------------------
+
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    fn resting_order(
+        bet_id: &str,
+        market: &str,
+        outcome: &str,
+        limit_prob: f64,
+    ) -> OwnRestingOrder {
+        OwnRestingOrder {
+            bet_id: bet_id.to_owned(),
+            market_id: market.to_owned(),
+            answer_id: None,
+            outcome: outcome.to_owned(),
+            limit_prob,
+            order_amount: 50.0,
+            filled_amount: 10.0,
+            filled_shares: 20.0,
+            created_ms: NOW_MS - 10_000,
+            expires_ms: Some(NOW_MS + 50_000),
+        }
+    }
+
+    fn own_bet_event(bet_id: &str, amount: f64, shares: f64) -> BetEvent {
+        BetEvent {
+            id: bet_id.to_owned(),
+            user_id: "bot-1".to_owned(),
+            contract_id: "Market_test".to_owned(),
+            answer_id: None,
+            outcome: "YES".to_owned(),
+            amount,
+            order_amount: 50.0,
+            shares,
+            prob_before: 0.5,
+            prob_after: 0.5,
+            is_filled: false,
+            limit_prob: Some(0.49),
+            expires_at: Some(NOW_MS + 40_000),
+            is_cancelled: false,
+            is_redemption: false,
+            created_time: NOW_MS - 10_000,
+            updated_time: Some(NOW_MS),
+        }
+    }
+
+    #[test]
+    fn a_fill_delta_is_only_the_shares_beyond_the_last_seen_counters() {
+        let order = resting_order("rest-1", "Market_test", "YES", 0.49);
+        let bet = own_bet_event("rest-1", 30.0, 60.0);
+
+        let update = own_bet_update(&order, &bet, NOW_MS);
+
+        let (mana, shares) = update.fill.expect("a growth is a fill");
+        assert_close(mana, 20.0);
+        assert_close(shares, 40.0);
+        assert!(!update.removed, "an open order is not dead");
+
+        // Replay against the *refreshed* counters (the server's values), the
+        // way the executor stores them before applying: a duplicate
+        // broadcast computes a zero delta and re-applies nothing.
+        let refreshed = OwnRestingOrder {
+            filled_amount: bet.amount,
+            filled_shares: bet.shares,
+            ..order.clone()
+        };
+        let replay = own_bet_update(&refreshed, &bet, NOW_MS);
+        assert!(replay.fill.is_none(), "a duplicate must not re-apply");
+        assert!(!replay.removed);
+
+        // An older event replayed against refreshed counters (the .max(0)
+        // clamps) must never unwind a fill.
+        let stale = own_bet_event("rest-1", 12.0, 24.0);
+        assert!(
+            own_bet_update(&refreshed, &stale, NOW_MS).fill.is_none(),
+            "a stale replay must not create a fill"
+        );
+    }
+
+    #[test]
+    fn cancelled_filled_and_expired_events_kill_the_tracker_entry() {
+        let order = resting_order("rest-1", "Market_test", "YES", 0.49);
+
+        let mut cancelled = own_bet_event("rest-1", 30.0, 60.0);
+        cancelled.is_cancelled = true;
+        assert!(own_bet_update(&order, &cancelled, NOW_MS).removed);
+
+        let mut fully_filled = own_bet_event("rest-1", 50.0, 100.0);
+        fully_filled.is_filled = true;
+        let update = own_bet_update(&order, &fully_filled, NOW_MS);
+        assert!(update.removed, "a full fill retires the order");
+        let (mana, shares) = update.fill.expect("the final fill still applies");
+        assert_close(mana, 40.0);
+        let _ = shares;
+
+        // Server expiry passed (or our placement estimate did): dead.
+        let mut expired = own_bet_event("rest-1", 10.0, 20.0);
+        expired.expires_at = Some(NOW_MS - 1);
+        assert!(own_bet_update(&order, &expired, NOW_MS).removed);
+
+        // When the event does not carry an expiry, the tracker's placement
+        // estimate decides.
+        let mut blind = own_bet_event("rest-1", 10.0, 20.0);
+        blind.expires_at = None;
+        assert!(own_bet_update(&expired_order(), &blind, NOW_MS).removed);
+        assert!(!own_bet_update(&alive_order(), &blind, NOW_MS).removed);
+    }
+
+    fn expired_order() -> OwnRestingOrder {
+        let mut expired = resting_order("rest-1", "Market_test", "YES", 0.49);
+        expired.expires_ms = Some(NOW_MS - 1);
+        expired
+    }
+
+    fn alive_order() -> OwnRestingOrder {
+        resting_order("rest-1", "Market_test", "YES", 0.49)
+    }
+
+    #[test]
+    fn the_own_resting_order_map_tracks_per_market_and_reports_outstanding() {
+        let mut orders = OwnRestingOrders::default();
+        let mut no_side = resting_order("rest-no", "Market_test", "NO", 0.29);
+        no_side.order_amount = 25.0;
+        no_side.filled_amount = 5.0;
+
+        orders.upsert(resting_order("rest-1", "Market_test", "YES", 0.49));
+        orders.upsert(no_side);
+
+        assert_eq!(orders.of_market("Market_test").len(), 2);
+        assert_eq!(orders.of_market("other").len(), 0);
+        assert!(
+            orders.get("Market_test", "rest-1").is_some(),
+            "tracked by bet id"
+        );
+
+        // Outstanding = unspent committed mana: YES 50−10, NO 25−5.
+        assert_close(orders.outstanding("Market_test"), 60.0);
+        assert_close(orders.outstanding("other"), 0.0);
+
+        // Removal is market-scoped and reports what went.
+        assert_eq!(
+            orders.remove("Market_test", "rest-1").expect("removed").bet_id,
+            "rest-1"
+        );
+        assert!(orders.remove("Market_test", "rest-1").is_none());
+        assert_close(orders.outstanding("Market_test"), 20.0);
+    }
+
+    #[test]
+    fn expired_orders_are_swept_from_the_map_without_a_cancel_call() {
+        let mut orders = OwnRestingOrders::default();
+        orders.upsert(resting_order("alive", "Market_test", "YES", 0.49));
+        orders.upsert(expired_order());
+
+        let swept = orders.retain_market("Market_test", |order| {
+            order.expires_ms.is_some_and(|expires| expires <= NOW_MS)
+        });
+
+        assert_eq!(swept, 1);
+        assert_eq!(orders.of_market("Market_test").len(), 1);
+        assert!(orders.get("Market_test", "alive").is_some());
+    }
+
+    #[test]
+    fn the_boot_snapshot_parses_live_open_limit_order_rows() {
+        // Live-row shape from the probe (/v0/bets?kinds=open-limit): a
+        // partially filled expiring limit.
+        let row = json!({
+            "id": "rest-9",
+            "userId": "bot-1",
+            "contractId": "Market_test",
+            "outcome": "NO",
+            "answerId": "ans-a",
+            "amount": 3.0,
+            "orderAmount": 12.0,
+            "shares": 9.0,
+            "limitProb": 0.29,
+            "isFilled": false,
+            "isCancelled": false,
+            "isRedemption": false,
+            "expiresAt": NOW_MS + 25_000,
+            "createdTime": NOW_MS - 35_000
+        });
+        let order = parse_own_order_row(&row, "bot-1", NOW_MS).expect("a restable row");
+
+        assert_eq!(order.bet_id, "rest-9");
+        assert_eq!(order.market_id, "Market_test");
+        assert_eq!(order.outcome, "NO");
+        assert_eq!(order.answer_id.as_deref(), Some("ans-a"));
+        assert_close(order.limit_prob, 0.29);
+        assert_close(order.filled_amount, 3.0);
+        assert_close(order.order_amount, 12.0);
+        assert_close(order.filled_shares, 9.0);
+        assert_eq!(order.created_ms, NOW_MS - 35_000);
+        assert_eq!(order.expires_ms, Some(NOW_MS + 25_000));
+    }
+
+    #[test]
+    fn the_boot_snapshot_skips_dead_and_unrestable_rows() {
+        let now = NOW_MS;
+        let base = |mut row: Value| {
+            row["id"] = json!("row");
+            row["userId"] = json!("bot-1");
+            row["contractId"] = json!("Market_test");
+            row["outcome"] = json!("YES");
+            row["amount"] = json!(0.0);
+            row["orderAmount"] = json!(10.0);
+            row["limitProb"] = json!(0.5);
+            row
+        };
+
+        // Cancelled, fully filled, expired, redemption rows do not rest.
+        let cancelled = {
+            let mut row = base(json!({}));
+            row["isCancelled"] = json!(true);
+            row
+        };
+        assert!(parse_own_order_row(&cancelled, "bot-1", now).is_none());
+
+        let filled = {
+            let mut row = base(json!({}));
+            row["isFilled"] = json!(true);
+            row
+        };
+        assert!(parse_own_order_row(&filled, "bot-1", now).is_none());
+
+        let expired = {
+            let mut row = base(json!({}));
+            row["expiresAt"] = json!(now - 500);
+            row
+        };
+        assert!(
+            parse_own_order_row(&expired, "bot-1", now).is_none(),
+            "expired rows are dead even before the cron flips isCancelled"
+        );
+
+        let redemption = {
+            let mut row = base(json!({}));
+            row["isRedemption"] = json!(true);
+            row
+        };
+        assert!(parse_own_order_row(&redemption, "bot-1", now).is_none());
+
+        // Foreign user (response-shape guard) and off-outcome rows.
+        let foreign = base(json!({})) ;
+        assert!(parse_own_order_row(&foreign, "someone-else", now).is_none());
+
+        let bad_outcome = {
+            let mut row = base(json!({}));
+            row["outcome"] = json!("DOWN");
+            row
+        };
+        assert!(parse_own_order_row(&bad_outcome, "bot-1", now).is_none());
+
+        // A row without a limit probability or with a zero remainder.
+        let no_limit = {
+            let mut row = base(json!({}));
+            row.as_object_mut().unwrap().remove("limitProb");
+            row
+        };
+        assert!(parse_own_order_row(&no_limit, "bot-1", now).is_none());
+
+        let fully_committed = {
+            let mut row = base(json!({}));
+            row["orderAmount"] = json!(10.0);
+            row["amount"] = json!(10.0);
+            row
+        };
+        assert!(parse_own_order_row(&fully_committed, "bot-1", now).is_none());
+
+        // A row without expiresAt falls back to the default lifetime.
+        let no_expiry = base(json!({}));
+        let order = parse_own_order_row(&no_expiry, "bot-1", now).expect("restable");
+        assert_eq!(order.expires_ms, Some(now + FALLBACK_LIMIT_EXPIRY_SECS * 1_000));
+    }
+
+    #[test]
+    fn leg_index_matches_the_binary_leg_and_answer_legs() {
+        use crate::types::TrackedAnswer;
+
+        // Binary single leg: only the None (binary) answer maps there.
+        let market = market_with(0.5, 0.5, 0.0, 0.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = MarketStore::new(&db).expect("store loads");
+        store.insert(&market).expect("insert market");
+        let binary = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        assert_eq!(leg_index_for(&binary, &None), Some(0));
+        assert_eq!(leg_index_for(&binary, &Some("ans-a".to_owned())), None);
+
+        // Multiple-choice: answer ids map to their leg only.
+        let mut mc = market;
+        mc.id = "Market_mc".to_owned();
+        mc.outcome_type = "MULTIPLE_CHOICE".to_owned();
+        store.insert(&mc).expect("insert mc market");
+        for (index, answer_id) in ["a", "b"].iter().enumerate() {
+            db.upsert_answer(&TrackedAnswer {
+                id: (*answer_id).to_owned(),
+                market_id: "Market_mc".to_owned(),
+                text: format!("Answer {answer_id}"),
+                p_internal_log_odds: 0.0,
+                p_market_last: 0.5,
+                belief_updated_at: 0,
+                yes_shares: 0.0,
+                no_shares: 0.0,
+                created_at: index as i64,
+                invested_mana: 0.0,
+            })
+            .expect("insert answer");
+        }
+        let answers = Book::load(&store, &db, "Market_mc")
+            .expect("load book")
+            .expect("tracked");
+        assert_eq!(
+            leg_index_for(&answers, &None),
+            None,
+            "an answers book has no binary leg"
+        );
+        assert_eq!(leg_index_for(&answers, &Some("a".to_owned())), Some(0));
+        assert_eq!(leg_index_for(&answers, &Some("b".to_owned())), Some(1));
+        assert_eq!(
+            leg_index_for(&answers, &Some("lost".to_owned())),
+            None,
+            "a lost answer maps to no leg"
+        );
+    }
+
+    // -- Maker-fill accounting end to end -----------------------------------
+
+    /// A trade executor wired to nothing remote: an in-memory DB, a real
+    /// (unused) HTTP client, and a fresh rate bucket. Every maker-fill test
+    /// avoids the network by feeding websocket-shaped `BetEvent`s straight
+    /// into [`TradeExecutor::on_own_bet_event`].
+    fn offline_executor(
+        db: &Db,
+        store: &Arc<MarketStore>,
+    ) -> TradeExecutor {
+        TradeExecutor {
+            client: ManifoldClient {
+                http: reqwest::Client::new(),
+                base_url: "http://127.0.0.1:1".to_owned(),
+                api_key: "unused".to_owned(),
+                bot_user_id: "bot-1".to_owned(),
+            },
+            db: db.clone(),
+            store: Arc::clone(store),
+            policy: TradePolicy {
+                params: params(),
+                multiple_choice: TradeLimits::binary(),
+            },
+            dry_run: false,
+            halflife_hours: 4.0,
+            limit_epsilon: 0.01,
+            limit_expiry_secs: 60,
+            limit_drift_cancel: 0.05,
+            rate: RateLimiter::per_minute(500, Box::new(SystemClock)),
+            execution_lock: Mutex::new(()),
+            terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
+            own_orders: SyncMutex::new(OwnRestingOrders::default()),
+            events: broadcast::channel(EVENT_CAPACITY).0,
+        }
+    }
+
+    /// A YES limit placed a minute ago and partially filled at placement,
+    /// with all times relative to the wall clock (the policy tests the local
+    /// clock for expiry).
+    fn live_resting_order(now_ms: i64) -> OwnRestingOrder {
+        OwnRestingOrder {
+            bet_id: "rest-1".to_owned(),
+            market_id: "Market_test".to_owned(),
+            answer_id: None,
+            outcome: "YES".to_owned(),
+            limit_prob: 0.49,
+            order_amount: 50.0,
+            filled_amount: 10.0,
+            filled_shares: 20.0,
+            created_ms: now_ms - 60_000,
+            expires_ms: Some(now_ms + 40_000),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_maker_fill_of_an_own_resting_order_applies_to_the_book_once() {
+        // The placement already filled 10 mana / 20 shares, recorded in the
+        // book exactly like execute() records a taker fill; the tracker
+        // mirrors those counters.
+        let market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("insert market");
+        let executor = offline_executor(&db, &store);
+        let now_ms = Utc::now().timestamp_millis();
+
+        executor.own_orders().upsert(live_resting_order(now_ms));
+
+        // Another chunk of the same bet filled on Manifold: +20 mana, +40
+        // shares beyond what placement reported.
+        let mut bet = own_bet_event("rest-1", 30.0, 60.0);
+        bet.expires_at = Some(now_ms + 40_000);
+        executor.on_own_bet_event(&bet).await.expect("fill applies");
+
+        // The book went through the same flow as an ordinary buy.
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        assert_close(book.leg(0).yes_shares, 60.0);
+        assert_close(book.leg(0).invested_mana, 30.0);
+
+        let trades = db.recent_trades("Market_test", 10).expect("ledger");
+        assert_eq!(trades.len(), 1, "exactly one maker-fill ledger row");
+        assert_eq!(trades[0].action, TradeAction::BuyYes);
+        assert_close(trades[0].mana_amount, 20.0);
+        assert_close(trades[0].shares_delta, 40.0);
+        assert_eq!(
+            trades[0].trigger_post_uri.as_deref(),
+            Some("maker_fill:rest-1"),
+            "provenance shows the fill source"
+        );
+        assert_eq!(trades[0].manifold_bet_id.as_deref(), Some("rest-1"));
+
+        // Budget invariant holds after the fill.
+        let row = store.load("Market_test").expect("load").expect("row");
+        assert!(
+            row.invested_mana
+                <= row.budget_mana + row.realized_pnl_mana + BUDGET_EPSILON,
+            "invested {} must stay within budget plus realized PnL {}",
+            row.invested_mana,
+            row.budget_mana + row.realized_pnl_mana
+        );
+
+        // Duplicate broadcast: idempotent by the delta key — no second row,
+        // no share change.
+        executor.on_own_bet_event(&bet).await.expect("replay is inert");
+        let trades = db.recent_trades("Market_test", 10).expect("ledger");
+        assert_eq!(trades.len(), 1, "a duplicate must not write a second row");
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        assert_close(book.leg(0).yes_shares, 60.0);
+
+        // The stored counters now read the server's values: a subsequent
+        // event builds its delta on them.
+        let tracked = executor
+            .own_orders()
+            .get("Market_test", "rest-1")
+            .cloned()
+            .expect("still tracked");
+        assert_close(tracked.filled_amount, 30.0);
+        assert_close(tracked.filled_shares, 60.0);
+
+        // The fill was announced downstream (Discord embeds read these).
+        // The order stays tracked (not fully filled, not cancelled, alive).
+        assert!(executor.own_orders().get("Market_test", "rest-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_maker_fill_past_the_ceiling_is_refused_locally_and_reported() {
+        let market = market_with(10.0, 0.0, 0.0, 0.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("insert market");
+        let executor = offline_executor(&db, &store);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let mut order = live_resting_order(now_ms);
+        order.order_amount = 500.0;
+        order.filled_amount = 0.0;
+        order.filled_shares = 0.0;
+        executor.own_orders().upsert(order);
+
+        let mut receiver = executor.events().subscribe();
+        let mut bet = own_bet_event("rest-1", 200.0, 400.0);
+        bet.expires_at = Some(now_ms + 40_000);
+        executor.on_own_bet_event(&bet).await.expect("handled");
+
+        // Nothing applied locally: the budget invariant wins.
+        let trades = db.recent_trades("Market_test", 10).expect("ledger");
+        assert!(trades.is_empty(), "a refused fill writes no ledger row");
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        assert_close(book.leg(0).yes_shares, 0.0);
+        assert_close(book.leg(0).invested_mana, 0.0);
+
+        // The refusal left the tracker entry (with the server's refreshed
+        // counters, so no duplicate can re-apply the refused fill); a later
+        // reconcile pass trusts Manifold's position anyway.
+        let tracked = executor
+            .own_orders()
+            .get("Market_test", "rest-1")
+            .cloned()
+            .expect("a refused fill is still tracked");
+        assert_close(tracked.filled_shares, 400.0);
+        assert_close(tracked.filled_amount, 200.0);
+
+        // A Discord-facing error was emitted.
+        match receiver.try_recv() {
+            Ok(TradeEvent::Error { market_id, message }) => {
+                assert_eq!(market_id.as_deref(), Some("Market_test"));
+                assert!(message.contains("budget invariant"), "{message}");
+            }
+            other => panic!("expected an error event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fully_filled_or_cancelled_maker_event_retires_the_order() {
+        let market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("insert market");
+        let executor = offline_executor(&db, &store);
+        let now_ms = Utc::now().timestamp_millis();
+
+        executor.own_orders().upsert(live_resting_order(now_ms));
+
+        let mut bet = own_bet_event("rest-1", 50.0, 100.0);
+        bet.expires_at = Some(now_ms + 40_000);
+        bet.is_filled = true;
+        executor.on_own_bet_event(&bet).await.expect("handled");
+
+        assert!(
+            executor.own_orders().get("Market_test", "rest-1").is_none(),
+            "a full fill retires the order"
+        );
+        let row = store.load("Market_test").expect("load").expect("row");
+        assert_close(row.yes_shares, 100.0);
+        assert_close(row.invested_mana, 50.0);
+
+        // A later cancel broadcast on the same bet id changes nothing.
+        let cancelled = BetEvent {
+            is_filled: false,
+            is_cancelled: true,
+            ..bet
+        };
+        executor
+            .on_own_bet_event(&cancelled)
+            .await
+            .expect("handled");
+        assert!(executor.own_orders().get("Market_test", "rest-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_foreign_user_bet_is_never_accounted() {
+        let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("insert market");
+        let executor = offline_executor(&db, &store);
+        let now_ms = Utc::now().timestamp_millis();
+        executor.own_orders().upsert(live_resting_order(now_ms));
+
+        // Someone else's bet on the same market, same bet id by accident
+        // (impossible on Manifold): the user-id gate keeps the fill path off.
+        let mut foreign = own_bet_event("rest-1", 30.0, 60.0);
+        foreign.user_id = "someone-else".to_owned();
+        executor.on_own_bet_event(&foreign).await.expect("handled");
+
+        let trades = db.recent_trades("Market_test", 10).expect("ledger");
+        assert!(trades.is_empty(), "a foreign bet writes no ledger row");
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        assert_close(book.leg(0).yes_shares, 0.0);
     }
 
     // -------------------------------------------------------------------
@@ -3114,6 +4805,8 @@ mod tests {
             exit_edge_threshold: 0.01,
             min_trade_size: 1.0,
             limit_epsilon: 0.01,
+            limit_expiry_secs: 60,
+            limit_drift_cancel: 0.05,
             belief_kappa: 1.1,
             belief_halflife_hours: 4.0,
             triage_min_evidence: 0.7,

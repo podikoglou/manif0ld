@@ -18,6 +18,17 @@ const DEFAULT_MIN_TRADE_SIZE: f64 = 1.0;
 /// Slack allowed beyond the bot's own fair price in one buy's fill limit
 /// (`docs/ALGO.md` §S1): the capped `limitProb` becomes `p_internal − ε`.
 const DEFAULT_LIMIT_EPSILON: f64 = 0.01;
+/// Lifetime of the resting remainder of a fair-capped buy, sent as
+/// `expiresMillisAfter` on `POST /v0/bet` (`docs/ALGO.md` §S1). The probe
+/// verified that Manifold accepts the field, expires a past-due order
+/// server-side at the top of the minute, and silently caps `amount` to what
+/// the limit allows — so the remainder rests *by construction* and the only
+/// choice is how long it may sit.
+const DEFAULT_LIMIT_EXPIRY_SECS: usize = 60;
+/// Reverse-drift cancel slack: how much worse than the day's fresh fair-capped
+/// cap an own resting order may sit (YES/NO-sensitive; `docs/SPEC.md` §6.6)
+/// before the executor cancels it.
+const DEFAULT_LIMIT_DRIFT_CANCEL: f64 = 0.05;
 const DEFAULT_BELIEF_KAPPA: f64 = 1.1;
 const DEFAULT_BELIEF_HALFLIFE_HOURS: f64 = 4.0;
 const DEFAULT_TRIAGE_MIN_EVIDENCE: f64 = 0.7;
@@ -60,6 +71,17 @@ pub struct Config {
     /// an `ε ≥ ENTRY_EDGE_THRESHOLD` could only produce no-fill limit orders
     /// resting on the book instead of sweeps.
     pub limit_epsilon: f64,
+    /// How long the resting remainder of one fair-capped buy may sit on the
+    /// book before Manifold expires it, sent as `expiresMillisAfter` on every
+    /// bot buy (seconds; the wire takes milliseconds). Bounded into
+    /// `[1, 300]` seconds so a drifted edge can idle at most five minutes,
+    /// and bot buys never need a manual cancel for a stale layer.
+    pub limit_expiry_secs: usize,
+    /// Reverse-drift cancel slack for the own resting layer (`docs/SPEC.md`
+    /// §6.6): cancel an own order once its limit price is more than this far
+    /// past the fresh fair-capped cap, on the outcome it buys. Must lie in the
+    /// open interval `(0, 1)`.
+    pub limit_drift_cancel: f64,
     pub belief_kappa: f64,
     pub belief_halflife_hours: f64,
     /// Probability of evidence a post must reach before it moves belief.
@@ -155,6 +177,15 @@ impl Config {
         if !(limit_epsilon > 0.0 && limit_epsilon < 0.05) {
             bail!("LIMIT_EPSILON must be within (0, 0.05), got {limit_epsilon}");
         }
+        let limit_expiry_secs = usize_or(&get, "LIMIT_EXPIRY_SECS", DEFAULT_LIMIT_EXPIRY_SECS)?;
+        if !(1..=300).contains(&limit_expiry_secs) {
+            bail!("LIMIT_EXPIRY_SECS must be within [1, 300] seconds, got {limit_expiry_secs}");
+        }
+        let limit_drift_cancel =
+            f64_or(&get, "LIMIT_DRIFT_CANCEL", DEFAULT_LIMIT_DRIFT_CANCEL)?;
+        if !(limit_drift_cancel > 0.0 && limit_drift_cancel < 1.0) {
+            bail!("LIMIT_DRIFT_CANCEL must be within (0, 1), got {limit_drift_cancel}");
+        }
         let belief_kappa = f64_or(&get, "BELIEF_KAPPA", DEFAULT_BELIEF_KAPPA)?;
         let belief_halflife_hours =
             f64_or(&get, "BELIEF_HALFLIFE_HOURS", DEFAULT_BELIEF_HALFLIFE_HOURS)?;
@@ -198,6 +229,8 @@ impl Config {
             exit_edge_threshold,
             min_trade_size,
             limit_epsilon,
+            limit_expiry_secs,
+            limit_drift_cancel,
             belief_kappa,
             belief_halflife_hours,
             triage_min_evidence,
@@ -392,6 +425,8 @@ mod tests {
         assert_eq!(config.exit_edge_threshold, 0.01);
         assert_eq!(config.min_trade_size, 1.0);
         assert_eq!(config.limit_epsilon, 0.01);
+        assert_eq!(config.limit_expiry_secs, 60);
+        assert_eq!(config.limit_drift_cancel, 0.05);
         assert_eq!(config.belief_kappa, 1.1);
         assert_eq!(config.belief_halflife_hours, 4.0);
         assert_eq!(config.triage_min_evidence, 0.7);
@@ -414,6 +449,8 @@ mod tests {
             ("EXIT_EDGE_THRESHOLD", "0.02"),
             ("MIN_TRADE_SIZE", "2.5"),
             ("LIMIT_EPSILON", "0.02"),
+            ("LIMIT_EXPIRY_SECS", "120"),
+            ("LIMIT_DRIFT_CANCEL", "0.08"),
             ("BELIEF_KAPPA", "2.0"),
             ("BELIEF_HALFLIFE_HOURS", "6.5"),
             ("TRADING_DRY_RUN", "false"),
@@ -436,6 +473,8 @@ mod tests {
         assert_eq!(config.exit_edge_threshold, 0.02);
         assert_eq!(config.min_trade_size, 2.5);
         assert_eq!(config.limit_epsilon, 0.02);
+        assert_eq!(config.limit_expiry_secs, 120);
+        assert_eq!(config.limit_drift_cancel, 0.08);
         assert_eq!(config.belief_kappa, 2.0);
         assert_eq!(config.belief_halflife_hours, 6.5);
         assert!(!config.trading_dry_run);
@@ -512,6 +551,28 @@ mod tests {
 
             let error = config_from(&vars).expect_err("out-of-range epsilon should fail");
             assert!(error.to_string().contains("LIMIT_EPSILON"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_limit_expiry_outside_the_one_to_three_hundred_second_band() {
+        for value in ["0", "301", "-2"] {
+            let mut vars = required_vars();
+            vars.push(("LIMIT_EXPIRY_SECS", value));
+
+            let error = config_from(&vars).expect_err("out-of-range expiry should fail");
+            assert!(error.to_string().contains("LIMIT_EXPIRY_SECS"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_limit_drift_cancel_outside_the_open_unit_interval() {
+        for value in ["0", "-0.05", "1", "1.5", "NaN"] {
+            let mut vars = required_vars();
+            vars.push(("LIMIT_DRIFT_CANCEL", value));
+
+            let error = config_from(&vars).expect_err("out-of-range slack should fail");
+            assert!(error.to_string().contains("LIMIT_DRIFT_CANCEL"), "{error}");
         }
     }
 

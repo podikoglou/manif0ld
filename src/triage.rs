@@ -971,6 +971,8 @@ mod tests {
             exit_edge_threshold: 0.01,
             min_trade_size: 1.0,
             limit_epsilon: 0.01,
+            limit_expiry_secs: 60,
+            limit_drift_cancel: 0.05,
             belief_kappa: 1.1,
             belief_halflife_hours: 4.0,
             triage_min_evidence: 0.7,

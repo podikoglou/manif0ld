@@ -5,7 +5,7 @@
 ## 1. Purpose & Invariants
 
 1. **Filter-first.** Sieve + one decision-model call per surviving post is the product. If the filter works, the bot works.
-2. **Auto-trading is in scope, but simple.** Market buys only. Enter once per market per direction on strong edge, exit once on edge decay. No limit orders, no partial scaling, no stop-loss regimes.
+2. **Auto-trading is in scope, but simple.** Fair-capped limit buys (§6.6) whose unfilled remainder rests with an expiry. Enter once per market per direction on strong edge, exit once on edge decay. No partial scaling, no stop-loss regimes, no client-placed standing orders.
 3. **Per-market isolated budgets.** Each market has `budget_mana`. Never invest more than `budget_mana` net in a market. Realized profits cycle back into that market's available budget only.
 4. **No autonomous market discovery.** Markets only enter via operator `/track`.
 5. **No calibration, no self-healing.** The onboarding LLM writes one Sieve rule. If it compiles, it's live. If the operator doesn't like it, they `/untrack` and `/track` again with a fresh prompt.
@@ -515,8 +515,10 @@ if no position and edge < −ENTRY_EDGE_THRESHOLD and target_mana >= MIN_TRADE_S
    field, and Manifold may add internal arbitrage legs on its own. Independent
    markets allow both sides.
 
-**No partial positions, no scale-in, no limit orders.** One entry per position
-lifecycle. Exit is all-or-nothing.
+**No partial positions, no scale-in, no separate limit-order strategy.** One
+entry per position lifecycle; exit is all-or-nothing. A fair-capped buy's
+unfilled remainder *rests* with an expiry (above) — that is execution
+detail of the buy, not a client-placed standing order.
 
 **Dry run.** `TRADING_DRY_RUN` defaults to `true`. Buys are sent with
 `"dryRun": true` (simulated fill, no position), sells are only logged, and
@@ -526,9 +528,11 @@ nothing is persisted. The canary phase flips it to `false` with tiny caps.
 
 | Action | Endpoint | Body |
 |---|---|---|
-| Buy | `POST /v0/bet` | `{contractId, answerId?, amount, outcome:"YES"\|"NO", limitProb: fair-capped sweep (below), dryRun?}` |
+| Buy | `POST /v0/bet` | `{contractId, answerId?, amount, outcome:"YES"\|"NO", limitProb: fair-capped sweep (below), expiresMillisAfter: LIMIT_EXPIRY_SECS×1000, dryRun?}` |
 | Sell | `POST /v0/market/{id}/sell` | `{answerId?, outcome:"YES"\|"NO", shares: <amount>}`; `answerId` is required on a multiple-choice market |
-| Positions | `GET /v0/market/{id}/positions?userId={bot_user_id}` (bot ID from `GET /v0/me` at startup) | — |
+| Cancel | `POST /v0/bet/cancel/{betId}` (one bet per request) | — |
+| Position | `GET /v0/market/{id}/positions?userId={bot_user_id}` (bot ID from `GET /v0/me` at startup) | — |
+| Resting book | `GET /v0/bets?userId={bot}&kinds=open-limit` (boot snapshot of the bot's own open orders, one call for every market) | — |
 | Market | `GET /v0/market/{id}` (includes `answers[].probability`) | — |
 
 Buys sweep the AMM with a **fair-capped limit**, not the old
@@ -556,13 +560,125 @@ config validation keeps `ε` in `(0, 0.05)` — below the default entry-edge
 threshold, so a threshold-sized edge still crosses the market price and the
 order sweeps instead of resting unfilled.
 
-When the cap stops the sweep before the requested mana is spent, Manifold
-fills the first portion and **rests the remainder** as an open limit order at
-the cap. The executor logs the shortfall at `info!` (requested mana from
-`orderAmount` against the actual `amount`/`shares`), persists the ledger row
-with the *actual* shares and mana only, and neither retries nor cancels —
-placing the expiring resting order for that remainder is the next §S1 step,
-after a wire probe.
+**One call is the whole ladder (wire-verified).** One `POST /v0/bet` with
+`limitProb + amount + expiresMillisAfter` consumes opposing resting orders
+first — at *their* price (which may be stale and favorable), in price-time
+priority — then sweeps the AMM up to the cap, and then rests whatever is
+left as the same bet row. There is no manual "take stale limits first"
+step and no mirror of other people's orders: the wire does the ladder
+(see **Deliberate S1 deviations** below).
+
+**Whole-percent quantization.** Manifold quantizes `limitProb`
+server-side onto whole percents and rejects finer values with HTTP 400.
+Before sending, the executor quantizes the exact cap in the one direction
+that can only make it *less* aggressive for the outcome being bought — the
+single invariant: the sent cap never permits a worse per-share fill than
+the unquantized cap:
+
+```
+YES buy:  limitProb = floor(cap_exact × 100) / 100        (per-share price IS limitProb)
+NO buy:   limitProb  = ceil(cap_exact × 100) / 100        (per-NO price is 1 − limitProb)
+```
+
+Both sides are clamped into `[0.01, 0.99]` afterwards. (A plain `floor`
+for both would make NO fills *worse*, since lowering the YES-scale limit
+raises the per-NO-share ceiling.)
+
+**Expiring rests.** Manifold fills `amount` silently up to what the limit
+allows (the response reports the filled part in `amount`/`shares` and echoes
+the request in `orderAmount`, so the remainder is `orderAmount − amount`);
+the remainder **rests automatically as the same bet row**. Every bot buy
+sends `expiresMillisAfter = LIMIT_EXPIRY_SECS × 1000` (default 60 s,
+validated into `[1, 300]`): the edge the rally is betting on can drift away,
+so a rest must not sit longer than minutes. When the cap stops the sweep
+before the requested mana is spent, the executor logs the shortfall at
+`info!`, persists the ledger row with the *actual* shares and mana only,
+and never retries; the rest is picked off or dies without a cancel call.
+
+**Own resting-order tracking (executor-side, in memory — no schema
+change).** The unfilled remainder is committed money, so the executor keeps
+`OwnRestingOrders` (keyed market → bet id), fed by three sources:
+
+1. **Buy responses.** A (partially) unfilled fill response records
+   `(bet_id, outcome, answer_id, limit_prob, order_amount, filled_amount,
+   filled_shares)`, expiry `=` placement time + `LIMIT_EXPIRY_SECS`.
+2. **Own `global/new-bet` events.** Websocket `BetEvent`s with the bot's
+   `user_id` (probe-verified: this stream carries maker fills) update the
+   cumulative `amount`/`shares` counters; a cancelled, fully filled, or
+   expired order leaves the tracker.
+3. **One boot snapshot.** `GET /v0/bets?userId={bot}&kinds=open-limit`
+   (payloads verified: `kinds` and `userId` combine; the backend filter is
+   `is_filled=false AND is_cancelled=false`; no expiry filter — a row whose
+   `expiresAt` passed can still appear for up to the ~1-minute cron lag, so
+   rows are filtered locally on the wall clock). One REST call covers all
+   markets.
+
+Because the rest is a spending commitment the position columns do not yet
+see, the pre-buy budget check counts it: `committed = invested + Σ
+remainder(market) + amount`, against the same
+`budget_mana + realized_pnl_mana` ceiling.
+
+**Maker-fill accounting.** When a websocket event shows one of our rests
+got (partially) filled *after* placement — at the rest's own limit price,
+better than the sweep — the delta beyond the last seen counters is applied
+through the same flow an ordinary buy uses: `Book::apply_buy` into the
+order's leg with the server-reported mana delta, a `trade_ledger` row
+carrying provenance `maker_fill:{betId}` in the trigger column, and a
+Discord `[TRADE]` event. It all runs under the execution lock, and the
+budget invariant gates the local application (a fill that would breach the
+ceiling — only possible after external tampering with the budget columns —
+is refused locally and left to the next reconcile pass, which trusts
+Manifold). Duplicate broadcasts are idempotent by construction: the delta
+key is *remaining amount consumed* (the stored cumulative
+`amount`/`shares` overwritten with the server's values first), so a
+replayed event computes a zero delta and writes nothing.
+
+**Reverse-drift cancel policy** (checked after the price-mirror step of
+every cached evaluation, before the plan). With a freshly derived fair
+value — the same `entry_fair_value` derivation the entry cap uses — and
+`cap_now = fair_capped_limit_prob(p_fair_now, ε, outcome)`:
+
+```
+YES order:  cancel iff  limitProb − cap_now > LIMIT_DRIFT_CANCEL   (default 0.05)
+NO order:   cancel iff  cap_now − limitProb > LIMIT_DRIFT_CANCEL   (compared on the YES scale)
+```
+
+A resting order is never left in place when filling it would take the book
+into a position at odds with current belief; favorable drift keeps it (it
+fills at a price we could not replicate). In addition, always cancel an own
+order when:
+
+- the market's latest price mirror carried the resolution signature
+  (`TerminalMirrors`), checked both at the top of a cached evaluation and
+  when the websocket patch arrives;
+- an entry executed in the same evaluation bought the opposite outcome on
+  the same leg (per leg, so an answer-A entry does not touch a resting
+  order on answer B);
+- the operator liquidates the market (`/close`, `/untrack --liquidate`,
+  `/panic` — the one hook those control-plane paths share).
+
+Orders younger than 5 seconds are never cancelled by the drift or
+opposite-entry rules: they were placed against the same evaluation's
+belief, and the next price update re-checks them. Untracked-without-sale
+(`/untrack`) has no cancel hook — its rests simply expire. Cancel writes
+are rate-checked like every other write (one Trade-class token), and a
+refusal or a failed cancel leaves the order resting, bounded by its expiry.
+
+**Deliberate S1 deviations** (against the `docs/ALGO.md` §S1 sketch, on
+wire grounds):
+
+1. **No stale-book sweep / mirror of other traders' orders.** The ladder's
+   first rung — crossing other participants' resting orders — is already
+   executed by the single bet call at *their* price, in price-time
+   priority; a manual sweep through our own order would only rearrange the
+   same fills. A passive `contract/{id}/orders` mirror of the open book is
+   deferred to the SNIPER phase unless S2 needs it.
+2. **No passive sell side.** `/v0/market/{id}/sell` is an instant,
+   uncapped sweep with no `limitProb`/expiry on the wire. (It may cross
+   opponents' resting orders at their stale prices — favorable, but not
+   controllable.) Exits remain instant.
+3. **No `contract/{id}/orders` subscriptions, no `cpmm-multi-2` multi-bet**
+   — out of scope for S1.
 
 **Position sync (phase 1 of `docs/ALGO.md`, websocket live prices):** Prices
 arrive live over the Manifold broadcast websocket
