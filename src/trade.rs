@@ -1,15 +1,17 @@
-//! Manifold trading: HTTP client, Kelly sizing, decisions, and execution.
+//! Manifold transport and trade execution.
 //!
-//! The module has three layers, each testable on its own:
+//! The module has two layers:
 //!
 //! 1. [`ManifoldClient`] wraps the REST API (`/v0/me`, `/v0/market/{id}`,
 //!    `/v0/market/{id}/positions`, `/v0/bet`, `/v0/market/{id}/sell`).
-//! 2. Pure functions: [`kelly_target_mana`], [`decide_trade`], [`apply_buy`],
-//!    and [`apply_sell`]. They take owned state and return decisions or mutate a
-//!    [`TrackedMarket`] in place, so they need no network, database, or clock.
-//! 3. [`TradeExecutor`] wires the two together: it reconciles the local
-//!    position against Manifold, computes the belief-derived edge, executes at
-//!    most one action, and persists the result.
+//! 2. [`TradeExecutor`] is the control flow: it loads a [`Book`], prepares it
+//!    from Manifold, asks the book for a plan, executes each action, and
+//!    persists the result.
+//!
+//! Positions, accounting, and the trading policy live in [`crate::book`]. The
+//! dependency edge is one-way: `trade` uses `book`, and `book` never imports
+//! this module. Positioning the layer boundary here is what makes the two
+//! market shapes share one control flow.
 //!
 //! # Positions, not bets, for reconciliation
 //!
@@ -32,7 +34,6 @@
 //! The API key is stored in [`ManifoldClient`] and sent in the `Authorization`
 //! header. It never appears in an error, a log line, or the `Debug` output.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,15 +45,18 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 
-use crate::belief;
+use crate::book::{
+    AnswerObservation, Book, MarketPositions, PlannedTrade, Position, Shape, TradePolicy,
+    BUDGET_EPSILON,
+};
 use crate::config::Config;
 use crate::db::Db;
-use crate::error::{bail, AppResult, Context};
+use crate::error::{anyhow, bail, AppResult, Context};
 use crate::market_store::MarketStore;
 use crate::pipeline::PipelineEvent;
 use crate::types::{
-    available_budget, MarketId, MarketStatus, TrackedAnswer, TrackedMarket, TradeAction,
-    TradeDecision, TradeRecord,
+    available_budget, MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision,
+    TradeRecord,
 };
 
 /// Public Manifold API base URL.
@@ -82,35 +86,6 @@ const YES_LIMIT_PROB: f64 = 0.99;
 
 /// Limit price that emulates a market buy of NO shares.
 const NO_LIMIT_PROB: f64 = 0.01;
-
-/// Kelly fractions are capped at half of the available budget.
-const MAX_KELLY_FRACTION: f64 = 0.5;
-
-/// Probability bounds used by the sizing and decision math.
-///
-/// A market probability of exactly 0 or 1 makes Kelly division and log-odds
-/// undefined, so the trading layer treats the probability as bounded away from
-/// those endpoints.
-const MIN_TRADING_PROB: f64 = 0.01;
-const MAX_TRADING_PROB: f64 = 0.99;
-
-/// Answers priced outside this band are never entered.
-///
-/// A multiple-choice market can contain answers that already resolved to 0 or 1
-/// while the market is still open (23 of 53 in the MEGA market at probe time).
-/// Entering at 99 cents for a one-cent edge is a bad trade, and a near-zero
-/// price makes the Kelly denominator meaningless.
-const MC_MIN_PRICE: f64 = 0.02;
-const MC_MAX_PRICE: f64 = 0.98;
-
-/// Tolerance for the budget invariant, in mana. Floating-point sums of budgets,
-/// PnL, and invested amounts can differ by a few ULPs from zero.
-const BUDGET_EPSILON: f64 = 1e-9;
-
-/// Difference between local and remote share counts that is still considered
-/// equal. Manifold reports fractional shares, so an exact comparison would warn
-/// on every tick.
-const POSITION_EPSILON: f64 = 1e-6;
 
 // -----------------------------------------------------------------------------
 // HTTP client
@@ -194,21 +169,17 @@ impl ManifoldClient {
     /// Fetches the bot's position in one market.
     ///
     /// A missing array or a missing entry means the bot holds nothing, which is
-    /// represented as a zero [`PositionSnapshot`] rather than an error.
-    pub async fn position(&self, market_id: &str) -> AppResult<PositionSnapshot> {
-        let path = format!(
-            "/v0/market/{}/positions?userId={}",
-            market_id, self.bot_user_id
-        );
-        let request = self.http.get(self.url(&path));
-        let value: Value = self.send(request, "GET /v0/market/{id}/positions").await?;
-        Ok(parse_position(&value, &self.bot_user_id))
+    /// represented as a zero [`Position`] rather than an error. This is the
+    /// root summary row of [`ManifoldClient::positions`], the single parser for
+    /// the `/positions` payload.
+    pub async fn position(&self, market_id: &str) -> AppResult<Position> {
+        Ok(self.positions(market_id).await?.root)
     }
 
     /// Fetches the root summary and every per-answer position in one request.
     ///
-    /// Use this for multiple choice markets. [`MarketPositions::checksum_ok`]
-    /// tells the caller whether the response was complete.
+    /// [`MarketPositions::checksum_ok`] tells the caller whether the response
+    /// was complete.
     pub async fn positions(&self, market_id: &str) -> AppResult<MarketPositions> {
         let path = format!(
             "/v0/market/{}/positions?userId={}",
@@ -404,19 +375,6 @@ pub struct MarketAnswerSnapshot {
     pub probability: Option<f64>,
 }
 
-/// The bot's current position in one market.
-///
-/// `invested` is Manifold's cost basis for the shares still held. `profit` is
-/// Manifold's total profit (realized plus unrealized), so it is diagnostic
-/// only: the local `realized_pnl_mana` is not overwritten from it.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PositionSnapshot {
-    pub yes_shares: f64,
-    pub no_shares: f64,
-    pub invested: f64,
-    pub profit: f64,
-}
-
 /// Fees charged on a bet, in mana.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BetFees {
@@ -494,112 +452,13 @@ impl BetResult {
     }
 }
 
-/// Parses the `GET /v0/market/{id}/positions` payload for one user.
-///
-/// The endpoint returns an array of `ContractMetric`, one entry per bettor. The
-/// entry whose `userId` matches `bot_user_id` and (if specified) `answerId` is used.
-/// For binary or root market positions, entries with `answerId: null` or absent are selected.
-pub(crate) fn parse_position(value: &Value, bot_user_id: &str) -> PositionSnapshot {
-    parse_answer_position(value, bot_user_id, None)
-}
-
-/// Parses the position for a specific answer (or the root contract if `target_answer_id` is None).
-pub(crate) fn parse_answer_position(
-    value: &Value,
-    bot_user_id: &str,
-    target_answer_id: Option<&str>,
-) -> PositionSnapshot {
-    let entries: &[Value] = match value {
-        Value::Array(items) => items.as_slice(),
-        Value::Object(map) => map
-            .get("positions")
-            .and_then(Value::as_array)
-            .map(|items| items.as_slice())
-            .unwrap_or(&[]),
-        _ => &[],
-    };
-
-    let selected = entries.iter().find(|entry| {
-        let user_matches = entry.get("userId").and_then(Value::as_str) == Some(bot_user_id)
-            || (entries.len() == 1 && entry.get("userId").is_none());
-        if !user_matches {
-            return false;
-        }
-        let answer_id = entry.get("answerId").and_then(Value::as_str);
-        match target_answer_id {
-            Some(target) => answer_id == Some(target),
-            None => answer_id.is_none(),
-        }
-    }).or_else(|| {
-        // Fallback for single-entry responses without answerId
-        if target_answer_id.is_none() && entries.len() == 1 {
-            entries.first()
-        } else {
-            None
-        }
-    });
-
-    let Some(entry) = selected else {
-        return PositionSnapshot::default();
-    };
-
-    position_from_entry(entry)
-}
-
-/// One row of a `ContractMetric` as a [`PositionSnapshot`].
-fn position_from_entry(entry: &Value) -> PositionSnapshot {
-    PositionSnapshot {
+/// One row of a `ContractMetric` as a [`Position`].
+fn position_from_entry(entry: &Value) -> Position {
+    Position {
         yes_shares: number_at(entry.pointer("/totalShares/YES")),
         no_shares: number_at(entry.pointer("/totalShares/NO")),
         invested: number_at(entry.get("invested")),
         profit: number_at(entry.get("profit")),
-    }
-}
-
-/// Every position the bot holds in one market, split by answer.
-///
-/// Manifold returns one root summary row (`answerId` null) plus one row per
-/// answer the user has ever bet on. The root row is not a position of its own:
-/// its totals equal the sum of the answer rows. A mismatch means the response
-/// was truncated, which [`MarketPositions::checksum_ok`] reports.
-#[derive(Debug, Clone, Default)]
-pub struct MarketPositions {
-    /// The market-level summary row. Zero when Manifold returned no rows.
-    pub root: PositionSnapshot,
-    /// Positions keyed by answer ID, for multiple choice markets.
-    pub answers: HashMap<String, PositionSnapshot>,
-    /// Whether the response included a root summary row.
-    pub saw_root: bool,
-}
-
-impl MarketPositions {
-    /// The position for one answer, or a zero position when never traded.
-    pub fn answer(&self, answer_id: &str) -> PositionSnapshot {
-        self.answers.get(answer_id).cloned().unwrap_or_default()
-    }
-
-    /// Sum of every per-answer row.
-    pub fn totals(&self) -> PositionSnapshot {
-        self.answers.values().fold(PositionSnapshot::default(), |mut sum, row| {
-            sum.yes_shares += row.yes_shares;
-            sum.no_shares += row.no_shares;
-            sum.invested += row.invested;
-            sum.profit += row.profit;
-            sum
-        })
-    }
-
-    /// Whether the root summary still equals the sum of the answer rows.
-    ///
-    /// A response without a root row (no positions at all) is consistent.
-    pub fn checksum_ok(&self) -> bool {
-        if !self.saw_root {
-            return true;
-        }
-        let totals = self.totals();
-        (self.root.yes_shares - totals.yes_shares).abs() <= POSITION_EPSILON
-            && (self.root.no_shares - totals.no_shares).abs() <= POSITION_EPSILON
-            && (self.root.invested - totals.invested).abs() <= POSITION_EPSILON
     }
 }
 
@@ -661,509 +520,6 @@ pub fn optional_millis_to_seconds(millis: Option<i64>) -> Option<i64> {
 }
 
 // -----------------------------------------------------------------------------
-// Sizing and decisions
-// -----------------------------------------------------------------------------
-
-/// Trading parameters, usually sourced from [`Config`].
-#[derive(Debug, Clone, Copy)]
-pub struct TradeParams {
-    pub kelly_fraction: f64,
-    pub entry_edge_threshold: f64,
-    pub exit_edge_threshold: f64,
-    pub min_trade_size: f64,
-}
-
-impl TradeParams {
-    /// Reads the trading parameters from process configuration.
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            kelly_fraction: config.kelly_fraction,
-            entry_edge_threshold: config.entry_edge_threshold,
-            exit_edge_threshold: config.exit_edge_threshold,
-            min_trade_size: config.min_trade_size,
-        }
-    }
-}
-
-/// Fractional-Kelly target size in mana for one entry.
-///
-/// Follows spec §6.6:
-///
-/// ```text
-/// bullish YES: f = lambda * edge / (1 - p_market)
-/// bullish NO:  f = lambda * |edge| / p_market
-/// f = clamp(f, 0, 0.5);  target = f * available_budget
-/// ```
-///
-/// Returns zero when the edge does not reach the entry threshold, when the
-/// budget is non-positive, or when the result would not be finite. `p_market`
-/// is clamped to `[0.01, 0.99]` to keep the denominators away from zero.
-pub fn kelly_target_mana(
-    edge: f64,
-    p_market: f64,
-    available_budget: f64,
-    params: TradeParams,
-) -> f64 {
-    if !available_budget.is_finite() || available_budget <= 0.0 {
-        return 0.0;
-    }
-    if !edge.is_finite() {
-        return 0.0;
-    }
-    let p_market = p_market.clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
-
-    let fraction = if edge >= params.entry_edge_threshold {
-        params.kelly_fraction * edge / (1.0 - p_market)
-    } else if edge <= -params.entry_edge_threshold {
-        params.kelly_fraction * edge.abs() / p_market
-    } else {
-        return 0.0;
-    };
-
-    if !fraction.is_finite() {
-        return 0.0;
-    }
-
-    fraction.clamp(0.0, MAX_KELLY_FRACTION) * available_budget
-}
-
-/// Chooses at most one trade for a market, following spec §6.6.
-///
-/// Exits are evaluated first and are all-or-nothing. Entries happen only when
-/// both share counts are zero, so a position is never scaled into and never
-/// held in both directions. A sell decision carries `shares: Some(count)`; a
-/// buy decision carries the Kelly target in `amount_mana` and `shares: None`.
-///
-/// Exit `amount_mana` is zero because the proceeds are unknown until Manifold
-/// fills the sell; the executed trade record stores the real proceeds.
-pub fn decide_trade(
-    market: &TrackedMarket,
-    p_internal: f64,
-    p_market: f64,
-    params: TradeParams,
-) -> Option<TradeDecision> {
-    let edge = p_internal - p_market;
-
-    if market.yes_shares > 0.0 && edge < params.exit_edge_threshold {
-        return Some(TradeDecision {
-            action: TradeAction::SellYes,
-            amount_mana: 0.0,
-            shares: Some(market.yes_shares),
-            answer_id: None,
-        });
-    }
-
-    if market.no_shares > 0.0 && edge > -params.exit_edge_threshold {
-        return Some(TradeDecision {
-            action: TradeAction::SellNo,
-            amount_mana: 0.0,
-            shares: Some(market.no_shares),
-            answer_id: None,
-        });
-    }
-
-    // A position that did not exit stays open. No scale-in.
-    if market.yes_shares > 0.0 || market.no_shares > 0.0 {
-        return None;
-    }
-
-    let target = kelly_target_mana(edge, p_market, available_budget(market), params);
-    if target < params.min_trade_size {
-        return None;
-    }
-
-    if edge > params.entry_edge_threshold {
-        Some(TradeDecision {
-            action: TradeAction::BuyYes,
-            amount_mana: target,
-            shares: None,
-            answer_id: None,
-        })
-    } else if edge < -params.entry_edge_threshold {
-        Some(TradeDecision {
-            action: TradeAction::BuyNo,
-            amount_mana: target,
-            shares: None,
-            answer_id: None,
-        })
-    } else {
-        None
-    }
-}
-
-/// Chooses at most one trade for a specific answer in a multiple-choice market.
-pub fn decide_trade_for_answer(
-    answer: &crate::types::TrackedAnswer,
-    p_internal: f64,
-    p_market: f64,
-    available_budget: f64,
-    params: TradeParams,
-) -> Option<TradeDecision> {
-    let edge = p_internal - p_market;
-
-    if answer.yes_shares > 0.0 && edge < params.exit_edge_threshold {
-        return Some(TradeDecision {
-            action: TradeAction::SellYes,
-            amount_mana: 0.0,
-            shares: Some(answer.yes_shares),
-            answer_id: Some(answer.id.clone()),
-        });
-    }
-
-    if answer.no_shares > 0.0 && edge > -params.exit_edge_threshold {
-        return Some(TradeDecision {
-            action: TradeAction::SellNo,
-            amount_mana: 0.0,
-            shares: Some(answer.no_shares),
-            answer_id: Some(answer.id.clone()),
-        });
-    }
-
-    // A position that did not exit stays open. No scale-in.
-    if answer.yes_shares > 0.0 || answer.no_shares > 0.0 {
-        return None;
-    }
-
-    let target = kelly_target_mana(edge, p_market, available_budget, params);
-    if target < params.min_trade_size {
-        return None;
-    }
-
-    if edge > params.entry_edge_threshold {
-        Some(TradeDecision {
-            action: TradeAction::BuyYes,
-            amount_mana: target,
-            shares: None,
-            answer_id: Some(answer.id.clone()),
-        })
-    } else if edge < -params.entry_edge_threshold {
-        Some(TradeDecision {
-            action: TradeAction::BuyNo,
-            amount_mana: target,
-            shares: None,
-            answer_id: Some(answer.id.clone()),
-        })
-    } else {
-        None
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Multiple-choice planning
-// -----------------------------------------------------------------------------
-
-/// One answer as the planner sees it: decayed belief, fresh price, and shares.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnswerView {
-    pub id: String,
-    pub text: String,
-    /// Decayed internal probability for this answer.
-    pub p_internal: f64,
-    /// Clamped market price for this answer.
-    pub p_market: f64,
-    pub yes_shares: f64,
-    pub no_shares: f64,
-}
-
-/// Exposure limits for one market evaluation.
-#[derive(Debug, Clone, Copy)]
-pub struct TradeLimits {
-    /// Maximum answers holding shares at the same time.
-    pub max_positions: usize,
-    /// Maximum new entries in one evaluation.
-    pub max_new_per_tick: usize,
-    /// Maximum share of `budget_mana` committed to one answer.
-    pub max_answer_fraction: f64,
-}
-
-impl TradeLimits {
-    /// Limits for multiple-choice markets, from process configuration.
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            max_positions: config.mc_max_positions,
-            max_new_per_tick: config.mc_max_new_per_tick,
-            max_answer_fraction: config.mc_max_answer_fraction,
-        }
-    }
-
-    /// Limits for a binary market: one position, one entry, no fraction cap.
-    pub fn binary() -> Self {
-        Self {
-            max_positions: 1,
-            max_new_per_tick: 1,
-            max_answer_fraction: 1.0,
-        }
-    }
-}
-
-/// Computes the edge of every answer.
-///
-/// Independent answers use their own belief minus their own price. A sum-to-one
-/// market normalizes the internal distribution first, so the edges add up to
-/// zero: an impulse that favors one answer necessarily creates offsetting
-/// negative edges on its rivals. Without that projection the bot could buy two
-/// mutually exclusive YES legs from one post.
-fn answer_edges(answers: &[AnswerView], sum_to_one: bool) -> Vec<f64> {
-    if !sum_to_one {
-        return answers
-            .iter()
-            .map(|answer| answer.p_internal - answer.p_market)
-            .collect();
-    }
-
-    let total: f64 = answers
-        .iter()
-        .map(|answer| answer.p_internal.clamp(0.0, 1.0))
-        .sum();
-    if !total.is_finite() || total <= 0.0 {
-        return vec![0.0; answers.len()];
-    }
-
-    answers
-        .iter()
-        .map(|answer| answer.p_internal.clamp(0.0, 1.0) / total - answer.p_market)
-        .collect()
-}
-
-/// Chooses the actions for one multiple-choice market evaluation.
-///
-/// Exits come first and are all-or-nothing per side. Entries are ordered by
-/// absolute edge, sized with fractional Kelly, and capped by [`TradeLimits`].
-/// The returned vector may contain several actions; the caller executes them
-/// one by one under the execution lock.
-///
-/// Sum-to-one markets are YES-only: a NO leg there is a basket over the field,
-/// and Manifold may add internal arbitrage legs of its own. Independent
-/// (`cpmm-multi-2`) markets allow both sides.
-pub fn plan_actions(
-    market: &TrackedMarket,
-    answers: &[AnswerView],
-    sum_to_one: bool,
-    available_budget: f64,
-    params: TradeParams,
-    limits: TradeLimits,
-) -> Vec<TradeDecision> {
-    let edges = answer_edges(answers, sum_to_one);
-    let mut decisions = Vec::new();
-
-    for (index, edge) in edges.iter().enumerate() {
-        let answer = &answers[index];
-        if answer.yes_shares > 0.0 && *edge < params.exit_edge_threshold {
-            decisions.push(TradeDecision {
-                action: TradeAction::SellYes,
-                amount_mana: 0.0,
-                shares: Some(answer.yes_shares),
-                answer_id: Some(answer.id.clone()),
-            });
-        }
-        if answer.no_shares > 0.0 && !sum_to_one && *edge > -params.exit_edge_threshold {
-            decisions.push(TradeDecision {
-                action: TradeAction::SellNo,
-                amount_mana: 0.0,
-                shares: Some(answer.no_shares),
-                answer_id: Some(answer.id.clone()),
-            });
-        }
-    }
-
-    let open_positions = answers
-        .iter()
-        .filter(|answer| answer.yes_shares > 0.0 || answer.no_shares > 0.0)
-        .count();
-    let mut slots = limits.max_positions.saturating_sub(open_positions);
-    if slots == 0 || limits.max_new_per_tick == 0 {
-        return decisions;
-    }
-
-    let mut candidates: Vec<(usize, f64)> = edges
-        .iter()
-        .enumerate()
-        .filter(|(index, edge)| {
-            let answer = &answers[*index];
-            answer.yes_shares <= 0.0
-                && answer.no_shares <= 0.0
-                && edge.abs() >= params.entry_edge_threshold
-                && (MC_MIN_PRICE..=MC_MAX_PRICE).contains(&answer.p_market)
-        })
-        .map(|(index, edge)| (index, *edge))
-        .collect();
-    candidates.sort_by(|left, right| {
-        right
-            .1
-            .abs()
-            .total_cmp(&left.1.abs())
-            .then_with(|| left.0.cmp(&right.0))
-    });
-
-    let mut remaining = available_budget;
-    let mut new_entries = 0;
-    for (index, edge) in candidates {
-        if slots == 0 || new_entries >= limits.max_new_per_tick {
-            break;
-        }
-
-        let answer = &answers[index];
-        let action = if edge > params.entry_edge_threshold {
-            TradeAction::BuyYes
-        } else if !sum_to_one && edge < -params.entry_edge_threshold {
-            TradeAction::BuyNo
-        } else {
-            continue;
-        };
-
-        let target = kelly_target_mana(edge, answer.p_market, remaining, params)
-            .min(limits.max_answer_fraction * market.budget_mana);
-        if target < params.min_trade_size {
-            continue;
-        }
-
-        decisions.push(TradeDecision {
-            action,
-            amount_mana: target,
-            shares: None,
-            answer_id: Some(answer.id.clone()),
-        });
-        remaining = (remaining - target).max(0.0);
-        slots -= 1;
-        new_entries += 1;
-    }
-
-    decisions
-}
-
-// -----------------------------------------------------------------------------
-// Position accounting
-// -----------------------------------------------------------------------------
-
-/// Mutable position fields shared by a market and one of its answers.
-///
-/// Keeping the accounting in one place is what makes binary and per-answer
-/// positions behave identically: only the owner of the fields differs.
-struct PositionFields<'a> {
-    yes: &'a mut f64,
-    no: &'a mut f64,
-    invested: &'a mut f64,
-}
-
-/// Records a filled buy on any position.
-fn apply_buy_at(
-    position: PositionFields<'_>,
-    action: TradeAction,
-    cost: f64,
-    shares: f64,
-) -> AppResult<()> {
-    match action {
-        TradeAction::BuyYes => *position.yes += shares,
-        TradeAction::BuyNo => *position.no += shares,
-        other => bail!("apply_buy called with non-buy action {other}"),
-    }
-    *position.invested += cost;
-    Ok(())
-}
-
-/// What one sell did to a position.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SellSettlement {
-    /// Shares actually sold, clamped to the held amount.
-    sold: f64,
-    /// Cost basis released by the sale.
-    basis: f64,
-    /// Proceeds minus basis.
-    realized: f64,
-}
-
-/// Records a filled sell on any position and returns the settlement.
-///
-/// The cost basis is proportional: with `sold` of `held` shares sold,
-/// `basis = invested * sold / held`. Every value is clamped at zero so rounding
-/// can never produce a negative position.
-fn settle_sell(
-    position: PositionFields<'_>,
-    action: TradeAction,
-    shares_sold: f64,
-    proceeds: f64,
-) -> AppResult<SellSettlement> {
-    let held = match action {
-        TradeAction::SellYes => *position.yes,
-        TradeAction::SellNo => *position.no,
-        other => bail!("apply_sell called with non-sell action {other}"),
-    };
-
-    if !shares_sold.is_finite() || shares_sold <= 0.0 {
-        bail!("sell must dispose of a positive finite share count, got {shares_sold}");
-    }
-    if held <= 0.0 {
-        bail!("cannot {action}: the position holds no shares on that side");
-    }
-
-    let sold = shares_sold.min(held);
-    let basis = (*position.invested * sold / held).max(0.0);
-    let realized = proceeds - basis;
-
-    *position.invested = (*position.invested - basis).max(0.0);
-    match action {
-        TradeAction::SellYes => *position.yes = (held - sold).max(0.0),
-        _ => *position.no = (held - sold).max(0.0),
-    }
-
-    Ok(SellSettlement {
-        sold,
-        basis,
-        realized,
-    })
-}
-
-/// Records a filled buy on the local market snapshot.
-///
-/// Adds the mana actually paid (fees included) to `invested_mana` and the
-/// filled share count to the matching side. Rejects sell actions, which must go
-/// through [`apply_sell`].
-pub fn apply_buy(
-    market: &mut TrackedMarket,
-    action: TradeAction,
-    cost: f64,
-    shares: f64,
-) -> AppResult<()> {
-    apply_buy_at(
-        PositionFields {
-            yes: &mut market.yes_shares,
-            no: &mut market.no_shares,
-            invested: &mut market.invested_mana,
-        },
-        action,
-        cost,
-        shares,
-    )
-}
-
-/// Records a filled sell on the local market snapshot.
-///
-/// `realized_pnl_mana` grows by `proceeds - basis`, `invested_mana` shrinks by
-/// `basis`, and the matching share count falls by the sold amount.
-///
-/// Rejects buy actions and rejects a sell when the market holds no shares of
-/// that side, which indicates a decision bug rather than a market condition.
-pub fn apply_sell(
-    market: &mut TrackedMarket,
-    action: TradeAction,
-    shares_sold: f64,
-    proceeds: f64,
-) -> AppResult<()> {
-    let settlement = settle_sell(
-        PositionFields {
-            yes: &mut market.yes_shares,
-            no: &mut market.no_shares,
-            invested: &mut market.invested_mana,
-        },
-        action,
-        shares_sold,
-        proceeds,
-    )?;
-    market.realized_pnl_mana += settlement.realized;
-    Ok(())
-}
-
-// -----------------------------------------------------------------------------
 // Executor
 // -----------------------------------------------------------------------------
 
@@ -1213,24 +569,14 @@ pub enum LiquidationOutcome {
     Sold,
 }
 
-/// Lists the sides a liquidation must sell.
-///
-/// A resolved market cannot be traded and Manifold settles resolved positions
-/// automatically, so no side is sold. A side with no shares is not sold
-/// either, which keeps a repeated liquidation from selling twice.
-fn liquidation_sides(yes_shares: f64, no_shares: f64, resolved: bool) -> Vec<(TradeAction, f64)> {
-    if resolved {
-        return Vec::new();
-    }
-
-    let mut sides = Vec::new();
-    if yes_shares > 0.0 {
-        sides.push((TradeAction::SellYes, yes_shares));
-    }
-    if no_shares > 0.0 {
-        sides.push((TradeAction::SellNo, no_shares));
-    }
-    sides
+/// The fill of one action, as the ledger records it.
+struct Fill<'a> {
+    /// Mana paid for a buy or received for a sell, fees included.
+    mana_amount: f64,
+    /// Signed share change: positive for a buy, negative for a sell.
+    shares_delta: f64,
+    /// The response the fill came from.
+    result: &'a BetResult,
 }
 
 /// Executes trades and keeps local state in step with Manifold.
@@ -1239,25 +585,11 @@ fn liquidation_sides(yes_shares: f64, no_shares: f64, resolved: bool) -> Vec<(Tr
 /// [`TradeExecutor::sync_market`], [`TradeExecutor::liquidate`]) serialize on
 /// `execution_lock`. Without that lock two concurrent signal evaluations could
 /// both read a flat position and each buy, violating "one entry per lifecycle".
-/// One evaluated action plus the context needed to record it.
-///
-/// Bundled so the buy and sell helpers keep a small argument list.
-struct ExecutionContext<'a> {
-    decision: &'a TradeDecision,
-    p_internal: f64,
-    p_market: f64,
-    trigger_post_uri: Option<&'a str>,
-    now: i64,
-    /// When true, buys are sent with `dryRun: true` and nothing is persisted.
-    dry_run: bool,
-}
-
 pub struct TradeExecutor {
     client: ManifoldClient,
     db: Db,
     store: Arc<MarketStore>,
-    params: TradeParams,
-    limits: TradeLimits,
+    policy: TradePolicy,
     dry_run: bool,
     halflife_hours: f64,
     execution_lock: Mutex<()>,
@@ -1279,8 +611,7 @@ impl TradeExecutor {
             client,
             db,
             store,
-            params: TradeParams::from_config(config),
-            limits: TradeLimits::from_config(config),
+            policy: TradePolicy::from_config(config),
             dry_run: config.trading_dry_run,
             halflife_hours: config.belief_halflife_hours,
             execution_lock: Mutex::new(()),
@@ -1301,10 +632,10 @@ impl TradeExecutor {
 
     /// Runs one trade check for a market.
     ///
-    /// Steps: reload from the database, skip non-active markets, fetch a fresh
-    /// market probability and the authoritative Manifold position, reconcile,
-    /// compute the decayed internal probability, decide, execute at most one
-    /// action, then persist the ledger row and the updated position.
+    /// Steps: load the book from the database, skip non-active markets, fetch a
+    /// fresh market snapshot, prepare the book (kind, positions, prices, and
+    /// reconciliation), plan one decision cycle, then execute and persist
+    /// every action it returned.
     ///
     /// Returns `Ok(None)` when no trade happens. A resolved market, a paused
     /// market, an edge inside the thresholds, and a buy blocked by the kill
@@ -1316,10 +647,8 @@ impl TradeExecutor {
     ) -> AppResult<Option<TradeRecord>> {
         let _guard = self.execution_lock.lock().await;
 
-        let Some(mut market) = self.store.load(market_id)? else {
-            bail!("market {market_id} is not tracked");
-        };
-        if market.status != MarketStatus::Active {
+        let mut book = self.load_book(market_id)?;
+        if book.status() != MarketStatus::Active {
             return Ok(None);
         }
 
@@ -1335,401 +664,97 @@ impl TradeExecutor {
             return Ok(None);
         }
 
-        self.refresh_market_kind(&mut market, &snapshot)?;
-        if market.is_multiple_choice() {
-            return self
-                .evaluate_answers(&mut market, &snapshot, trigger_post_uri, kill_switch)
-                .await;
-        }
-
-        let p_market = snapshot
-            .probability
-            .unwrap_or(market.p_market_last)
-            .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
-        let position = self
-            .client
-            .position(market_id)
-            .await
-            .with_context(|| format!("fetching the Manifold position for {market_id}"))?;
-        reconcile_position(&mut market, &position, market_id);
-
         let now = Utc::now().timestamp();
-        market.p_market_last = p_market;
-        let p_internal = belief::current_p_internal(
-            market.p_internal_log_odds,
-            market.belief_updated_at,
-            p_market,
-            now,
-            self.halflife_hours,
-        );
+        self.prepare(&mut book, &snapshot, now).await?;
 
-        // Persist reconciliation and the fresh market probability even when no
-        // trade follows, so the cache and the next tick agree with Manifold.
-        self.persist_market(&market)?;
-
-        let Some(decision) = decide_trade(&market, p_internal, p_market, self.params) else {
-            return Ok(None);
-        };
-
-        if is_buy(decision.action) && kill_switch {
-            tracing::warn!(
-                market_id = %market_id,
-                "global kill switch is on; refusing to buy"
-            );
-            return Ok(None);
-        }
-
-        let record = match decision.action {
-            TradeAction::BuyYes | TradeAction::BuyNo => {
-                self.execute_buy(
-                    &mut market,
-                    None,
-                    ExecutionContext {
-                        decision: &decision,
-                        p_internal,
-                        p_market,
-                        trigger_post_uri,
-                        now,
-                        dry_run: false,
-                    },
-                )
-                .await?
-            }
-            TradeAction::SellYes | TradeAction::SellNo => {
-                self.execute_sell(
-                    &mut market,
-                    None,
-                    ExecutionContext {
-                        decision: &decision,
-                        p_internal,
-                        p_market,
-                        trigger_post_uri,
-                        now,
-                        dry_run: false,
-                    },
-                )
-                .await?
-            }
-        };
-
-        let Some(record) = record else {
-            return Ok(None);
-        };
-        self.persist_market(&market)?;
-        self.emit_trade(&market, &record);
-        Ok(Some(record))
-    }
-
-    /// Runs one decision cycle for a multiple-choice market.
-    ///
-    /// Syncs answers and positions, builds one [`AnswerView`] per answer, asks
-    /// the planner for actions, and executes them in order. A dry run sends buys
-    /// with `dryRun: true`, logs sells, and persists nothing.
-    async fn evaluate_answers(
-        &self,
-        market: &mut TrackedMarket,
-        snapshot: &MarketSnapshot,
-        trigger_post_uri: Option<&str>,
-        kill_switch: bool,
-    ) -> AppResult<Option<TradeRecord>> {
-        let now = Utc::now().timestamp();
-        let mut answers = self.sync_answers(market, snapshot, now)?;
-        let positions = self
-            .client
-            .positions(&market.id)
-            .await
-            .with_context(|| format!("fetching the Manifold positions for {}", market.id))?;
-        self.reconcile_answers(market, &mut answers, &positions)?;
-        self.persist_market(market)?;
-
-        let views: Vec<AnswerView> = answers
-            .iter()
-            .map(|answer| {
-                let p_market = answer
-                    .p_market_last
-                    .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
-                AnswerView {
-                    id: answer.id.clone(),
-                    text: answer.text.clone(),
-                    p_internal: belief::current_p_internal(
-                        answer.p_internal_log_odds,
-                        answer.belief_updated_at,
-                        p_market,
-                        now,
-                        self.halflife_hours,
-                    ),
-                    p_market,
-                    yes_shares: answer.yes_shares,
-                    no_shares: answer.no_shares,
-                }
-            })
-            .collect();
-
-        let decisions = plan_actions(
-            market,
-            &views,
-            market.should_answers_sum_to_one,
-            available_budget(market),
-            self.params,
-            self.limits,
-        );
-        if decisions.is_empty() {
-            return Ok(None);
-        }
-
-        let mut first_record = None;
-        for decision in &decisions {
-            if is_buy(decision.action) && kill_switch {
+        let planned = book.plan(now, self.halflife_hours, &self.policy);
+        let mut first: Option<TradeRecord> = None;
+        for planned_trade in &planned {
+            if is_buy(planned_trade.decision.action) && kill_switch {
                 tracing::warn!(
-                    market_id = %market.id,
-                    action = %decision.action,
+                    market_id = %market_id,
+                    action = %planned_trade.decision.action,
                     "global kill switch is on; refusing to buy"
                 );
                 continue;
             }
 
-            let Some(index) = decision
-                .answer_id
-                .as_ref()
-                .and_then(|id| answers.iter().position(|answer| &answer.id == id))
-            else {
-                tracing::error!(
-                    market_id = %market.id,
-                    answer_id = ?decision.answer_id,
-                    "planned action named an unknown answer"
-                );
-                continue;
-            };
-
-            let p_internal = views[index].p_internal;
-            let p_market = views[index].p_market;
-
+            // Log before execution so a dry run reports every planned action,
+            // not only the one that would have been sent for real.
             if self.dry_run {
                 tracing::info!(
-                    market_id = %market.id,
-                    answer = %views[index].text,
-                    action = %decision.action,
-                    edge = p_internal - p_market,
-                    amount_mana = decision.amount_mana,
-                    shares = ?decision.shares,
-                    "planned answer trade"
+                    market_id = %market_id,
+                    answer = %book.leg(planned_trade.leg).text,
+                    action = %planned_trade.decision.action,
+                    edge = planned_trade.p_internal - planned_trade.p_market,
+                    amount_mana = planned_trade.decision.amount_mana,
+                    shares = ?planned_trade.decision.shares,
+                    "planned trade"
                 );
             }
 
-            let record = match decision.action {
-                TradeAction::BuyYes | TradeAction::BuyNo => {
-                    self.execute_buy(
-                        market,
-                        Some(&mut answers[index]),
-                        ExecutionContext {
-                            decision,
-                            p_internal,
-                            p_market,
-                            trigger_post_uri,
-                            now,
-                            dry_run: self.dry_run,
-                        },
-                    )
-                    .await?
-                }
-                TradeAction::SellYes | TradeAction::SellNo => {
-                    self.execute_sell(
-                        market,
-                        Some(&mut answers[index]),
-                        ExecutionContext {
-                            decision,
-                            p_internal,
-                            p_market,
-                            trigger_post_uri,
-                            now,
-                            dry_run: self.dry_run,
-                        },
-                    )
-                    .await?
-                }
-            };
-
-            let Some(record) = record else {
+            let Some(record) = self
+                .execute(
+                    &mut book,
+                    planned_trade,
+                    trigger_post_uri,
+                    now,
+                    self.dry_run,
+                )
+                .await?
+            else {
                 continue;
             };
-            self.persist_market(market)?;
-            self.emit_trade(market, &record);
-            if first_record.is_none() {
-                first_record = Some(record);
-            }
+
+            book.persist(&self.store, &self.db)?;
+            self.emit_trade(&book, &record);
+            first.get_or_insert(record);
         }
 
-        Ok(first_record)
+        Ok(first)
     }
 
-    /// Refreshes the stored outcome type and sum-to-one flag from Manifold.
-    ///
-    /// Rows created before migration 005 default to `BINARY`, so this runs on
-    /// every sync and reports a change once.
-    fn refresh_market_kind(
-        &self,
-        market: &mut TrackedMarket,
-        snapshot: &MarketSnapshot,
-    ) -> AppResult<()> {
-        if market.outcome_type == snapshot.outcome_type
-            && market.should_answers_sum_to_one == snapshot.should_answers_sum_to_one
-        {
-            return Ok(());
-        }
+    /// Loads the book, failing when the market is not tracked.
+    fn load_book(&self, market_id: &str) -> AppResult<Book> {
+        Book::load(&self.store, &self.db, market_id)?
+            .ok_or_else(|| anyhow!("market {market_id} is not tracked"))
+    }
 
-        self.store.record_kind(
-            &market.id,
+    /// Brings the book in step with Manifold before a decision.
+    ///
+    /// Refreshes the market kind, applies fresh prices (which may discover new
+    /// answers), reconciles the position from the authoritative `/positions`
+    /// response, and persists the result. Belief columns stay with triage; this
+    /// writes prices, text, positions, and the root aggregate only.
+    async fn prepare(&self, book: &mut Book, snapshot: &MarketSnapshot, now: i64) -> AppResult<()> {
+        book.refresh_kind(
+            &self.store,
+            &self.db,
             &snapshot.outcome_type,
             snapshot.should_answers_sum_to_one,
         )?;
-        tracing::info!(
-            market_id = %market.id,
-            previous_outcome_type = %market.outcome_type,
-            outcome_type = %snapshot.outcome_type,
-            should_answers_sum_to_one = snapshot.should_answers_sum_to_one,
-            "market kind updated from Manifold"
-        );
-        market.outcome_type = snapshot.outcome_type.clone();
-        market.should_answers_sum_to_one = snapshot.should_answers_sum_to_one;
-        Ok(())
-    }
 
-    /// Refreshes local answer rows from a market snapshot.
-    ///
-    /// New answers (an `addAnswersMode = ANYONE` market can grow) are inserted
-    /// with their belief anchored at the current price. Existing answers get a
-    /// price refresh only: belief columns belong to triage and must not be
-    /// overwritten by a sync.
-    fn sync_answers(
-        &self,
-        market: &TrackedMarket,
-        snapshot: &MarketSnapshot,
-        now: i64,
-    ) -> AppResult<Vec<TrackedAnswer>> {
-        let mut answers = self.db.list_answers(&market.id)?;
+        let positions = self
+            .client
+            .positions(book.id())
+            .await
+            .with_context(|| format!("fetching the Manifold positions for {}", book.id()))?;
 
-        for remote in snapshot.answers.as_deref().unwrap_or(&[]) {
-            let price = remote
-                .probability
-                .unwrap_or(0.5)
-                .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
+        let observations: Vec<AnswerObservation<'_>> = snapshot
+            .answers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|answer| AnswerObservation {
+                id: &answer.id,
+                text: &answer.text,
+                probability: answer.probability,
+            })
+            .collect();
 
-            match answers.iter_mut().find(|answer| answer.id == remote.id) {
-                Some(answer) => {
-                    if !remote.text.trim().is_empty() && answer.text != remote.text {
-                        self.db
-                            .update_answer_text(&market.id, &answer.id, &remote.text)?;
-                        answer.text = remote.text.clone();
-                    }
-                    if (answer.p_market_last - price).abs() > POSITION_EPSILON {
-                        self.db
-                            .update_answer_market_price(&market.id, &answer.id, price)?;
-                        answer.p_market_last = price;
-                    }
-                }
-                None => {
-                    let answer = TrackedAnswer {
-                        id: remote.id.clone(),
-                        market_id: market.id.clone(),
-                        text: remote.text.clone(),
-                        p_internal_log_odds: belief::logit(price),
-                        p_market_last: price,
-                        belief_updated_at: now,
-                        yes_shares: 0.0,
-                        no_shares: 0.0,
-                        created_at: now,
-                        invested_mana: 0.0,
-                    };
-                    if self.db.insert_answer_if_missing(&answer)? {
-                        tracing::info!(
-                            market_id = %market.id,
-                            answer_id = %answer.id,
-                            answer = %answer.text,
-                            "discovered a new multiple-choice answer"
-                        );
-                        answers.push(answer);
-                    }
-                }
-            }
-        }
-
-        answers.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(answers)
-    }
-
-    /// Matches local answer positions to Manifold and refreshes the aggregate.
-    ///
-    /// Manifold is the truth for shares and cost basis. For a multiple-choice
-    /// market the root row is only a checksum: the budget lives in
-    /// `tracked_markets.invested_mana`, which becomes the sum of the answers.
-    fn reconcile_answers(
-        &self,
-        market: &mut TrackedMarket,
-        answers: &mut [TrackedAnswer],
-        positions: &MarketPositions,
-    ) -> AppResult<()> {
-        if !positions.checksum_ok() {
-            let totals = positions.totals();
-            tracing::warn!(
-                market_id = %market.id,
-                root_invested = positions.root.invested,
-                answer_invested = totals.invested,
-                root_yes_shares = positions.root.yes_shares,
-                answer_yes_shares = totals.yes_shares,
-                root_no_shares = positions.root.no_shares,
-                answer_no_shares = totals.no_shares,
-                "per-answer positions do not add up to the root summary; trusting the answer rows"
-            );
-        }
-
-        let mut invested = 0.0;
-        let mut yes_shares = 0.0;
-        let mut no_shares = 0.0;
-
-        for answer in answers.iter_mut() {
-            let remote = positions.answer(&answer.id);
-            if (answer.yes_shares - remote.yes_shares).abs() > POSITION_EPSILON
-                || (answer.no_shares - remote.no_shares).abs() > POSITION_EPSILON
-                || (answer.invested_mana - remote.invested).abs() > POSITION_EPSILON
-            {
-                tracing::warn!(
-                    market_id = %market.id,
-                    answer_id = %answer.id,
-                    local_yes_shares = answer.yes_shares,
-                    remote_yes_shares = remote.yes_shares,
-                    local_no_shares = answer.no_shares,
-                    remote_no_shares = remote.no_shares,
-                    local_invested = answer.invested_mana,
-                    remote_invested = remote.invested,
-                    "local answer position differs from Manifold; trusting Manifold"
-                );
-            }
-
-            answer.yes_shares = remote.yes_shares.max(0.0);
-            answer.no_shares = remote.no_shares.max(0.0);
-            answer.invested_mana = remote.invested.max(0.0);
-
-            self.db.update_answer_position(
-                &market.id,
-                &answer.id,
-                answer.yes_shares,
-                answer.no_shares,
-                answer.invested_mana,
-            )?;
-
-            invested += answer.invested_mana;
-            yes_shares += answer.yes_shares;
-            no_shares += answer.no_shares;
-        }
-
-        market.invested_mana = invested;
-        market.yes_shares = yes_shares;
-        market.no_shares = no_shares;
-        Ok(())
+        book.observe_prices(&self.db, now, snapshot.probability, &observations)?;
+        book.reconcile(&positions);
+        book.persist(&self.store, &self.db)
     }
 
     /// Reconciles one market with Manifold without trading.
@@ -1740,49 +765,27 @@ impl TradeExecutor {
     pub async fn sync_market(&self, market_id: &str) -> AppResult<TrackedMarket> {
         let _guard = self.execution_lock.lock().await;
 
-        let Some(mut market) = self.store.load(market_id)? else {
-            bail!("market {market_id} is not tracked");
-        };
+        let mut book = self.load_book(market_id)?;
 
         let snapshot = self
             .client
             .market(market_id)
             .await
             .with_context(|| format!("fetching Manifold market {market_id}"))?;
-        self.refresh_market_kind(&mut market, &snapshot)?;
 
-        if market.is_multiple_choice() {
-            let now = Utc::now().timestamp();
-            let mut answers = self.sync_answers(&market, &snapshot, now)?;
-            let positions = self
-                .client
-                .positions(market_id)
-                .await
-                .with_context(|| format!("fetching the Manifold positions for {market_id}"))?;
-            self.reconcile_answers(&mut market, &mut answers, &positions)?;
-            self.persist_market(&market)?;
+        let now = Utc::now().timestamp();
+        self.prepare(&mut book, &snapshot, now).await?;
+
+        if book.shape() == Shape::Answers {
             tracing::debug!(
                 market_id = %market_id,
-                answers = answers.len(),
-                invested = market.invested_mana,
+                answers = book.legs().len(),
+                invested = book.aggregate().invested,
                 "synced multiple-choice answers"
             );
-            return Ok(market);
         }
 
-        let position = self
-            .client
-            .position(market_id)
-            .await
-            .with_context(|| format!("fetching the Manifold position for {market_id}"))?;
-
-        reconcile_position(&mut market, &position, market_id);
-        market.p_market_last = snapshot
-            .probability
-            .unwrap_or(market.p_market_last)
-            .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
-        self.persist_market(&market)?;
-        Ok(market)
+        Ok(book.market())
     }
 
     /// Syncs and evaluates every active market once.
@@ -1817,10 +820,8 @@ impl TradeExecutor {
     pub async fn liquidate(&self, market_id: &str) -> AppResult<LiquidationOutcome> {
         let _guard = self.execution_lock.lock().await;
 
-        let Some(mut market) = self.store.load(market_id)? else {
-            bail!("market {market_id} is not tracked");
-        };
-        if market.status == MarketStatus::Closed {
+        let mut book = self.load_book(market_id)?;
+        if book.status() == MarketStatus::Closed {
             tracing::info!(market_id = %market_id, "market is already closed; skipping liquidation");
             return Ok(LiquidationOutcome::AlreadyClosed);
         }
@@ -1830,35 +831,10 @@ impl TradeExecutor {
             .market(market_id)
             .await
             .with_context(|| format!("fetching Manifold market {market_id} for liquidation"))?;
-        self.refresh_market_kind(&mut market, &snapshot)?;
-        if market.is_multiple_choice() {
-            return self.liquidate_answers(&mut market, &snapshot).await;
-        }
-
-        let position = self
-            .client
-            .position(market_id)
-            .await
-            .with_context(|| format!("fetching the Manifold position for {market_id}"))?;
-
-        reconcile_position(&mut market, &position, market_id);
-        let p_market = snapshot
-            .probability
-            .unwrap_or(market.p_market_last)
-            .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
-        market.p_market_last = p_market;
 
         let now = Utc::now().timestamp();
-        let p_internal = belief::current_p_internal(
-            market.p_internal_log_odds,
-            market.belief_updated_at,
-            p_market,
-            now,
-            self.halflife_hours,
-        );
-        self.persist_market(&market)?;
+        self.prepare(&mut book, &snapshot, now).await?;
 
-        let sides = liquidation_sides(market.yes_shares, market.no_shares, snapshot.is_resolved);
         if snapshot.is_resolved {
             tracing::info!(
                 market_id = %market_id,
@@ -1866,159 +842,40 @@ impl TradeExecutor {
             );
             return Ok(LiquidationOutcome::AlreadyResolved);
         }
+
+        let sides = book.sell_sides(false);
         if sides.is_empty() {
             tracing::info!(market_id = %market_id, "no shares to liquidate");
             return Ok(LiquidationOutcome::NoPosition);
         }
 
-        for (action, held) in sides {
-            let decision = TradeDecision {
-                action,
-                amount_mana: 0.0,
-                shares: Some(held),
-                answer_id: None,
+        for (leg, action, held) in sides {
+            let view = book.view(leg, now, self.halflife_hours);
+            let planned = PlannedTrade {
+                leg,
+                decision: TradeDecision {
+                    action,
+                    amount_mana: 0.0,
+                    shares: Some(held),
+                    answer_id: book.leg(leg).answer_id.clone(),
+                },
+                p_internal: view.p_internal,
+                p_market: view.p_market,
             };
+
             let record = self
-                .execute_sell(
-                    &mut market,
-                    None,
-                    ExecutionContext {
-                        decision: &decision,
-                        p_internal,
-                        p_market,
-                        trigger_post_uri: None,
-                        now,
-                        dry_run: false,
-                    },
-                )
+                .execute(&mut book, &planned, None, now, false)
                 .await
                 .with_context(|| format!("liquidating {action} on market {market_id}"))?;
             let Some(record) = record else {
                 continue;
             };
-            self.persist_market(&market)?;
-            self.emit_trade(&market, &record);
+
+            book.persist(&self.store, &self.db)?;
+            self.emit_trade(&book, &record);
         }
 
         Ok(LiquidationOutcome::Sold)
-    }
-
-    /// Sells every answer position in a multiple-choice market.
-    ///
-    /// The same idempotence rules as the binary path apply: remote positions are
-    /// fetched first, a resolved market is left alone, and each side is recorded
-    /// and persisted before the next is attempted.
-    async fn liquidate_answers(
-        &self,
-        market: &mut TrackedMarket,
-        snapshot: &MarketSnapshot,
-    ) -> AppResult<LiquidationOutcome> {
-        let market_id = market.id.clone();
-        let positions = self
-            .client
-            .positions(&market_id)
-            .await
-            .with_context(|| format!("fetching the Manifold positions for {market_id}"))?;
-        let mut answers = self.db.list_answers(&market_id)?;
-        self.reconcile_answers(market, &mut answers, &positions)?;
-        self.persist_market(market)?;
-
-        if snapshot.is_resolved {
-            tracing::info!(
-                market_id = %market_id,
-                "market is resolved on Manifold; answer positions settle automatically"
-            );
-            return Ok(LiquidationOutcome::AlreadyResolved);
-        }
-
-        let now = Utc::now().timestamp();
-        let mut sold = false;
-
-        for answer in &mut answers {
-            let remote = positions.answer(&answer.id);
-            for (action, held) in liquidation_sides(remote.yes_shares, remote.no_shares, false) {
-                let p_market = answer
-                    .p_market_last
-                    .clamp(MIN_TRADING_PROB, MAX_TRADING_PROB);
-                let p_internal = belief::current_p_internal(
-                    answer.p_internal_log_odds,
-                    answer.belief_updated_at,
-                    p_market,
-                    now,
-                    self.halflife_hours,
-                );
-
-                let result = self
-                    .client
-                    .sell(&market_id, action.outcome(), held, Some(&answer.id))
-                    .await
-                    .with_context(|| {
-                        format!("selling {action} on answer {} of {market_id}", answer.id)
-                    })?;
-                ensure_filled(&result, &market_id)?;
-
-                let requested = if result.shares.is_finite() && result.shares.abs() > 0.0 {
-                    result.shares.abs()
-                } else {
-                    held
-                };
-                let proceeds = result.net_proceeds();
-                let settlement = settle_sell(
-                    PositionFields {
-                        yes: &mut answer.yes_shares,
-                        no: &mut answer.no_shares,
-                        invested: &mut answer.invested_mana,
-                    },
-                    action,
-                    requested,
-                    proceeds,
-                )?;
-
-                market.realized_pnl_mana += settlement.realized;
-                market.invested_mana = (market.invested_mana - settlement.basis).max(0.0);
-                match action {
-                    TradeAction::SellYes => {
-                        market.yes_shares = (market.yes_shares - settlement.sold).max(0.0)
-                    }
-                    _ => market.no_shares = (market.no_shares - settlement.sold).max(0.0),
-                }
-
-                self.db.update_answer_position(
-                    &market_id,
-                    &answer.id,
-                    answer.yes_shares,
-                    answer.no_shares,
-                    answer.invested_mana,
-                )?;
-
-                let record = TradeRecord {
-                    id: 0,
-                    market_id: market_id.clone(),
-                    answer_id: Some(answer.id.clone()),
-                    action,
-                    mana_amount: proceeds,
-                    shares_delta: -settlement.sold,
-                    p_internal,
-                    p_market,
-                    trigger_post_uri: None,
-                    manifold_bet_id: optional_id(result.bet_id()),
-                    created_at: now,
-                };
-                let id = self.db.insert_trade(&record)?;
-                let record = TradeRecord { id, ..record };
-
-                self.persist_market(market)?;
-                self.emit_trade(market, &record);
-                sold = true;
-            }
-        }
-
-        if sold {
-            Ok(LiquidationOutcome::Sold)
-        } else {
-            tracing::info!(market_id = %market_id, "no answer shares to liquidate");
-            Ok(LiquidationOutcome::NoPosition)
-        }
     }
 
     /// Liquidates every market that is not already closed.
@@ -2047,9 +904,10 @@ impl TradeExecutor {
     /// Publishes a filled trade after the database and cache were updated.
     ///
     /// A receiver that is not running yet is normal: the broadcast channel has
-    /// no history and events are best-effort.
-    fn emit_trade(&self, market: &TrackedMarket, record: &TradeRecord) {
-        let _ = self.events.send(trade_event(market, record));
+    /// no history and events are best-effort. The available budget comes from
+    /// the book's aggregate, so it reflects the post-trade position.
+    fn emit_trade(&self, book: &Book, record: &TradeRecord) {
+        let _ = self.events.send(trade_event(&book.market(), record));
     }
 
     /// Publishes a trade-loop failure.
@@ -2124,144 +982,98 @@ impl TradeExecutor {
         }
     }
 
-    /// Performs one buy and writes its ledger row.
-    async fn execute_buy(
-        &self,
-        market: &mut TrackedMarket,
-        answer: Option<&mut TrackedAnswer>,
-        ctx: ExecutionContext<'_>,
-    ) -> AppResult<Option<TradeRecord>> {
-        let ExecutionContext {
-            decision,
-            p_internal,
-            p_market,
-            trigger_post_uri,
-            now,
-            dry_run,
-        } = ctx;
-        let amount = decision.amount_mana;
-        if !amount.is_finite() || amount <= 0.0 {
-            bail!("buy amount must be a positive finite mana value, got {amount}");
-        }
-
-        let available = available_budget(market);
-        if amount > available + BUDGET_EPSILON {
-            bail!(
-                "budget invariant violated for market {}: buy of {amount} mana exceeds \
-                 available budget {available}",
-                market.id
-            );
-        }
-        let committed = market.invested_mana + amount;
-        let ceiling = market.budget_mana + market.realized_pnl_mana;
-        if committed > ceiling + BUDGET_EPSILON {
-            bail!(
-                "budget invariant violated for market {}: invested {committed} would exceed \
-                 budget plus realized PnL {ceiling}",
-                market.id
-            );
-        }
-
-        let outcome = decision.action.outcome();
-        let result = self
-            .client
-            .buy(
-                &market.id,
-                outcome,
-                amount,
-                decision.answer_id.as_deref(),
-                dry_run,
-            )
-            .await
-            .with_context(|| format!("buying {outcome} on Manifold market {}", market.id))?;
-        ensure_filled(&result, &market.id)?;
-        if !result.shares.is_finite() || result.shares <= 0.0 {
-            bail!(
-                "Manifold bet {} on market {} returned no shares",
-                result.bet_id(),
-                market.id
-            );
-        }
-
-        if dry_run {
-            tracing::info!(
-                market_id = %market.id,
-                answer_id = ?decision.answer_id,
-                action = %decision.action,
-                amount,
-                shares = result.shares,
-                prob_before = ?result.prob_before,
-                prob_after = ?result.prob_after,
-                "dry run: simulated buy, nothing persisted"
-            );
-            return Ok(None);
-        }
-
-        let cost = result.total_cost();
-        match answer {
-            Some(answer) => {
-                apply_buy_at(
-                    PositionFields {
-                        yes: &mut answer.yes_shares,
-                        no: &mut answer.no_shares,
-                        invested: &mut answer.invested_mana,
-                    },
-                    decision.action,
-                    cost,
-                    result.shares,
-                )?;
-                market.invested_mana += cost;
-                match decision.action {
-                    TradeAction::BuyYes => market.yes_shares += result.shares,
-                    _ => market.no_shares += result.shares,
-                }
-                self.db.update_answer_position(
-                    &market.id,
-                    &answer.id,
-                    answer.yes_shares,
-                    answer.no_shares,
-                    answer.invested_mana,
-                )?;
-            }
-            None => apply_buy(market, decision.action, cost, result.shares)?,
-        }
-
-        let record = TradeRecord {
-            id: 0,
-            market_id: market.id.clone(),
-            answer_id: decision.answer_id.clone(),
-            action: decision.action,
-            mana_amount: cost,
-            shares_delta: result.shares,
-            p_internal,
-            p_market,
-            trigger_post_uri: trigger_post_uri.map(str::to_owned),
-            manifold_bet_id: optional_id(result.bet_id()),
-            created_at: now,
-        };
-        let id = self.db.insert_trade(&record)?;
-
-        Ok(Some(TradeRecord { id, ..record }))
-    }
-
-    /// Performs one sell and writes its ledger row.
+    /// Performs one planned action and writes its ledger row.
     ///
-    /// A dry run cannot simulate a sell (Manifold has no `dryRun` for that
-    /// endpoint), so it only logs the intended action and persists nothing.
-    async fn execute_sell(
+    /// A buy keeps the budget invariant checks, sends `dryRun` when asked, and
+    /// records the fill on its leg. A sell sends the requested share count and
+    /// lets the book release the proportional cost basis. Neither branch writes
+    /// a position column: the caller calls [`Book::persist`] afterwards.
+    async fn execute(
         &self,
-        market: &mut TrackedMarket,
-        answer: Option<&mut TrackedAnswer>,
-        ctx: ExecutionContext<'_>,
+        book: &mut Book,
+        planned: &PlannedTrade,
+        trigger_post_uri: Option<&str>,
+        now: i64,
+        dry_run: bool,
     ) -> AppResult<Option<TradeRecord>> {
-        let ExecutionContext {
-            decision,
-            p_internal,
-            p_market,
-            trigger_post_uri,
-            now,
-            dry_run,
-        } = ctx;
+        let decision = &planned.decision;
+
+        if is_buy(decision.action) {
+            let amount = decision.amount_mana;
+            if !amount.is_finite() || amount <= 0.0 {
+                bail!("buy amount must be a positive finite mana value, got {amount}");
+            }
+
+            let available = book.available_budget();
+            if amount > available + BUDGET_EPSILON {
+                bail!(
+                    "budget invariant violated for market {}: buy of {amount} mana exceeds \
+                     available budget {available}",
+                    book.id()
+                );
+            }
+            let market = book.market();
+            let committed = market.invested_mana + amount;
+            let ceiling = market.budget_mana + market.realized_pnl_mana;
+            if committed > ceiling + BUDGET_EPSILON {
+                bail!(
+                    "budget invariant violated for market {}: invested {committed} would exceed \
+                     budget plus realized PnL {ceiling}",
+                    book.id()
+                );
+            }
+
+            let outcome = decision.action.outcome();
+            let result = self
+                .client
+                .buy(
+                    book.id(),
+                    outcome,
+                    amount,
+                    decision.answer_id.as_deref(),
+                    dry_run,
+                )
+                .await
+                .with_context(|| format!("buying {outcome} on Manifold market {}", book.id()))?;
+            ensure_filled(&result, book.id())?;
+            if !result.shares.is_finite() || result.shares <= 0.0 {
+                bail!(
+                    "Manifold bet {} on market {} returned no shares",
+                    result.bet_id(),
+                    book.id()
+                );
+            }
+
+            if dry_run {
+                tracing::info!(
+                    market_id = %book.id(),
+                    answer_id = ?decision.answer_id,
+                    action = %decision.action,
+                    amount,
+                    shares = result.shares,
+                    prob_before = ?result.prob_before,
+                    prob_after = ?result.prob_after,
+                    "dry run: simulated buy, nothing persisted"
+                );
+                return Ok(None);
+            }
+
+            let cost = result.total_cost();
+            book.apply_buy(planned.leg, decision.action, cost, result.shares)?;
+
+            return self.record_trade(
+                book,
+                planned,
+                trigger_post_uri,
+                now,
+                Fill {
+                    mana_amount: cost,
+                    shares_delta: result.shares,
+                    result: &result,
+                },
+            );
+        }
+
         let requested = decision.shares.unwrap_or(0.0);
         if !requested.is_finite() || requested <= 0.0 {
             bail!("sell must dispose of a positive finite share count, got {requested}");
@@ -2269,7 +1081,7 @@ impl TradeExecutor {
 
         if dry_run {
             tracing::info!(
-                market_id = %market.id,
+                market_id = %book.id(),
                 answer_id = ?decision.answer_id,
                 action = %decision.action,
                 shares = requested,
@@ -2281,10 +1093,10 @@ impl TradeExecutor {
         let outcome = decision.action.outcome();
         let result = self
             .client
-            .sell(&market.id, outcome, requested, decision.answer_id.as_deref())
+            .sell(book.id(), outcome, requested, decision.answer_id.as_deref())
             .await
-            .with_context(|| format!("selling {outcome} on Manifold market {}", market.id))?;
-        ensure_filled(&result, &market.id)?;
+            .with_context(|| format!("selling {outcome} on Manifold market {}", book.id()))?;
+        ensure_filled(&result, book.id())?;
 
         // Prefer the filled share count from Manifold; fall back to the request
         // when the response omits it. The settlement clamps to the held amount.
@@ -2294,65 +1106,41 @@ impl TradeExecutor {
             requested
         };
         let proceeds = result.net_proceeds();
+        let settlement = book.apply_sell(planned.leg, decision.action, sold, proceeds)?;
 
-        let sold = match answer {
-            Some(answer) => {
-                let settlement = settle_sell(
-                    PositionFields {
-                        yes: &mut answer.yes_shares,
-                        no: &mut answer.no_shares,
-                        invested: &mut answer.invested_mana,
-                    },
-                    decision.action,
-                    sold,
-                    proceeds,
-                )?;
+        self.record_trade(
+            book,
+            planned,
+            trigger_post_uri,
+            now,
+            Fill {
+                mana_amount: proceeds,
+                shares_delta: -settlement.sold,
+                result: &result,
+            },
+        )
+    }
 
-                market.realized_pnl_mana += settlement.realized;
-                market.invested_mana = (market.invested_mana - settlement.basis).max(0.0);
-                match decision.action {
-                    TradeAction::SellYes => {
-                        market.yes_shares = (market.yes_shares - settlement.sold).max(0.0)
-                    }
-                    _ => market.no_shares = (market.no_shares - settlement.sold).max(0.0),
-                }
-
-                self.db.update_answer_position(
-                    &market.id,
-                    &answer.id,
-                    answer.yes_shares,
-                    answer.no_shares,
-                    answer.invested_mana,
-                )?;
-                settlement.sold
-            }
-            None => {
-                let settlement = settle_sell(
-                    PositionFields {
-                        yes: &mut market.yes_shares,
-                        no: &mut market.no_shares,
-                        invested: &mut market.invested_mana,
-                    },
-                    decision.action,
-                    sold,
-                    proceeds,
-                )?;
-                market.realized_pnl_mana += settlement.realized;
-                settlement.sold
-            }
-        };
-
+    /// Writes the ledger row for a filled action.
+    fn record_trade(
+        &self,
+        book: &Book,
+        planned: &PlannedTrade,
+        trigger_post_uri: Option<&str>,
+        now: i64,
+        fill: Fill<'_>,
+    ) -> AppResult<Option<TradeRecord>> {
         let record = TradeRecord {
             id: 0,
-            market_id: market.id.clone(),
-            answer_id: decision.answer_id.clone(),
-            action: decision.action,
-            mana_amount: proceeds,
-            shares_delta: -sold,
-            p_internal,
-            p_market,
+            market_id: book.id().to_owned(),
+            answer_id: planned.decision.answer_id.clone(),
+            action: planned.decision.action,
+            mana_amount: fill.mana_amount,
+            shares_delta: fill.shares_delta,
+            p_internal: planned.p_internal,
+            p_market: planned.p_market,
             trigger_post_uri: trigger_post_uri.map(str::to_owned),
-            manifold_bet_id: optional_id(result.bet_id()),
+            manifold_bet_id: optional_id(fill.result.bet_id()),
             created_at: now,
         };
         let id = self.db.insert_trade(&record)?;
@@ -2366,22 +1154,6 @@ impl TradeExecutor {
             .db
             .get_kv(KILL_SWITCH_KEY)?
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("true")))
-    }
-
-    /// Writes the reconciled position and the freshly observed market price.
-    ///
-    /// Belief columns are deliberately absent: triage and `/override` own them
-    /// and may have written a newer value between the snapshot this call was
-    /// built from and now.
-    fn persist_market(&self, market: &TrackedMarket) -> AppResult<()> {
-        self.store.record_position(
-            &market.id,
-            market.invested_mana,
-            market.realized_pnl_mana,
-            market.yes_shares,
-            market.no_shares,
-        )?;
-        self.store.record_price(&market.id, market.p_market_last)
     }
 }
 
@@ -2405,35 +1177,6 @@ fn trade_event(market: &TrackedMarket, record: &TradeRecord) -> TradeEvent {
         available_budget: available_budget(market),
         bet_id: record.manifold_bet_id.clone(),
     }
-}
-
-/// Replaces the local position fields with Manifold's and warns when they
-/// differed.
-///
-/// `realized_pnl_mana` is deliberately not overwritten: Manifold's `profit`
-/// includes unrealized gains, while the bot's budget accounting treats realized
-/// PnL as the only source of recycled budget.
-fn reconcile_position(market: &mut TrackedMarket, remote: &PositionSnapshot, market_id: &str) {
-    let differs = (market.yes_shares - remote.yes_shares).abs() > POSITION_EPSILON
-        || (market.no_shares - remote.no_shares).abs() > POSITION_EPSILON
-        || (market.invested_mana - remote.invested).abs() > POSITION_EPSILON;
-
-    if differs {
-        tracing::warn!(
-            market_id = %market_id,
-            local_yes_shares = market.yes_shares,
-            remote_yes_shares = remote.yes_shares,
-            local_no_shares = market.no_shares,
-            remote_no_shares = remote.no_shares,
-            local_invested = market.invested_mana,
-            remote_invested = remote.invested,
-            "local position differs from Manifold; trusting Manifold"
-        );
-    }
-
-    market.yes_shares = remote.yes_shares.max(0.0);
-    market.no_shares = remote.no_shares.max(0.0);
-    market.invested_mana = remote.invested.max(0.0);
 }
 
 /// Rejects a bet response that Manifold did not fill.
@@ -2473,6 +1216,9 @@ fn snippet(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use crate::belief;
+    use crate::book::{TradeLimits, TradeParams, MAX_TRADING_PROB, MIN_TRADING_PROB};
 
     fn params() -> TradeParams {
         TradeParams {
@@ -2515,425 +1261,6 @@ mod tests {
             (actual - expected).abs() < 1e-9,
             "expected {expected}, got {actual}"
         );
-    }
-
-    // -- Kelly sizing -------------------------------------------------------
-
-    #[test]
-    fn kelly_uses_the_yes_formula_for_a_bullish_edge() {
-        // f = 0.25 * 0.1 / (1 - 0.5) = 0.05 -> 5 mana of a 100 mana budget.
-        let target = kelly_target_mana(0.1, 0.5, 100.0, params());
-        assert_close(target, 5.0);
-    }
-
-    #[test]
-    fn kelly_uses_the_no_formula_for_a_bearish_edge() {
-        // f = 0.25 * 0.1 / 0.4 = 0.0625 -> 6.25 mana of a 100 mana budget.
-        let target = kelly_target_mana(-0.1, 0.4, 100.0, params());
-        assert_close(target, 6.25);
-    }
-
-    #[test]
-    fn kelly_caps_the_fraction_at_half_the_budget() {
-        let aggressive = TradeParams {
-            kelly_fraction: 2.0,
-            ..params()
-        };
-        // f = 2.0 * 0.4 / 0.5 = 1.6, clamped to 0.5 -> 50 mana of 100.
-        let target = kelly_target_mana(0.4, 0.5, 100.0, aggressive);
-        assert_close(target, 50.0);
-    }
-
-    #[test]
-    fn kelly_returns_zero_below_the_entry_threshold() {
-        assert_eq!(kelly_target_mana(0.049, 0.5, 100.0, params()), 0.0);
-        assert_eq!(kelly_target_mana(-0.049, 0.5, 100.0, params()), 0.0);
-        assert_eq!(kelly_target_mana(0.0, 0.5, 100.0, params()), 0.0);
-    }
-
-    #[test]
-    fn kelly_accepts_an_edge_exactly_at_the_threshold() {
-        // f = 0.25 * 0.05 / 0.5 = 0.025 -> 2.5 mana.
-        assert_close(kelly_target_mana(0.05, 0.5, 100.0, params()), 2.5);
-        assert_close(kelly_target_mana(-0.05, 0.5, 100.0, params()), 2.5);
-    }
-
-    #[test]
-    fn kelly_clamps_market_probability_at_the_endpoints() {
-        // p_market 0 -> treated as 0.01: f = 0.25 * 0.5 / 0.99.
-        let yes = kelly_target_mana(0.5, 0.0, 100.0, params());
-        assert!(yes.is_finite());
-        assert_close(yes, 0.25 * 0.5 / 0.99 * 100.0);
-
-        // p_market 1 -> treated as 0.99: f = 0.25 * 0.5 / 0.99.
-        let no = kelly_target_mana(-0.5, 1.0, 100.0, params());
-        assert!(no.is_finite());
-        assert_close(no, 0.25 * 0.5 / 0.99 * 100.0);
-    }
-
-    #[test]
-    fn kelly_returns_zero_for_a_zero_or_negative_budget() {
-        assert_eq!(kelly_target_mana(0.5, 0.5, 0.0, params()), 0.0);
-        assert_eq!(kelly_target_mana(0.5, 0.5, -10.0, params()), 0.0);
-    }
-
-    // -- Decisions ----------------------------------------------------------
-
-    #[test]
-    fn flat_market_with_a_bullish_edge_buys_yes() {
-        let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
-        let decision = decide_trade(&market, 0.6, 0.5, params()).expect("buy YES");
-        assert_eq!(decision.action, TradeAction::BuyYes);
-        assert_close(decision.amount_mana, 5.0);
-        assert_eq!(decision.shares, None);
-    }
-
-    #[test]
-    fn flat_market_with_a_bearish_edge_buys_no() {
-        let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
-        let decision = decide_trade(&market, 0.4, 0.5, params()).expect("buy NO");
-        assert_eq!(decision.action, TradeAction::BuyNo);
-        assert_close(decision.amount_mana, 5.0);
-        assert_eq!(decision.shares, None);
-    }
-
-    #[test]
-    fn edge_inside_the_entry_band_does_not_trade() {
-        let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
-        assert!(decide_trade(&market, 0.54, 0.5, params()).is_none());
-        assert!(decide_trade(&market, 0.46, 0.5, params()).is_none());
-        assert!(decide_trade(&market, 0.5, 0.5, params()).is_none());
-    }
-
-    // -- Multiple-choice planner -------------------------------------------
-
-    fn view(id: &str, p_internal: f64, p_market: f64, yes: f64, no: f64) -> AnswerView {
-        AnswerView {
-            id: id.to_owned(),
-            text: format!("Answer {id}"),
-            p_internal,
-            p_market,
-            yes_shares: yes,
-            no_shares: no,
-        }
-    }
-
-    fn limits(max_positions: usize, max_new_per_tick: usize, fraction: f64) -> TradeLimits {
-        TradeLimits {
-            max_positions,
-            max_new_per_tick,
-            max_answer_fraction: fraction,
-        }
-    }
-
-    fn actions_for(
-        answers: &[AnswerView],
-        sum_to_one: bool,
-        limits: TradeLimits,
-    ) -> Vec<TradeDecision> {
-        plan_actions(
-            &market_with(100.0, 0.0, 0.0, 0.0, 0.0),
-            answers,
-            sum_to_one,
-            100.0,
-            params(),
-            limits,
-        )
-    }
-
-    #[test]
-    fn sum_to_one_edges_are_normalized_and_block_the_offsetting_side() {
-        // Raw beliefs sum to 1.0 here, so the normalized probabilities match.
-        let answers = [
-            view("a", 0.8, 0.5, 0.0, 0.0),
-            view("b", 0.2, 0.5, 0.0, 0.0),
-        ];
-
-        let decisions = actions_for(&answers, true, limits(6, 2, 0.25));
-
-        assert_eq!(decisions.len(), 1, "only the favored answer may be bought");
-        assert_eq!(decisions[0].action, TradeAction::BuyYes);
-        assert_eq!(decisions[0].answer_id.as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn independent_edges_allow_both_sides() {
-        let answers = [
-            view("a", 0.8, 0.5, 0.0, 0.0),
-            view("b", 0.2, 0.5, 0.0, 0.0),
-        ];
-
-        let decisions = actions_for(&answers, false, limits(6, 2, 0.25));
-
-        assert_eq!(decisions.len(), 2);
-        assert_eq!(decisions[0].action, TradeAction::BuyYes);
-        assert_eq!(decisions[0].answer_id.as_deref(), Some("a"));
-        assert_eq!(decisions[1].action, TradeAction::BuyNo);
-        assert_eq!(decisions[1].answer_id.as_deref(), Some("b"));
-    }
-
-    #[test]
-    fn normalization_removes_a_duplicate_yes_entry() {
-        // Two high raw beliefs cannot both stay cheap once the distribution is
-        // projected onto prices that sum to one. The edges must cancel.
-        let answers = [
-            view("a", 0.7, 0.55, 0.0, 0.0),
-            view("b", 0.5, 0.45, 0.0, 0.0),
-        ];
-        let edges = answer_edges(&answers, true);
-        let total: f64 = 1.2;
-        assert_close(edges[0], 0.7 / total - 0.55);
-        assert_close(edges[1], 0.5 / total - 0.45);
-        assert_close(edges.iter().sum::<f64>(), 0.0);
-    }
-
-    #[test]
-    fn exits_are_planned_before_entries() {
-        let answers = [
-            view("held", 0.4, 0.6, 10.0, 0.0),
-            view("fresh", 0.9, 0.5, 0.0, 0.0),
-        ];
-
-        let decisions = actions_for(&answers, false, limits(6, 2, 0.25));
-
-        assert_eq!(decisions[0].action, TradeAction::SellYes);
-        assert_eq!(decisions[0].answer_id.as_deref(), Some("held"));
-        assert_eq!(decisions[0].shares, Some(10.0));
-        assert!(decisions
-            .iter()
-            .any(|decision| decision.action == TradeAction::BuyYes
-                && decision.answer_id.as_deref() == Some("fresh")));
-    }
-
-    #[test]
-    fn new_entries_are_capped_per_tick() {
-        let answers: Vec<AnswerView> = (0..5)
-            .map(|index| view(&format!("a{index}"), 0.9, 0.5, 0.0, 0.0))
-            .collect();
-
-        let decisions = actions_for(&answers, false, limits(6, 2, 0.25));
-
-        assert_eq!(decisions.len(), 2);
-        assert!(decisions
-            .iter()
-            .all(|decision| decision.action == TradeAction::BuyYes));
-    }
-
-    #[test]
-    fn open_positions_consume_the_slots() {
-        let answers = [
-            view("held1", 0.6, 0.5, 1.0, 0.0),
-            view("held2", 0.6, 0.5, 1.0, 0.0),
-            view("fresh", 0.9, 0.5, 0.0, 0.0),
-        ];
-
-        let decisions = actions_for(&answers, false, limits(2, 2, 0.25));
-
-        assert!(
-            decisions.iter().all(|decision| decision.action != TradeAction::BuyYes),
-            "no slot is free: {decisions:?}"
-        );
-    }
-
-    #[test]
-    fn one_answer_cannot_take_more_than_its_share_of_the_budget() {
-        let answers = [view("a", 0.99, 0.2, 0.0, 0.0)];
-
-        // Kelly would size this near 24.7 mana; the 10% cap binds first.
-        let decisions = actions_for(&answers, false, limits(6, 2, 0.1));
-
-        let buy = decisions
-            .iter()
-            .find(|decision| decision.action == TradeAction::BuyYes)
-            .expect("a buy");
-        assert_close(buy.amount_mana, 10.0);
-    }
-
-    #[test]
-    fn near_certain_answers_are_not_entered() {
-        let answers = [
-            view("almost-won", 0.999, 0.99, 0.0, 0.0),
-            view("almost-lost", 0.001, 0.01, 0.0, 0.0),
-        ];
-
-        let decisions = actions_for(&answers, false, limits(6, 2, 0.25));
-
-        assert!(decisions.is_empty(), "near-certain prices: {decisions:?}");
-    }
-
-    #[test]
-    fn zero_internal_mass_produces_no_edges() {
-        let answers = [
-            view("a", 0.0, 0.5, 0.0, 0.0),
-            view("b", 0.0, 0.5, 0.0, 0.0),
-        ];
-
-        let decisions = actions_for(&answers, true, limits(6, 2, 0.25));
-
-        assert!(decisions.is_empty());
-    }
-
-    #[test]
-    fn holding_yes_exits_when_the_edge_drops_below_the_exit_threshold() {
-        let market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
-        let decision = decide_trade(&market, 0.505, 0.5, params()).expect("sell YES");
-        assert_eq!(decision.action, TradeAction::SellYes);
-        assert_eq!(decision.shares, Some(20.0));
-    }
-
-    #[test]
-    fn holding_no_exits_when_the_edge_rises_above_the_exit_threshold() {
-        let market = market_with(100.0, 10.0, 0.0, 0.0, 15.0);
-        let decision = decide_trade(&market, 0.495, 0.5, params()).expect("sell NO");
-        assert_eq!(decision.action, TradeAction::SellNo);
-        assert_eq!(decision.shares, Some(15.0));
-    }
-
-    #[test]
-    fn holding_yes_does_not_exit_inside_the_band() {
-        let market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
-        // edge = 0.02, above EXIT_EDGE_THRESHOLD, but below the entry threshold.
-        assert!(decide_trade(&market, 0.52, 0.5, params()).is_none());
-        // A large edge does not scale the position in either.
-        assert!(decide_trade(&market, 0.7, 0.5, params()).is_none());
-    }
-
-    #[test]
-    fn holding_no_does_not_exit_or_add_inside_the_band() {
-        let market = market_with(100.0, 10.0, 0.0, 0.0, 15.0);
-        assert!(decide_trade(&market, 0.48, 0.5, params()).is_none());
-        assert!(decide_trade(&market, 0.3, 0.5, params()).is_none());
-    }
-
-    #[test]
-    fn entries_below_the_minimum_trade_size_are_skipped() {
-        // A 10 mana budget with a 0.1 edge sizes to 0.5 mana, below the 1 mana
-        // minimum.
-        let market = market_with(10.0, 0.0, 0.0, 0.0, 0.0);
-        assert!(decide_trade(&market, 0.6, 0.5, params()).is_none());
-
-        // Increasing the edge makes the same budget tradable.
-        let decision = decide_trade(&market, 0.8, 0.5, params()).expect("large edge trades");
-        assert_close(decision.amount_mana, 1.5);
-    }
-
-    #[test]
-    fn entries_use_only_the_available_budget() {
-        // budget 100 + pnl 20 - invested 50 = 70 available; f = 0.05.
-        let market = market_with(100.0, 50.0, 20.0, 0.0, 0.0);
-        let decision = decide_trade(&market, 0.6, 0.5, params()).expect("buy YES");
-        assert_close(decision.amount_mana, 3.5);
-    }
-
-    #[test]
-    fn decision_never_sells_a_zero_share_position() {
-        let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
-        // A strongly bearish edge with no shares is an entry, never a sell.
-        let decision = decide_trade(&market, 0.1, 0.5, params()).expect("entry");
-        assert_eq!(decision.action, TradeAction::BuyNo);
-    }
-
-    // -- Position accounting ------------------------------------------------
-
-    #[test]
-    fn apply_buy_adds_cost_and_shares_to_the_matching_side() {
-        let mut market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
-        apply_buy(&mut market, TradeAction::BuyYes, 10.0, 20.0).expect("buy YES");
-        assert_close(market.invested_mana, 10.0);
-        assert_close(market.yes_shares, 20.0);
-        assert_close(market.no_shares, 0.0);
-
-        apply_buy(&mut market, TradeAction::BuyNo, 5.0, 10.0).expect("buy NO");
-        assert_close(market.invested_mana, 15.0);
-        assert_close(market.no_shares, 10.0);
-    }
-
-    #[test]
-    fn apply_buy_rejects_sell_actions() {
-        let mut market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
-        assert!(apply_buy(&mut market, TradeAction::SellYes, 1.0, 1.0).is_err());
-        assert!(apply_buy(&mut market, TradeAction::SellNo, 1.0, 1.0).is_err());
-    }
-
-    #[test]
-    fn profitable_sell_increases_realized_pnl_and_available_budget() {
-        let mut market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
-        let before = available_budget(&market);
-
-        apply_sell(&mut market, TradeAction::SellYes, 20.0, 12.0).expect("sell YES");
-
-        assert_close(market.realized_pnl_mana, 2.0);
-        assert_close(market.invested_mana, 0.0);
-        assert_close(market.yes_shares, 0.0);
-        // The released cost basis and the profit both return to the budget.
-        assert_close(available_budget(&market), before + 12.0);
-    }
-
-    #[test]
-    fn partial_sell_uses_a_proportional_cost_basis() {
-        let mut market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
-        let before = available_budget(&market);
-
-        apply_sell(&mut market, TradeAction::SellYes, 10.0, 6.0).expect("partial sell");
-
-        assert_close(market.realized_pnl_mana, 1.0); // 6 - 10 * 10/20
-        assert_close(market.invested_mana, 5.0);
-        assert_close(market.yes_shares, 10.0);
-        assert_close(available_budget(&market), before + 6.0);
-    }
-
-    #[test]
-    fn losing_sell_reduces_available_budget() {
-        let mut market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
-        let before = available_budget(&market);
-
-        apply_sell(&mut market, TradeAction::SellYes, 20.0, 3.0).expect("sell YES");
-
-        assert_close(market.realized_pnl_mana, -7.0);
-        // The released basis minus the loss equals the actual proceeds.
-        assert_close(available_budget(&market), before + 3.0);
-    }
-
-    #[test]
-    fn sell_of_more_shares_than_held_is_clamped() {
-        let mut market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
-
-        apply_sell(&mut market, TradeAction::SellYes, 50.0, 12.0).expect("clamped sell");
-
-        assert_close(market.yes_shares, 0.0);
-        assert_close(market.invested_mana, 0.0);
-        assert_close(market.realized_pnl_mana, 2.0);
-    }
-
-    #[test]
-    fn apply_sell_rejects_buy_actions_and_empty_positions() {
-        let mut market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
-        assert!(apply_sell(&mut market, TradeAction::BuyYes, 1.0, 1.0).is_err());
-        assert!(apply_sell(&mut market, TradeAction::BuyNo, 1.0, 1.0).is_err());
-        assert!(apply_sell(&mut market, TradeAction::SellNo, 1.0, 1.0).is_err());
-        assert!(apply_sell(&mut market, TradeAction::SellYes, 0.0, 1.0).is_err());
-    }
-
-    #[test]
-    fn liquidation_sells_only_the_sides_that_hold_shares() {
-        assert_eq!(
-            liquidation_sides(20.0, 5.0, false),
-            vec![(TradeAction::SellYes, 20.0), (TradeAction::SellNo, 5.0)]
-        );
-        assert_eq!(
-            liquidation_sides(20.0, 0.0, false),
-            vec![(TradeAction::SellYes, 20.0)]
-        );
-        assert_eq!(
-            liquidation_sides(0.0, 5.0, false),
-            vec![(TradeAction::SellNo, 5.0)]
-        );
-    }
-
-    #[test]
-    fn liquidation_of_a_resolved_or_empty_position_sells_nothing() {
-        assert!(liquidation_sides(20.0, 5.0, true).is_empty());
-        assert!(liquidation_sides(0.0, 0.0, false).is_empty());
     }
 
     // -- Wire format --------------------------------------------------------
@@ -3083,7 +1410,7 @@ mod tests {
             "hasNoShares": false
         }]);
 
-        let position = parse_position(&raw, "bot-1");
+        let position = parse_market_positions(&raw, "bot-1").root;
 
         assert_close(position.yes_shares, 12.5);
         assert_close(position.no_shares, 0.0);
@@ -3100,7 +1427,7 @@ mod tests {
             "profit": -0.5
         }]);
 
-        let position = parse_position(&raw, "bot-1");
+        let position = parse_market_positions(&raw, "bot-1").root;
 
         assert_close(position.yes_shares, 0.0);
         assert_close(position.no_shares, 3.25);
@@ -3114,7 +1441,7 @@ mod tests {
             {"userId": "someone-else", "totalShares": {"YES": 99.0}, "invested": 50.0},
             {"userId": "bot-1", "totalShares": {"NO": 7.0}, "invested": 4.0, "profit": 1.0}
         ]);
-        let position = parse_position(&raw, "bot-1");
+        let position = parse_market_positions(&raw, "bot-1").root;
         assert_close(position.no_shares, 7.0);
         assert_close(position.invested, 4.0);
 
@@ -3123,16 +1450,17 @@ mod tests {
             {"userId": "bot-1", "answerId": "ans-a", "totalShares": {"YES": 15.0}, "invested": 10.0},
             {"userId": "bot-1", "answerId": "ans-b", "totalShares": {"NO": 8.0}, "invested": 5.0}
         ]);
-        let pos_a = parse_answer_position(&multi_raw, "bot-1", Some("ans-a"));
+        let positions = parse_market_positions(&multi_raw, "bot-1");
+        let pos_a = positions.answer("ans-a");
         assert_close(pos_a.yes_shares, 15.0);
         assert_close(pos_a.invested, 10.0);
-        let pos_b = parse_answer_position(&multi_raw, "bot-1", Some("ans-b"));
+        let pos_b = positions.answer("ans-b");
         assert_close(pos_b.no_shares, 8.0);
         assert_close(pos_b.invested, 5.0);
 
         // The server filters by userId; a single anonymous entry is still ours.
         let single = json!([{"totalShares": {"YES": 2.0}, "invested": 1.0}]);
-        let position = parse_position(&single, "bot-1");
+        let position = parse_market_positions(&single, "bot-1").root;
         assert_close(position.yes_shares, 2.0);
     }
 
@@ -3148,8 +1476,8 @@ mod tests {
             ]),
         ] {
             assert_eq!(
-                parse_position(&raw, "bot-1"),
-                PositionSnapshot::default(),
+                parse_market_positions(&raw, "bot-1").root,
+                Position::default(),
                 "payload: {raw}"
             );
         }
@@ -3162,7 +1490,7 @@ mod tests {
                 {"userId": "bot-1", "totalShares": {"YES": 5.0}, "invested": 3.0, "profit": 2.0}
             ]
         });
-        let position = parse_position(&raw, "bot-1");
+        let position = parse_market_positions(&raw, "bot-1").root;
         assert_close(position.yes_shares, 5.0);
     }
 
@@ -3376,10 +1704,7 @@ mod tests {
             ))
             .expect("insert sum-to-one market");
         store
-            .insert(&live_mc_market(
-                "hEpuZQpgR2",
-                "US Midterms MEGA Market",
-            ))
+            .insert(&live_mc_market("hEpuZQpgR2", "US Midterms MEGA Market"))
             .expect("insert independent market");
         let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
         let executor = runtime
@@ -3472,8 +1797,20 @@ mod tests {
         // The event is emitted only after a filled trade; a flat market whose
         // edge sits inside the entry band produces no decision at all.
         let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
-        assert!(decide_trade(&market, 0.54, 0.5, params()).is_none());
-        assert!(decide_trade(&market, 0.46, 0.5, params()).is_none());
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = MarketStore::new(&db).expect("store loads");
+        store.insert(&market).expect("insert market");
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        let policy = TradePolicy {
+            params: params(),
+            multiple_choice: TradeLimits::binary(),
+        };
+        assert!(
+            book.plan(Utc::now().timestamp(), 4.0, &policy).is_empty(),
+            "a flat market at its own price must not trade"
+        );
 
         let (sender, mut receiver) = broadcast::channel::<TradeEvent>(4);
         assert!(receiver.try_recv().is_err(), "no event may be queued");
