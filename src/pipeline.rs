@@ -167,7 +167,7 @@ pub enum PipelineEvent {
 pub struct Pipeline {
     pub config: Arc<Config>,
     pub db: Db,
-    pub registry: Arc<EngineRegistry>,
+    registry: Arc<EngineRegistry>,
     pub store: Arc<MarketStore>,
     triage: TriageClient,
     events: broadcast::Sender<PipelineEvent>,

@@ -1,21 +1,14 @@
-//! Entry point for the Bluesky-to-Manifold trading bot.
+//! Process entry point for the Bluesky-to-Manifold trading bot.
 //!
-//! Startup is deliberately linear: load configuration, open the database,
-//! build the market store, compile one Sieve engine per active market, then
-//! connect ingestion to the triage pipeline and the pipeline to the trade
-//! executor. Discord is not started yet; [`pipeline::PipelineEvent`] is the
-//! extension point a Discord consumer subscribes to.
-//!
-//! [`market_store::MarketStore`] is constructed once and shared as an `Arc`:
-//! it is the only path to `tracked_markets`, so every writer patches the same
-//! snapshot.
-//!
-//! The process runs until Ctrl-C, then aborts its spawned tasks.
+//! Setup only: install the rustls crypto provider, configure `tracing`, load
+//! [`config::Config`], then hand the process to [`app::App`]. The composition,
+//! the broadcast subscriptions, and the task lifetime live in [`app`].
 
 // Several module APIs are exercised by unit tests or reserved for the Discord
 // layer that is wired in later.
 #![allow(dead_code)]
 
+mod app;
 mod belief;
 mod book;
 mod config;
@@ -34,23 +27,9 @@ mod trade;
 mod triage;
 mod types;
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use tokio::sync::broadcast;
-
+use crate::app::App;
 use crate::config::Config;
-use crate::control::ControlPlane;
-use crate::db::Db;
-use crate::error::{anyhow, AppResult, Context};
-use crate::market_store::MarketStore;
-use crate::onboarding::OnboardingService;
-use crate::pipeline::{Pipeline, PipelineEvent};
-use crate::trade::TradeExecutor;
-use crate::types::MarketStatus;
-
-/// How often the INFO heartbeat reports throughput and active markets.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+use crate::error::{anyhow, AppResult};
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -63,177 +42,9 @@ async fn main() -> AppResult<()> {
 
     init_tracing();
 
-    let config = Arc::new(Config::from_env()?);
-    let db = Db::open(&config.db_path)?;
-    let store = Arc::new(MarketStore::new(&db)?);
-
-    let registry = Arc::new(sieve::EngineRegistry::new());
-    for market in store.list()? {
-        if market.status != MarketStatus::Active {
-            continue;
-        }
-        match sieve::compile(&market.sieve_source) {
-            Ok(engine) => registry.register(market.id.clone(), engine),
-            Err(error) => tracing::error!(
-                market_id = %market.id,
-                error = %error,
-                "skipping market with an invalid Sieve rule"
-            ),
-        }
-    }
-    tracing::info!(
-        markets = registry.len(),
-        active = registry.market_ids().len(),
-        "loaded Sieve engines"
-    );
-
-    // Onboarding shares the registry; build it before the registry is moved
-    // into the pipeline.
-    let onboarding = Arc::new(OnboardingService::new(
-        &config,
-        db.clone(),
-        Arc::clone(&registry),
-        Arc::clone(&store),
-    )?);
-
-    let pipeline = Arc::new(Pipeline::new(
-        Arc::clone(&config),
-        db.clone(),
-        registry,
-        Arc::clone(&store),
-    )?);
-    let mut pipeline_events = pipeline.events().subscribe();
-    // Subscribe before spawning the executor: the broadcast channel has no
-    // history, so a subscriber created later would miss early signals.
-    let trade_events = pipeline.events().subscribe();
-    // Discord subscribes before either loop starts for the same reason: a
-    // receiver created after the tasks are running may miss startup events.
-    let discord_pipeline_events = pipeline.events().subscribe();
-
-    // Resolving the bot identity here makes a bad API key a startup failure
-    // instead of silently disabling trading.
-    let executor = Arc::new(
-        TradeExecutor::new(&config, db.clone(), Arc::clone(&store))
-            .await
-            .context("initializing the trade executor")?,
-    );
-    tracing::info!(
-        bot_user_id = executor.client().bot_user_id(),
-        "Manifold client ready"
-    );
-    let discord_trade_events = executor.events().subscribe();
-
-    // The control plane owns every operator-driven lifecycle transition. The
-    // two `Arc` coercions keep the dependency edges pointing at the services.
-    let control = Arc::new(ControlPlane::new(
-        db.clone(),
-        Arc::clone(&store),
-        Arc::clone(&pipeline.registry),
-        onboarding,
-        executor.clone(),
-    ));
-
-    let discord_state = discord::DiscordState {
-        config: Arc::clone(&config),
-        db: db.clone(),
-        store: Arc::clone(&store),
-        pipeline: Arc::clone(&pipeline),
-        control,
-    };
-
-    let post_tx = ingest::channel();
-    let post_rx = post_tx.subscribe();
-
-    let pipeline_task = tokio::spawn({
-        let pipeline = Arc::clone(&pipeline);
-        async move {
-            if let Err(error) = pipeline.run(post_rx).await {
-                tracing::error!(error = %error, "pipeline stopped");
-            }
-        }
-    });
-
-    let heartbeat_task = tokio::spawn({
-        let pipeline = Arc::clone(&pipeline);
-        let store = Arc::clone(&store);
-        async move {
-            let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The first tick completes immediately; skip it so the first line
-            // reports a full interval of throughput.
-            ticker.tick().await;
-            let mut last_count = pipeline.processed_posts();
-            let mut last_at = Instant::now();
-            loop {
-                ticker.tick().await;
-                let now = Instant::now();
-                let count = pipeline.processed_posts();
-                let elapsed = now.saturating_duration_since(last_at).as_secs_f64();
-                let per_sec = if elapsed > 0.0 {
-                    count.saturating_sub(last_count) as f64 / elapsed
-                } else {
-                    0.0
-                };
-                tracing::info!(
-                    messages_per_sec = %format!("{per_sec:.1}"),
-                    messages_processed = count,
-                    active_markets = store.active_count(),
-                    "heartbeat"
-                );
-                last_count = count;
-                last_at = now;
-            }
-        }
-    });
-
-    let trade_task = tokio::spawn({
-        let executor = Arc::clone(&executor);
-        async move {
-            if let Err(error) = executor.run(trade_events).await {
-                tracing::error!(error = %error, "trade executor stopped");
-            }
-        }
-    });
-
-    let ingest_task = tokio::spawn(async move {
-        if let Err(error) = ingest::run((*config).clone(), post_tx).await {
-            tracing::error!(error = %error, "ingest stopped");
-        }
-    });
-
-    let discord_task = tokio::spawn(async move {
-        if let Err(error) =
-            discord::run(discord_state, discord_pipeline_events, discord_trade_events).await
-        {
-            tracing::error!(error = %error, "discord stopped");
-        }
-    });
-
-    let event_task = tokio::spawn(async move {
-        loop {
-            match pipeline_events.recv().await {
-                Ok(event) => log_pipeline_event(&event),
-                Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                    tracing::warn!(dropped, "pipeline event consumer lagged");
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-
-    tokio::signal::ctrl_c()
-        .await
-        .context("waiting for Ctrl-C")?;
-    tracing::info!("shutting down");
-
-    pipeline_task.abort();
-    heartbeat_task.abort();
-    trade_task.abort();
-    ingest_task.abort();
-    event_task.abort();
-    discord_task.abort();
-
-    Ok(())
+    // Composition and task ownership live in `app`: `build` wires every service,
+    // `spawn` subscribes every receiver before it starts any task.
+    App::build(Config::from_env()?).await?.spawn().run().await
 }
 
 /// Configures `tracing` from `RUST_LOG`, defaulting to `info`.
@@ -243,84 +54,4 @@ fn init_tracing() {
         Err(_) => tracing_subscriber::EnvFilter::new("info"),
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-/// Prints pipeline events to stdout.
-///
-/// This is the Phase 2 milestone consumer: a material belief update is visible
-/// on stdout. A later Discord consumer can subscribe to the same broadcast
-/// channel without changing the pipeline.
-fn log_pipeline_event(event: &PipelineEvent) {
-    match event {
-        PipelineEvent::PostMatched {
-            market_id,
-            post_uri,
-            author_handle,
-        } => {
-            tracing::info!(
-                market_id = %market_id,
-                author_handle = %author_handle,
-                post_uri = %post_uri,
-                "post matched filter, sending to triage"
-            );
-        }
-        PipelineEvent::Signal {
-            market_id,
-            question,
-            post_uri,
-            author_handle,
-            author_did,
-            text,
-            answer,
-            direction,
-            p_evidence,
-            p_target,
-            strength,
-            p_priced,
-            material,
-            impulse,
-            p_before,
-            p_after,
-            p_market,
-            created_at,
-        } => {
-            if *material {
-                tracing::info!(
-                    market_id = %market_id,
-                    question = %question,
-                    post_uri = %post_uri,
-                    author_handle = %author_handle,
-                    author_did = %author_did,
-                    post_text = %text,
-                    answer = ?answer,
-                    direction = %direction,
-                    p_evidence = *p_evidence,
-                    p_target = *p_target,
-                    strength = *strength,
-                    p_priced = *p_priced,
-                    impulse = *impulse,
-                    p_before = *p_before,
-                    p_after = *p_after,
-                    p_market = *p_market,
-                    created_at = *created_at,
-                    "signal"
-                );
-            } else {
-                tracing::debug!(
-                    market_id = %market_id,
-                    direction = %direction,
-                    p_evidence = *p_evidence,
-                    strength = *strength,
-                    "non-material signal"
-                );
-            }
-        }
-        PipelineEvent::Error { market_id, message } => {
-            tracing::error!(
-                market_id = ?market_id,
-                message = %message,
-                "pipeline error"
-            );
-        }
-    }
 }
