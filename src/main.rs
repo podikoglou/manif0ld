@@ -19,6 +19,7 @@ mod discord;
 mod error;
 mod extract;
 mod ingest;
+mod market_store;
 mod onboarding;
 mod onboarding_agent;
 mod pipeline;

@@ -116,7 +116,11 @@ impl Db {
         Ok(())
     }
 
-    fn lock(&self) -> AppResult<MutexGuard<'_, Connection>> {
+    /// Acquires the single connection.
+    ///
+    /// Visible to [`crate::market_store`], which owns the `tracked_markets`
+    /// queries and therefore needs the same connection.
+    pub(crate) fn lock(&self) -> AppResult<MutexGuard<'_, Connection>> {
         self.conn
             .lock()
             .map_err(|_| anyhow!("database mutex poisoned"))
@@ -704,7 +708,7 @@ fn limit_to_i64(limit: usize) -> i64 {
 }
 
 /// Fails when an update matched no market row.
-fn ensure_updated(rows: usize, market_id: &str) -> AppResult<()> {
+pub(crate) fn ensure_updated(rows: usize, market_id: &str) -> AppResult<()> {
     if rows == 0 {
         bail!("market {market_id} not found");
     }
@@ -724,7 +728,7 @@ fn collect_rows<T>(
 }
 
 /// Builds a column-conversion error that preserves the parse failure.
-fn invalid_text(column: usize, message: String) -> rusqlite::Error {
+pub(crate) fn invalid_text(column: usize, message: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         column,
         rusqlite::types::Type::Text,
