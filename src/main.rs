@@ -179,7 +179,7 @@ async fn main() -> AppResult<()> {
     });
 
     let ingest_task = tokio::spawn(async move {
-        if let Err(error) = ingest::run((*config).clone(), db, post_tx).await {
+        if let Err(error) = ingest::run((*config).clone(), post_tx).await {
             tracing::error!(error = %error, "ingest stopped");
         }
     });
