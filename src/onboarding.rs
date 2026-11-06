@@ -234,6 +234,9 @@ pub enum ResearchStep {
     },
     /// A dry run did not compile; the root cause is shown as history.
     DryRunFailed { error: String },
+    /// A research tool failed or timed out. Recorded as history so a stalled or
+    /// rejected call is visible instead of silent.
+    Failed { tool: String, error: String },
 }
 
 /// A fully resolved market that has not been persisted yet.

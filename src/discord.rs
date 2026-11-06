@@ -818,6 +818,9 @@ impl TrackProgress {
                 self.dry_runs += 1;
                 format!("dry run failed → {}", truncate_chars(&error, 70))
             }
+            ResearchStep::Failed { tool, error } => {
+                format!("{tool} failed → {}", truncate_chars(&error, 70))
+            }
         };
 
         self.activity
