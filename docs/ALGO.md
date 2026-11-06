@@ -319,6 +319,72 @@ judgment call, and it emits `Intent::Belief`. `pipeline.rs` shrinks to the
 dispatcher. Per-strategy risk caps (e.g. the snipe pool) are executor-side
 config keyed by `strategy.name()`.
 
+### 6.1 Channel topology
+
+Yes — channels, but at the rate boundaries, not everywhere. The system has
+two rates: the firehose (~10³ posts/s) and the tradeable (~1 intent/s).
+Channels sit exactly where the rate changes:
+
+```
+Jetstream ──► broadcast<Post>  (cap 1024, drop-oldest) ──┐
+Manifold ws ──► mpsc<MfdEvent> (cap 1024, never drop) ───┤
+timers ──────────────────────────────────────────────────┤
+                                                         ▼
+                                            dispatcher task (select!,
+                                            interest filter, Arc<Event>)
+              ┌──────────────┬──────────────┬────────────┴──────────┐
+              ▼              ▼              ▼                       ▼
+        news mpsc      snipe mpsc     copy mpsc               arb mpsc
+        (drop-oldest)  (never drop)   (never drop)            (never drop)
+              │              │              │                       │
+              ▼              ▼              ▼                       ▼
+        NewsStrategy   SnipeStrategy  CopyStrategy            ArbStrategy
+              └──────────────┴──────┬───────┴───────────────────────┘
+                                    ▼
+                  intent mpsc ×2 (priority, normal)  ◄── strategies
+                                    ▼
+                    CORE task (single consumer, biased to priority):
+                    apply Belief → edge check → ladder → Manifold
+                    = the ONLY writer to Manifold, and the ONLY
+                      mutator of belief/position state → no locks
+                                    ▼
+                             ledger + Discord
+```
+
+Rules:
+
+1. **One core task, single consumer.** All intents flow through two mpsc
+   queues (`priority` for stale-limit pickoffs and arb, `normal` for the
+   rest) into one task. It owns belief state, position state, the rate
+   bucket, and the Manifold client. Sequential draining means no `RwLock`
+   on hot state, no double-bet when two strategies fire together, and the
+   kill switch is literally "stop draining".
+2. **Drop policy is per-channel, by preciousness:**
+   | Channel | Policy | Why |
+   |---|---|---|
+   | posts broadcast | drop-oldest + `warn!` on lag | freshness beats completeness; stale news is toxic |
+   | mfd events | never drop; large cap, alert if full | every bet/contract/answer event is rare and tradeable |
+   | news inbox | drop-oldest | inherits the firehose policy |
+   | snipe/copy/arb inboxes | never drop; alert if full | each item is one decision call + maybe one trade |
+   | intent queues | bounded 256; full ⇒ kill-switch alert | intents are ≤ a few/s; full means a bug |
+3. **State is not a channel.** The mirrored world — current probs, resting
+   order books, our positions (`market_store.rs`, extended) — is read-mostly
+   shared state: `Arc<RwLock<..>>` written by the ws task, read by
+   strategies for context (e.g. triage needs `market_probability`).
+   Channels carry *work*; `Arc`/`watch` carries *state*. Do not stream state
+   snapshots through mpsc.
+4. **Strategies never await Manifold.** They push an intent and move on;
+   the core task serializes all writes against the rate bucket. A slow
+   strategy can only clog its own inbox, never the bus, never the executor.
+5. **Subscriptions in `App::spawn`.** All channels are created and all
+   broadcast/mpsc receivers are handed out in `App::spawn`, before the first
+   `tokio::spawn` — the existing convention, unchanged.
+
+What does *not* get a channel: Sieve matching stays a synchronous in-process
+call inside `NewsStrategy`'s task (microseconds), and the per-market triage
+queue stays the bounded queue it already is. Channels are for crossing task
+boundaries where rates or latencies differ — nothing smaller earns one.
+
 ## 7. Rollout order
 
 1. **`mfd_ws` + `rate` + reconcile swap** — kill 60 s polling. Pure win, no
