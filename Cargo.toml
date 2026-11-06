@@ -9,9 +9,10 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+firecrawl = "2"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-rig = { path = "rig", default-features = false, features = ["reqwest", "rustls"] }
+rig = { path = "rig", default-features = false, features = ["reqwest", "rustls", "agent"] }
 # Serenity's rustls backend enables the `ring` provider while rig's reqwest
 # stack enables `aws-lc-rs`; rustls then cannot auto-select at runtime. This
 # direct dependency lets main() install the `ring` provider explicitly.
