@@ -61,6 +61,12 @@ const MIN_IMPULSE: f64 = 0.01;
 const EVIDENCE_INSTRUCTIONS: &str =
     "Does the post give new evidence about the market question?";
 
+/// On a multiple-choice market the propositions live in the answers, not in the
+/// question text, which is often just a title. The evidence question must point
+/// at the answers or the model judges evidence against a bare title.
+const EVIDENCE_INSTRUCTIONS_CHOICES: &str =
+    "Does the post give new evidence for or against any of the market's answers?";
+
 const EVIDENCE_YES: &str = "The post reports a new fact, a named source, an official statement, or \
                             insider knowledge that bears on the question.";
 
@@ -80,6 +86,15 @@ const PRICED_NO: &str = "The information is new to the market, or the price has 
 
 const SUPPORTED_ANSWER_INSTRUCTIONS: &str =
     "Which answer does the post give evidence for?";
+
+/// The abstain alternative offered on every multiple-choice market.
+///
+/// A matched post can be real, relevant-looking news that changes the
+/// probability of none of the tracked answers (a race call for an untracked
+/// race, for example). Without an abstain option the choice question is a
+/// forced pick over N answers, and whatever it picks would receive an impulse.
+/// When the model picks this label, no belief moves.
+const NONE_ALTERNATIVE: &str = "None of the market's answers";
 
 /// Outcome the post favors on a binary market.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -208,6 +223,9 @@ pub enum Target {
     Binary,
     /// One answer of a multiple-choice market.
     Answer(String),
+    /// No tracked answer: the model chose the abstain alternative. The post is
+    /// recorded in the signal ledger but never moves a belief.
+    NoAnswer,
 }
 
 /// Calibrated answers for one post, before the materiality policy runs.
@@ -216,6 +234,11 @@ pub struct TriageOutcome {
     /// Probability that the post carries genuine evidence.
     pub p_evidence: f64,
     /// Probability mass on the single alternative the post favors.
+    ///
+    /// On a multiple-choice market this is renormalized over the tracked
+    /// answers only: mass the model places on the abstain alternative means
+    /// "the post supports no answer", not mass against the chosen one, so it
+    /// must not drag the direction toward the chosen answer's opposite.
     pub p_target: f64,
     /// Number of alternatives the mass is spread over: 2 for binary markets.
     pub alternatives: usize,
@@ -257,6 +280,9 @@ pub struct TriageAssessment {
 /// one. For two alternatives it reduces to `2 * p - 1`.
 pub fn assess(outcome: &TriageOutcome, policy: TriagePolicy) -> Option<f64> {
     if !outcome.p_evidence.is_finite() || !outcome.p_target.is_finite() {
+        return None;
+    }
+    if matches!(outcome.target, Target::NoAnswer) {
         return None;
     }
     if outcome.p_evidence < policy.min_evidence {
@@ -403,10 +429,14 @@ fn choice_questions(answers: &[TrackedAnswer]) -> AppResult<ChoiceQuery> {
     let alternatives = answers
         .iter()
         .map(|answer| (answer.text.clone(), None::<Value>))
+        .chain(std::iter::once((NONE_ALTERNATIVE.to_owned(), None::<Value>)))
         .collect::<Vec<_>>();
 
     Ok(ChoiceQuestions {
-        is_evidence: Noul::new(EVIDENCE_INSTRUCTIONS)?.criteria(EVIDENCE_YES, EVIDENCE_NO)?,
+        is_evidence: Noul::new(EVIDENCE_INSTRUCTIONS_CHOICES)?.criteria(
+            EVIDENCE_YES,
+            EVIDENCE_NO,
+        )?,
         supported_answer: Choice::try_from_iter(
             SUPPORTED_ANSWER_INSTRUCTIONS,
             alternatives,
@@ -480,19 +510,41 @@ fn outcome_from_binary(answers: BinaryAnswers) -> TriageOutcome {
 }
 
 fn outcome_from_choice(answers: ChoiceAnswers, tracked: &[TrackedAnswer]) -> AppResult<TriageOutcome> {
-    let supported = answers.supported_answer.choice;
+    let choice = &answers.supported_answer;
+    if choice.choice == NONE_ALTERNATIVE {
+        return Ok(TriageOutcome {
+            p_evidence: answers.is_evidence.noul,
+            // The abstain mass is display-only; `assess` never forms an
+            // impulse for [`Target::NoAnswer`].
+            p_target: choice.probabilities.get(NONE_ALTERNATIVE).copied().unwrap_or(0.0),
+            alternatives: tracked.len() + 1,
+            strength: answers.evidence_strength.score,
+            p_priced: answers.already_priced.noul,
+            target: Target::NoAnswer,
+            cost_usd: None,
+        });
+    }
+
     let answer = tracked
         .iter()
-        .find(|candidate| candidate.text == supported)
-        .ok_or_else(|| anyhow!("triage chose an answer that is not tracked: {supported}"))?;
+        .find(|candidate| candidate.text == choice.choice)
+        .ok_or_else(|| anyhow!("triage chose an answer that is not tracked: {}", choice.choice))?;
+
+    let p_target = choice.probabilities.get(&choice.choice).copied().unwrap_or(0.0);
+    let tracked_mass: f64 = tracked
+        .iter()
+        .filter_map(|candidate| choice.probabilities.get(&candidate.text))
+        .sum();
+    if !tracked_mass.is_finite() || tracked_mass <= 0.0 {
+        bail!(
+            "triage gave no probability mass to tracked answers (mass on `{}` was {p_target})",
+            choice.choice
+        );
+    }
 
     Ok(TriageOutcome {
         p_evidence: answers.is_evidence.noul,
-        p_target: *answers
-            .supported_answer
-            .probabilities
-            .get(&supported)
-            .unwrap_or(&0.0),
+        p_target: (p_target / tracked_mass).clamp(0.0, 1.0),
         alternatives: tracked.len(),
         strength: answers.evidence_strength.score,
         p_priced: answers.already_priced.noul,
@@ -851,6 +903,97 @@ mod tests {
         let tracked = [tracked_answer("a1", "Yes"), tracked_answer("a2", "No")];
         let error = outcome_from_choice(answers, &tracked).expect_err("unknown answer should fail");
         assert!(error.to_string().contains("not tracked"), "{error}");
+    }
+
+    #[test]
+    fn choice_questions_offer_the_abstain_alternative() {
+        let answers = [
+            tracked_answer("a1", "Yes, by June"),
+            tracked_answer("a2", "No, it will not happen"),
+        ];
+        let value = serde_json::to_value(choice_questions(&answers).expect("questions build"))
+            .expect("questions serialize");
+
+        let criteria = value["supported_answer"]["criteria"]
+            .as_object()
+            .expect("choice criteria are a map");
+        assert!(criteria.contains_key(NONE_ALTERNATIVE), "{criteria:?}");
+        assert_eq!(criteria.len(), 3); // 2 tracked answers + the abstain option
+    }
+
+    #[test]
+    fn choice_evidence_question_is_answer_relative() {
+        let answers = [tracked_answer("a1", "Yes"), tracked_answer("a2", "No")];
+        let value = serde_json::to_value(choice_questions(&answers).expect("questions build"))
+            .expect("questions serialize");
+        assert_eq!(
+            value["is_evidence"]["instructions"],
+            EVIDENCE_INSTRUCTIONS_CHOICES
+        );
+
+        let binary = serde_json::to_value(binary_questions().expect("questions build"))
+            .expect("questions serialize");
+        assert_eq!(binary["is_evidence"]["instructions"], EVIDENCE_INSTRUCTIONS);
+    }
+
+    fn choice_answers_with(choice: &str, probabilities: &[(&str, f64)]) -> ChoiceAnswers {
+        ChoiceAnswers {
+            is_evidence: NoulAnswer { noul: 0.95 },
+            supported_answer: ChoiceAnswer {
+                choice: choice.to_owned(),
+                probabilities: probabilities
+                    .iter()
+                    .map(|(text, p)| (text.to_string(), *p))
+                    .collect(),
+                confidence: 0.9,
+            },
+            evidence_strength: ScoreAnswer {
+                score: 3.0,
+                probabilities: Default::default(),
+                confidence: 0.9,
+            },
+            already_priced: NoulAnswer { noul: 0.0 },
+        }
+    }
+
+    #[test]
+    fn an_abstain_choice_is_never_material() {
+        let tracked = [tracked_answer("a1", "Yes"), tracked_answer("a2", "No")];
+        let answers = choice_answers_with(
+            NONE_ALTERNATIVE,
+            &[(NONE_ALTERNATIVE, 0.8), ("Yes", 0.1), ("No", 0.1)],
+        );
+
+        let outcome = outcome_from_choice(answers, &tracked).expect("abstain decodes");
+        assert_eq!(outcome.target, Target::NoAnswer);
+        assert_eq!(assess(&outcome, policy()), None);
+    }
+
+    #[test]
+    fn abstain_mass_does_not_flip_the_direction() {
+        // Track mass 0.5 split evenly, abstain 0.5: renormalized p_target is a
+        // draw, so no impulse — not a maximal negative one for the chosen side.
+        let tracked = [tracked_answer("a1", "Yes"), tracked_answer("a2", "No")];
+        let answers = choice_answers_with(
+            "Yes",
+            &[("Yes", 0.25), ("No", 0.25), (NONE_ALTERNATIVE, 0.5)],
+        );
+
+        let outcome = outcome_from_choice(answers, &tracked).expect("choice decodes");
+        assert!((outcome.p_target - 0.5).abs() < 1e-12, "{:?}", outcome.p_target);
+        assert_eq!(assess(&outcome, policy()), None);
+    }
+
+    #[test]
+    fn zero_mass_on_tracked_answers_is_an_error() {
+        let tracked = [tracked_answer("a1", "Yes"), tracked_answer("a2", "No")];
+        let answers = choice_answers_with(
+            "Yes",
+            &[(NONE_ALTERNATIVE, 1.0), ("Yes", 0.0), ("No", 0.0)],
+        );
+
+        let error = outcome_from_choice(answers, &tracked).expect_err("no mass must fail");
+        assert!(error.to_string().contains("no probability mass"), "{error}");
     }
 
     #[test]

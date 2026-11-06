@@ -525,6 +525,7 @@ impl Pipeline {
         let answer_id = match &outcome.target {
             Target::Answer(id) => Some(id.clone()),
             Target::Binary => None,
+            Target::NoAnswer => None,
         };
         let answer_text = answer_id.as_ref().and_then(|id| {
             answers
@@ -539,6 +540,9 @@ impl Pipeline {
 
         if let Some(scale) = assessment.impulse_scale {
             match &outcome.target {
+                // A `[Target::NoAnswer]` outcome has no scale, so this arm is
+                // unreachable, but the type system still needs it.
+                Target::NoAnswer => {}
                 Target::Binary => match self.apply_to_market(&market, scale, p_market, now) {
                     Ok((applied, after)) => {
                         impulse = applied;
