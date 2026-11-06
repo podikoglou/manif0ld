@@ -28,6 +28,15 @@ pub const STRATEGY_NEWS: &str = "news";
 /// (`SNIPE_POOL_MANA`) and stay visible to the executor and reconciliation.
 pub const STRATEGY_SNIPE: &str = "snipe";
 
+/// Strategy that owns a market entered by S3b smart-money copy-trading
+/// (`docs/ALGO.md` §S3, `docs/SPEC.md` §6.11).
+///
+/// A copy market is discovered from another trader's `global/new-bet`
+/// broadcast, so it has no Sieve rule, no Discord thread, and no operator
+/// budget; its per-market ceiling comes from `COPY_MAX_MANA` and the shared
+/// copy pool, exactly as a snipe row's comes from `SNIPE_MAX_MANA`.
+pub const STRATEGY_COPY: &str = "copy";
+
 /// Lifecycle state of a tracked market.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarketStatus {
@@ -211,6 +220,11 @@ impl TrackedMarket {
     pub fn is_snipe(&self) -> bool {
         self.strategy == STRATEGY_SNIPE
     }
+
+    /// Whether S3b copy-trading owns this market.
+    pub fn is_copy(&self) -> bool {
+        self.strategy == STRATEGY_COPY
+    }
 }
 
 /// A ledger action after a trade decision.
@@ -364,6 +378,55 @@ pub struct SnipeRecord {
     pub cost_usd: Option<f64>,
     pub created_at: i64,
 }
+
+/// A row from `copy_ledger`: one S3b copy evaluation, skip, or exit signal.
+///
+/// Every gate after the watch-list lookup writes a row, so the thresholds
+/// (`COPY_MIN_SIZE`, `COPY_MIN_INFORMED`, `COPY_MIN_EDGE`) are tunable from
+/// measured outcomes. Model outputs are optional: a failed decision call still
+/// records the evaluation with the numbers known so far.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyRecord {
+    pub id: i64,
+    /// Manifold user ID whose bet triggered the evaluation.
+    pub trader_id: String,
+    pub contract_id: MarketId,
+    /// Question text captured at evaluation time; empty when the market was
+    /// skipped before it was described.
+    pub question: String,
+    /// The copied bet (provenance for duplicate detection and auditing).
+    pub bet_id: Option<String>,
+    /// Mana size of the copied bet.
+    pub bet_amount: Option<f64>,
+    /// Market probability before their bet.
+    pub p_before: Option<f64>,
+    /// Market probability after their bet.
+    pub p_after: Option<f64>,
+    /// `is_informed_bet` gate output.
+    pub p_informed: Option<f64>,
+    /// Model fair probability for YES.
+    pub fair_prob: Option<f64>,
+    /// Residual edge in YES space: `fair_prob − p_after`. Negative means the
+    /// only value is on NO.
+    pub gap: Option<f64>,
+    /// `BUY_YES`, `BUY_NO`, `SKIP`, or `EXIT_SIGNAL`.
+    pub action: String,
+    /// Skip reason, follow rationale, or which leg the source trader exited.
+    pub reason: Option<String>,
+    /// Mana committed by this evaluation; zero for a skip or an exit signal.
+    pub mana_amount: f64,
+    /// Manifold bet ID when a bet was placed.
+    pub manifold_bet_id: Option<String>,
+    pub created_at: i64,
+}
+
+/// Actions written by S3b into `copy_ledger`.
+///
+/// Executed fills use the ordinary trade-action names so a
+/// `SUM(mana_amount) ... WHERE action IN (BUY_YES, BUY_NO)` query is the
+/// daily spend, while every refusal and every exit signal has its own marker.
+pub const COPY_ACTION_SKIP: &str = "SKIP";
+pub const COPY_ACTION_EXIT_SIGNAL: &str = "EXIT_SIGNAL";
 
 /// Mana that the market may still deploy: budget, plus realized profit, minus
 /// what is currently invested.

@@ -72,6 +72,27 @@ const DEFAULT_TRADER_REFRESH_MIN: usize = 60;
 /// trader plus three for the candidate universe, so the default covers ~58
 /// traders per pass; the remainder of the watch list keeps its last score.
 const DEFAULT_TRADER_REQUEST_BUDGET: usize = 120;
+/// S3b copy execution is off until its own canary phase is approved.
+const DEFAULT_COPY_ENABLED: bool = false;
+/// Smallest source bet worth considering; below it the bet is noise.
+const DEFAULT_COPY_MIN_SIZE: f64 = 5.0;
+/// Probability that their bet is informed, below which the copy is skipped.
+const DEFAULT_COPY_MIN_INFORMED: f64 = 0.60;
+/// Smallest residual edge after their move that still justifies a copy.
+const DEFAULT_COPY_MIN_EDGE: f64 = 0.05;
+/// Half-Kelly fraction for copy sizing: half of the news fraction, because a
+/// copied trader's move is already reflected in the current price.
+const DEFAULT_COPY_KELLY_FRACTION: f64 = 0.125;
+/// Per-copy cap, clamped to the pool and daily caps at use time.
+const DEFAULT_COPY_MAX_MANA: f64 = 10.0;
+/// Global pool for copy positions, separate from every other strategy.
+const DEFAULT_COPY_POOL_MANA: f64 = 100.0;
+/// Rolling 24-hour deployment cap for copy buys.
+const DEFAULT_COPY_DAILY_MANA: f64 = 30.0;
+/// Largest accepted age of a source bet at evaluation time.
+const DEFAULT_COPY_MAX_AGE_SECS: usize = 30;
+/// Deadline for each of the two copy decision calls.
+const DEFAULT_COPY_DECISION_TIMEOUT_SECS: usize = 2;
 
 /// Runtime configuration for the bot.
 ///
@@ -167,6 +188,29 @@ pub struct Config {
     pub trader_refresh_min: usize,
     /// Hard cap on Manifold requests one refresh may spend, at least 20.
     pub trader_request_budget: usize,
+    /// Enables S3b smart-money copy execution (`docs/ALGO.md` §S3). Off by
+    /// default; with the flag off the executor never evaluates a bet, never
+    /// fetches a market, and never writes a `copy_ledger` row.
+    pub copy_enabled: bool,
+    /// Minimum mana size of a source bet before it may be copied.
+    pub copy_min_size: f64,
+    /// Minimum `is_informed_bet` probability, in `(0, 1)`.
+    pub copy_min_informed: f64,
+    /// Minimum residual edge after the source bet, in `(0, 1)`.
+    pub copy_min_edge: f64,
+    /// Fractional Kelly fraction for copy sizing, in `(0, 0.5]`.
+    pub copy_kelly_fraction: f64,
+    /// Per-copy cap in mana, clamped to the pool and daily caps at use time.
+    pub copy_max_mana: f64,
+    /// Global mana pool for copy positions, separate from every other
+    /// strategy. [`crate::db::Db::copy_pool_invested`] reports what is open.
+    pub copy_pool_mana: f64,
+    /// Rolling 24-hour cap on executed copy buys, in mana.
+    pub copy_daily_mana: f64,
+    /// Largest accepted age of a source bet, in `[1, 300]` seconds.
+    pub copy_max_age_secs: usize,
+    /// Deadline for each copy decision call, in `[1, 30]` seconds.
+    pub copy_decision_timeout_secs: usize,
     pub db_path: PathBuf,
 }
 
@@ -184,6 +228,14 @@ impl Config {
                 snipe_pool_mana = config.snipe_pool_mana,
                 "SNIPE_MAX_MANA exceeds SNIPE_POOL_MANA; the per-snipe cap will be clamped to \
                  the remaining pool at use time"
+            );
+        }
+        if config.copy_max_mana > config.copy_pool_mana {
+            tracing::warn!(
+                copy_max_mana = config.copy_max_mana,
+                copy_pool_mana = config.copy_pool_mana,
+                "COPY_MAX_MANA exceeds COPY_POOL_MANA; the per-copy cap will be clamped to the \
+                 remaining pool at use time"
             );
         }
         Ok(config)
@@ -359,6 +411,55 @@ impl Config {
             );
         }
 
+        let copy_enabled = bool_or(&get, "COPY_ENABLED", DEFAULT_COPY_ENABLED)?;
+        let copy_min_size = f64_or(&get, "COPY_MIN_SIZE", DEFAULT_COPY_MIN_SIZE)?;
+        if copy_min_size < 0.0 || !copy_min_size.is_finite() {
+            bail!(
+                "COPY_MIN_SIZE must be a finite number greater than or equal to 0, got \
+                 {copy_min_size}"
+            );
+        }
+        let copy_min_informed = f64_or(&get, "COPY_MIN_INFORMED", DEFAULT_COPY_MIN_INFORMED)?;
+        if !(copy_min_informed > 0.0 && copy_min_informed < 1.0) {
+            bail!("COPY_MIN_INFORMED must be within (0, 1), got {copy_min_informed}");
+        }
+        let copy_min_edge = f64_or(&get, "COPY_MIN_EDGE", DEFAULT_COPY_MIN_EDGE)?;
+        if !(copy_min_edge > 0.0 && copy_min_edge < 1.0) {
+            bail!("COPY_MIN_EDGE must be within (0, 1), got {copy_min_edge}");
+        }
+        let copy_kelly_fraction =
+            f64_or(&get, "COPY_KELLY_FRACTION", DEFAULT_COPY_KELLY_FRACTION)?;
+        if !(copy_kelly_fraction > 0.0 && copy_kelly_fraction <= 0.5) {
+            bail!("COPY_KELLY_FRACTION must be within (0, 0.5], got {copy_kelly_fraction}");
+        }
+        let copy_max_mana = f64_or(&get, "COPY_MAX_MANA", DEFAULT_COPY_MAX_MANA)?;
+        if copy_max_mana <= 0.0 || !copy_max_mana.is_finite() {
+            bail!("COPY_MAX_MANA must be a finite number greater than 0, got {copy_max_mana}");
+        }
+        let copy_pool_mana = f64_or(&get, "COPY_POOL_MANA", DEFAULT_COPY_POOL_MANA)?;
+        if copy_pool_mana <= 0.0 || !copy_pool_mana.is_finite() {
+            bail!("COPY_POOL_MANA must be a finite number greater than 0, got {copy_pool_mana}");
+        }
+        let copy_daily_mana = f64_or(&get, "COPY_DAILY_MANA", DEFAULT_COPY_DAILY_MANA)?;
+        if copy_daily_mana <= 0.0 || !copy_daily_mana.is_finite() {
+            bail!("COPY_DAILY_MANA must be a finite number greater than 0, got {copy_daily_mana}");
+        }
+        let copy_max_age_secs = usize_or(&get, "COPY_MAX_AGE_SECS", DEFAULT_COPY_MAX_AGE_SECS)?;
+        if !(1..=300).contains(&copy_max_age_secs) {
+            bail!("COPY_MAX_AGE_SECS must be within [1, 300] seconds, got {copy_max_age_secs}");
+        }
+        let copy_decision_timeout_secs = usize_or(
+            &get,
+            "COPY_DECISION_TIMEOUT_SECS",
+            DEFAULT_COPY_DECISION_TIMEOUT_SECS,
+        )?;
+        if !(1..=30).contains(&copy_decision_timeout_secs) {
+            bail!(
+                "COPY_DECISION_TIMEOUT_SECS must be within [1, 30] seconds, got \
+                 {copy_decision_timeout_secs}"
+            );
+        }
+
         let config = Self {
             jetstream_url,
             cloudflare_account_id,
@@ -399,6 +500,16 @@ impl Config {
             trader_min_bets,
             trader_refresh_min,
             trader_request_budget,
+            copy_enabled,
+            copy_min_size,
+            copy_min_informed,
+            copy_min_edge,
+            copy_kelly_fraction,
+            copy_max_mana,
+            copy_pool_mana,
+            copy_daily_mana,
+            copy_max_age_secs,
+            copy_decision_timeout_secs,
             db_path,
         };
 
@@ -608,6 +719,16 @@ mod tests {
         assert_eq!(config.trader_min_bets, 25);
         assert_eq!(config.trader_refresh_min, 60);
         assert_eq!(config.trader_request_budget, 120);
+        assert!(!config.copy_enabled, "copy execution must default to off");
+        assert_eq!(config.copy_min_size, 5.0);
+        assert_eq!(config.copy_min_informed, 0.60);
+        assert_eq!(config.copy_min_edge, 0.05);
+        assert_eq!(config.copy_kelly_fraction, 0.125);
+        assert_eq!(config.copy_max_mana, 10.0);
+        assert_eq!(config.copy_pool_mana, 100.0);
+        assert_eq!(config.copy_daily_mana, 30.0);
+        assert_eq!(config.copy_max_age_secs, 30);
+        assert_eq!(config.copy_decision_timeout_secs, 2);
         assert_eq!(config.db_path, PathBuf::from("./data/manif0ld.db"));
     }
 
@@ -644,6 +765,16 @@ mod tests {
             ("TRADER_MIN_BETS", "10"),
             ("TRADER_REFRESH_MIN", "15"),
             ("TRADER_REQUEST_BUDGET", "40"),
+            ("COPY_ENABLED", "true"),
+            ("COPY_MIN_SIZE", "7.5"),
+            ("COPY_MIN_INFORMED", "0.7"),
+            ("COPY_MIN_EDGE", "0.08"),
+            ("COPY_KELLY_FRACTION", "0.2"),
+            ("COPY_MAX_MANA", "6"),
+            ("COPY_POOL_MANA", "80"),
+            ("COPY_DAILY_MANA", "25"),
+            ("COPY_MAX_AGE_SECS", "45"),
+            ("COPY_DECISION_TIMEOUT_SECS", "4"),
             ("DB_PATH", "/tmp/test.db"),
         ]);
 
@@ -681,6 +812,16 @@ mod tests {
         assert_eq!(config.trader_min_bets, 10);
         assert_eq!(config.trader_refresh_min, 15);
         assert_eq!(config.trader_request_budget, 40);
+        assert!(config.copy_enabled);
+        assert_eq!(config.copy_min_size, 7.5);
+        assert_eq!(config.copy_min_informed, 0.7);
+        assert_eq!(config.copy_min_edge, 0.08);
+        assert_eq!(config.copy_kelly_fraction, 0.2);
+        assert_eq!(config.copy_max_mana, 6.0);
+        assert_eq!(config.copy_pool_mana, 80.0);
+        assert_eq!(config.copy_daily_mana, 25.0);
+        assert_eq!(config.copy_max_age_secs, 45);
+        assert_eq!(config.copy_decision_timeout_secs, 4);
         assert_eq!(config.db_path, PathBuf::from("/tmp/test.db"));
     }
 
@@ -960,6 +1101,85 @@ mod tests {
 
         let error = config_from(&vars).expect_err("malformed flag should fail");
         assert!(error.to_string().contains("TRADERS_ENABLED"), "{error}");
+    }
+
+    #[test]
+    fn rejects_copy_thresholds_outside_their_intervals() {
+        for (key, value) in [
+            ("COPY_MIN_INFORMED", "0"),
+            ("COPY_MIN_INFORMED", "1"),
+            ("COPY_MIN_INFORMED", "NaN"),
+            ("COPY_MIN_EDGE", "0"),
+            ("COPY_MIN_EDGE", "1"),
+            ("COPY_MIN_EDGE", "NaN"),
+            ("COPY_KELLY_FRACTION", "0"),
+            ("COPY_KELLY_FRACTION", "0.51"),
+            ("COPY_KELLY_FRACTION", "NaN"),
+        ] {
+            let mut vars = required_vars();
+            vars.push((key, value));
+
+            let error = config_from(&vars).expect_err("out-of-range copy threshold should fail");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+
+        // The half-open upper bound of the Kelly fraction is valid.
+        let mut vars = required_vars();
+        vars.push(("COPY_KELLY_FRACTION", "0.5"));
+        assert_eq!(
+            config_from(&vars)
+                .expect("half Kelly is valid")
+                .copy_kelly_fraction,
+            0.5
+        );
+    }
+
+    #[test]
+    fn rejects_non_positive_copy_budgets() {
+        for key in ["COPY_MAX_MANA", "COPY_POOL_MANA", "COPY_DAILY_MANA"] {
+            for value in ["0", "-1", "NaN"] {
+                let mut vars = required_vars();
+                vars.push((key, value));
+
+                let error = config_from(&vars).expect_err("non-positive budget should fail");
+                assert!(error.to_string().contains(key), "{error}");
+            }
+        }
+
+        let mut vars = required_vars();
+        vars.push(("COPY_MIN_SIZE", "-1"));
+        let error = config_from(&vars).expect_err("negative minimum size should fail");
+        assert!(error.to_string().contains("COPY_MIN_SIZE"), "{error}");
+    }
+
+    #[test]
+    fn rejects_copy_timing_values_outside_their_bands() {
+        for value in ["0", "301", "-2"] {
+            let mut vars = required_vars();
+            vars.push(("COPY_MAX_AGE_SECS", value));
+
+            let error = config_from(&vars).expect_err("out-of-range age should fail");
+            assert!(error.to_string().contains("COPY_MAX_AGE_SECS"), "{error}");
+        }
+        for value in ["0", "31", "-2"] {
+            let mut vars = required_vars();
+            vars.push(("COPY_DECISION_TIMEOUT_SECS", value));
+
+            let error = config_from(&vars).expect_err("out-of-range timeout should fail");
+            assert!(
+                error.to_string().contains("COPY_DECISION_TIMEOUT_SECS"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_malformed_copy_enabled_flag() {
+        let mut vars = required_vars();
+        vars.push(("COPY_ENABLED", "sometimes"));
+
+        let error = config_from(&vars).expect_err("malformed flag should fail");
+        assert!(error.to_string().contains("COPY_ENABLED"), "{error}");
     }
 
     #[test]

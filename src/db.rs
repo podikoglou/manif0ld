@@ -20,7 +20,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::types::{
-    MarketStatus, SignalRecord, SnipeRecord, TrackedAnswer, TradeRecord, STRATEGY_SNIPE,
+    CopyRecord, MarketStatus, SignalRecord, SnipeRecord, TrackedAnswer, TradeAction, TradeRecord,
+    STRATEGY_COPY, STRATEGY_SNIPE,
 };
 
 const ANSWER_COLUMNS: &str = "id, market_id, text, p_internal_log_odds, p_market_last, \
@@ -35,7 +36,13 @@ const TRADE_COLUMNS: &str = "id, market_id, answer_id, action, mana_amount, shar
 const SNIPE_COLUMNS: &str = "id, contract_id, question, p_initial, p_model, gap, answer, action, \
      reason, mana_amount, limit_prob, manifold_bet_id, cost_usd, created_at";
 
+const COPY_COLUMNS: &str = "id, trader_id, contract_id, question, bet_id, bet_amount, p_before, \
+     p_after, p_informed, fair_prob, gap, action, reason, mana_amount, manifold_bet_id, created_at";
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Rolling window of [`Db::copy_spent_last_24h`], in seconds.
+pub const COPY_SPEND_WINDOW_SECS: i64 = 24 * 60 * 60;
 
 /// Cloneable database handle.
 ///
@@ -328,6 +335,108 @@ impl Db {
             |row| row.get::<_, f64>(0),
         )
         .context("summing invested mana across active snipe markets")
+    }
+
+    // ---------------------------------------------------------------------
+    // Copy evaluation ledger (S3b)
+    // ---------------------------------------------------------------------
+
+    /// Appends one copy-trade evaluation and returns its assigned row ID.
+    ///
+    /// Skips, fills, and exit signals share the table; `action` says which.
+    /// `record.id` is ignored; SQLite assigns the identifier.
+    pub fn insert_copy(&self, record: &CopyRecord) -> AppResult<i64> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO copy_ledger (trader_id, contract_id, question, bet_id, bet_amount, \
+             p_before, p_after, p_informed, fair_prob, gap, action, reason, mana_amount, \
+             manifold_bet_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                record.trader_id,
+                record.contract_id,
+                record.question,
+                record.bet_id,
+                record.bet_amount,
+                record.p_before,
+                record.p_after,
+                record.p_informed,
+                record.fair_prob,
+                record.gap,
+                record.action,
+                record.reason,
+                record.mana_amount,
+                record.manifold_bet_id,
+                record.created_at,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "inserting copy evaluation for contract {} by trader {}",
+                record.contract_id, record.trader_id
+            )
+        })?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Returns the newest copy evaluations, newest first.
+    pub fn recent_copies(&self, limit: usize) -> AppResult<Vec<CopyRecord>> {
+        let limit = limit_to_i64(limit);
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT {COPY_COLUMNS} FROM copy_ledger \
+                 ORDER BY created_at DESC, id DESC LIMIT ?1"
+            ))
+            .context("preparing copy history")?;
+        let rows = statement
+            .query_map(params![limit], copy_from_row)
+            .context("querying copy history")?;
+        collect_rows(rows, "listing copy evaluations")
+    }
+
+    /// Mana currently committed to open S3b copy positions.
+    ///
+    /// Exact semantics: `SUM(invested_mana - realized_pnl_mana)` over every
+    /// `tracked_markets` row where `strategy = 'copy'`, `status = 'ACTIVE'`,
+    /// and `deleted_at IS NULL`. Returns `0.0` when no row matches. The row
+    /// columns are the same per-market truth the executor persists after each
+    /// fill and each exit, so realised profit returns to the pool exactly as
+    /// it does for [`Db::snipe_pool_invested`].
+    pub fn copy_pool_invested(&self) -> AppResult<f64> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COALESCE(SUM(invested_mana - realized_pnl_mana), 0.0) \
+             FROM tracked_markets \
+             WHERE strategy = ?1 AND status = ?2 AND deleted_at IS NULL",
+            params![STRATEGY_COPY, MarketStatus::Active.as_str()],
+            |row| row.get::<_, f64>(0),
+        )
+        .context("summing invested mana across active copy markets")
+    }
+
+    /// Mana spent on executed copy buys in the trailing 24 hours.
+    ///
+    /// Exact semantics: `SUM(mana_amount)` over `copy_ledger` rows whose
+    /// `action` is an executed buy (`BUY_YES` or `BUY_NO`) and whose
+    /// `created_at` is at or after `now - 86400`. Refused copies (`SKIP`) and
+    /// exit signals contribute nothing, so the daily cap counts deployment,
+    /// not decisions, and a closed position does not refund the day's budget
+    /// (that is the point of a daily cap). `now` is a parameter so the window
+    /// is testable without a clock.
+    pub fn copy_spent_last_24h(&self, now: i64) -> AppResult<f64> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COALESCE(SUM(mana_amount), 0.0) FROM copy_ledger \
+             WHERE action IN (?1, ?2) AND created_at >= ?3",
+            params![
+                TradeAction::BuyYes.as_str(),
+                TradeAction::BuyNo.as_str(),
+                now.saturating_sub(COPY_SPEND_WINDOW_SECS),
+            ],
+            |row| row.get::<_, f64>(0),
+        )
+        .context("summing copy spend over the last 24 hours")
     }
 
     // ---------------------------------------------------------------------
@@ -673,8 +782,28 @@ fn snipe_from_row(row: &Row<'_>) -> rusqlite::Result<SnipeRecord> {
     })
 }
 
-fn answer_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedAnswer> {
-    Ok(TrackedAnswer {
+fn copy_from_row(row: &Row<'_>) -> rusqlite::Result<CopyRecord> {
+    Ok(CopyRecord {
+        id: row.get(0)?,
+        trader_id: row.get(1)?,
+        contract_id: row.get(2)?,
+        question: row.get(3)?,
+        bet_id: row.get(4)?,
+        bet_amount: row.get(5)?,
+        p_before: row.get(6)?,
+        p_after: row.get(7)?,
+        p_informed: row.get(8)?,
+        fair_prob: row.get(9)?,
+        gap: row.get(10)?,
+        action: row.get(11)?,
+        reason: row.get(12)?,
+        mana_amount: row.get(13)?,
+        manifold_bet_id: row.get(14)?,
+        created_at: row.get(15)?,
+    })
+}
+
+fn answer_from_row(row: &Row<'_>) -> rusqlite::Result<TrackedAnswer> {    Ok(TrackedAnswer {
         id: row.get(0)?,
         market_id: row.get(1)?,
         text: row.get(2)?,
@@ -968,6 +1097,132 @@ mod tests {
         let db = Db::open_in_memory().expect("in-memory DB");
         insert_market_row(&db);
         assert_eq!(db.snipe_pool_invested().expect("pool total"), 0.0);
+    }
+
+    fn sample_copy(bet_id: &str, action: &str, mana: f64, created_at: i64) -> CopyRecord {
+        CopyRecord {
+            id: 0,
+            trader_id: "trader-1".to_owned(),
+            contract_id: "m1".to_owned(),
+            question: "Question m1?".to_owned(),
+            bet_id: Some(bet_id.to_owned()),
+            bet_amount: Some(20.0),
+            p_before: Some(0.40),
+            p_after: Some(0.44),
+            p_informed: Some(0.78),
+            fair_prob: Some(0.52),
+            gap: Some(0.08),
+            action: action.to_owned(),
+            reason: Some("informed 0.78".to_owned()),
+            mana_amount: mana,
+            manifold_bet_id: Some(format!("bet-{bet_id}")),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn copy_ledger_roundtrips_and_lists_newest_first() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let first = db
+            .insert_copy(&sample_copy("b1", "BUY_YES", 4.0, 100))
+            .expect("insert first");
+        let second = db
+            .insert_copy(&sample_copy("b2", "SKIP", 0.0, 200))
+            .expect("insert second");
+        assert!(second > first);
+
+        let rows = db.recent_copies(10).expect("copy rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, second);
+        assert_eq!(rows[0].bet_id.as_deref(), Some("b2"));
+        assert_eq!(rows[0].action, "SKIP");
+        assert_eq!(rows[0].reason.as_deref(), Some("informed 0.78"));
+        assert_eq!(rows[0].p_informed, Some(0.78));
+        assert_eq!(rows[0].gap, Some(0.08));
+        assert_eq!(rows[1].id, first);
+        assert_eq!(rows[1].mana_amount, 4.0);
+        assert_eq!(rows[1].manifold_bet_id.as_deref(), Some("bet-b1"));
+
+        assert_eq!(db.recent_copies(1).expect("limited").len(), 1);
+    }
+
+    #[test]
+    fn copy_spent_last_24h_counts_executed_buys_inside_the_window() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let now = 1_700_000_000;
+        db.insert_copy(&sample_copy("fresh-yes", "BUY_YES", 10.0, now - 60))
+            .expect("fresh yes");
+        db.insert_copy(&sample_copy("fresh-no", "BUY_NO", 5.0, now - 3_600))
+            .expect("fresh no");
+        // A skip and an exit signal never consume the daily budget.
+        db.insert_copy(&sample_copy("skip", "SKIP", 0.0, now - 60))
+            .expect("skip");
+        db.insert_copy(&sample_copy("exit", "EXIT_SIGNAL", 0.0, now - 60))
+            .expect("exit");
+        // An old fill falls out of the rolling window.
+        db.insert_copy(&sample_copy(
+            "old",
+            "BUY_YES",
+            40.0,
+            now - COPY_SPEND_WINDOW_SECS - 1,
+        ))
+        .expect("old");
+        // The boundary is inclusive: exactly 24 h ago is still inside.
+        db.insert_copy(&sample_copy(
+            "boundary",
+            "BUY_YES",
+            2.0,
+            now - COPY_SPEND_WINDOW_SECS,
+        ))
+        .expect("boundary");
+
+        assert_eq!(db.copy_spent_last_24h(now).expect("spend"), 17.0);
+        // The window rolls: an hour later both fresh fills are still inside it.
+        assert_eq!(db.copy_spent_last_24h(now + 3_600).expect("spend"), 15.0);
+        // A day later nothing is.
+        assert_eq!(db.copy_spent_last_24h(now + 86_400).expect("spend"), 0.0);
+    }
+
+    #[test]
+    fn copy_pool_invested_sums_open_copy_rows_only() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = crate::market_store::MarketStore::new(&db).expect("store loads");
+        let copy_market = |id: &str, invested: f64, realized: f64| crate::types::TrackedMarket {
+            id: id.to_owned(),
+            slug: format!("slug-{id}"),
+            market_url: String::new(),
+            question: format!("Question {id}?"),
+            description: String::new(),
+            resolution_criteria: String::new(),
+            close_time: None,
+            status: crate::types::MarketStatus::Active,
+            budget_mana: 10.0,
+            invested_mana: invested,
+            realized_pnl_mana: realized,
+            yes_shares: 0.0,
+            no_shares: 0.0,
+            p_internal_log_odds: 0.0,
+            p_market_last: 0.5,
+            belief_updated_at: 1,
+            sieve_source: String::new(),
+            discord_thread_id: String::new(),
+            created_at: 1,
+            deleted_at: None,
+            outcome_type: "BINARY".to_owned(),
+            should_answers_sum_to_one: false,
+            strategy: crate::types::STRATEGY_COPY.to_owned(),
+        };
+
+        store.insert(&copy_market("c1", 8.0, 1.0)).expect("c1");
+        store.insert(&copy_market("c2", 5.0, 0.0)).expect("c2");
+        store.insert(&copy_market("c3", 50.0, 0.0)).expect("c3");
+        store
+            .record_status("c3", crate::types::MarketStatus::Paused)
+            .expect("pause c3");
+        insert_market_row(&db);
+
+        // (8 - 1) + 5 = 12; the paused row and the news row do not count.
+        assert_eq!(db.copy_pool_invested().expect("pool total"), 12.0);
     }
 
     #[test]

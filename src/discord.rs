@@ -47,7 +47,8 @@ use crate::onboarding::{OnboardUpdate, OnboardingDraft, ResearchStep, SieveAttem
 use crate::pipeline::{Pipeline, PipelineEvent};
 use crate::trade::TradeEvent;
 use crate::types::{
-    available_budget, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, STRATEGY_SNIPE,
+    available_budget, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, TradeAction,
+    STRATEGY_COPY, STRATEGY_SNIPE,
 };
 
 /// Maximum number of autocomplete choices Discord accepts.
@@ -1978,6 +1979,7 @@ async fn consume_trade_events(
                 available_budget,
                 bet_id,
                 strategy,
+                p_informed,
             }) => {
                 let channel = channel_for_market(&store, &config, Some(&market_id));
                 let mut embed = CreateEmbed::new()
@@ -1996,16 +1998,31 @@ async fn consume_trade_events(
                         bet_id.unwrap_or_else(|| "(not returned)".to_owned()),
                         true,
                     );
-                // S2 provenance: `p_market` on a snipe entry is the creation
-                // price, so the spread is the gap the snipe traded on. Snipe
-                // rows have no thread; `channel_for_market` already falls back
-                // to the control channel.
+                // Autonomous strategies carry their provenance here.
+                // S2: `p_market` on a snipe entry is the creation price, so
+                // the spread is the gap the snipe traded on. S3b: the
+                // informed-gate probability plus the residual edge the copy
+                // required. Neither row has a thread, so `channel_for_market`
+                // already falls back to the control channel.
                 if strategy == STRATEGY_SNIPE {
                     embed = embed.field(
                         "Strategy",
                         format!("⛏ SNIPE · gap {:+.3}", p_internal - p_market),
                         true,
                     );
+                } else if strategy == STRATEGY_COPY {
+                    // A copy entry renders the informed probability and the
+                    // residual edge of *our* leg; an exit carries no informed
+                    // probability, so it shows the edge only.
+                    let edge = match action {
+                        TradeAction::BuyNo | TradeAction::SellNo => p_market - p_internal,
+                        _ => p_internal - p_market,
+                    };
+                    let detail = match p_informed {
+                        Some(p) => format!("🤝 COPY · informed {p:.2} · edge {edge:+.3}"),
+                        None => format!("🤝 COPY · edge {edge:+.3}"),
+                    };
+                    embed = embed.field("Strategy", detail, true);
                 }
                 send_embed(&http, channel, embed).await;
             }

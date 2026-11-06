@@ -63,6 +63,13 @@ manif0ld/
     ├── triage.rs        # OpenRouter decisions call, question wording, impulse fold
     ├── belief.rs        # log-odds state, decay, impulse
     ├── trade.rs         # Manifold client, Kelly sizing, order manager
+    ├── snipe.rs         # S2 new-market sniper (strategy + snipe ledger)
+    ├── copy.rs          # S3b copy-trader (gated follow + copy ledger)
+    ├── strategy_market.rs # shared market-row builder for autonomous strategies
+    ├── traders.rs       # S3a leaderboard scoring and the shared watch list
+    ├── manifold_ws.rs   # Manifold broadcast websocket client
+    ├── book.rs          # positions, planner, Kelly, execution ladder
+    ├── rate.rs          # global priority token bucket
     ├── onboarding.rs    # fetch market, prepare/activate a draft
     ├── onboarding_agent.rs # research agent: Firecrawl + Sieve submission
     ├── pipeline.rs      # extract → match → triage → belief → trade orchestration
@@ -133,6 +140,18 @@ TRADER_MIN_BETS=25         # activity gate
 TRADER_REFRESH_MIN=60      # [5, 1440]
 TRADER_REQUEST_BUDGET=120  # hard cap per refresh; 3 + 2 per enriched trader
 
+# S3b copy-trading execution (off by default)
+COPY_ENABLED=false
+COPY_MIN_SIZE=5            # minimum source-bet size in mana
+COPY_MIN_INFORMED=0.60     # is_informed_bet gate, (0, 1)
+COPY_MIN_EDGE=0.05         # residual edge after their move, (0, 1)
+COPY_KELLY_FRACTION=0.125  # half-Kelly, (0, 0.5]
+COPY_MAX_MANA=10           # per-copy cap
+COPY_POOL_MANA=100         # global pool for open copy positions
+COPY_DAILY_MANA=30         # rolling 24 h cap on executed copy buys
+COPY_MAX_AGE_SECS=30       # [1, 300] source-bet age bound
+COPY_DECISION_TIMEOUT_SECS=2  # [1, 30] per decision call
+
 # Storage
 DB_PATH=./data/manif0ld.db
 ```
@@ -179,7 +198,7 @@ CREATE TABLE tracked_markets (
   discord_thread_id    TEXT NOT NULL,
   created_at           INTEGER NOT NULL,
   deleted_at           INTEGER,           -- NULL while tracked; set by /untrack
-  strategy             TEXT NOT NULL DEFAULT 'news' -- 'news' | 'snipe'
+  strategy             TEXT NOT NULL DEFAULT 'news' -- 'news' | 'snipe' | 'copy'
 );
 
 CREATE TABLE signal_ledger (
@@ -245,7 +264,7 @@ CREATE TABLE trader_scores (               -- migration 008, S3a watch list
   updated_at       INTEGER NOT NULL
 );
 
-CREATE TABLE copy_ledger (                 -- migration 008, S3b (next task)
+CREATE TABLE copy_ledger (                 -- migration 008, S3b (§6.11)
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   trader_id        TEXT NOT NULL,
   contract_id      TEXT NOT NULL,
@@ -257,7 +276,7 @@ CREATE TABLE copy_ledger (                 -- migration 008, S3b (next task)
   p_informed       REAL,                   -- decision-model gate output
   fair_prob        REAL,
   gap              REAL,
-  action           TEXT NOT NULL,          -- 'COPY' | 'SKIP'
+  action           TEXT NOT NULL,          -- 'BUY_YES' | 'BUY_NO' | 'SKIP' | 'EXIT_SIGNAL'
   reason           TEXT,
   mana_amount      REAL NOT NULL DEFAULT 0,
   manifold_bet_id  TEXT,
@@ -272,7 +291,9 @@ CREATE TABLE copy_ledger (                 -- migration 008, S3b (next task)
 - `deleted_at` describes tracking: `NULL` means the market is tracked. Setting
   it (via `/untrack`) also forces `status = 'CLOSED'`.
 - `strategy` names the component that owns the row: `'news'` for `/track`ed
-  and onboarded markets, `'snipe'` for rows created by S2 new-market sniping.
+  and onboarded markets, `'snipe'` for rows created by S2 new-market sniping,
+  `'copy'` for rows created by S3b copy-trading. Both autonomous strategies
+  hide their rows from operator listings but not from the executor.
   Operator listings (`/status`, autocomplete) show only `'news'`; the trade
   executor and reconciliation keep every active row, and a snipe market has no
   Sieve rule and no Discord thread (its embeds fall back to the control
@@ -917,7 +938,7 @@ the two teardown end states are explicit: `/untrack` hides the row
    same split and naming is used by `/status market`, so the two views never
    disagree; the last field states how many chunks were dropped.
 2. `[SIGNAL]` — author handle + followers, link to Bluesky post, answer (MCQ), evidence / direction / strength / priced probabilities, `P_internal` before → after.
-3. `[TRADE]` — action (BUY_YES / SELL_YES / etc.), amount, shares delta, `P_internal` vs `P_market`, remaining available budget. A snipe trade adds `Strategy: ⛏ SNIPE · gap ±x.xxx` (§6.9).
+3. `[TRADE]` — action (BUY_YES / SELL_YES / etc.), amount, shares delta, `P_internal` vs `P_market`, remaining available budget. A snipe trade adds `Strategy: ⛏ SNIPE · gap ±x.xxx` (§6.9); a copy trade adds `Strategy: 🤝 COPY · informed 0.72 · edge +0.08` (§6.11).
 4. `[ERROR]` — any trade rejection, Manifold API error, LLM call failure, or rate-limit breach.
 
 **Action buttons** on the ONBOARDED embed:
@@ -1052,8 +1073,8 @@ fills apply, exits fire, and `/panic` sweeps them.
 
 **Scope.** This milestone builds and persists the smart-money watch list only.
 Copy execution — the `global/new-bet` trigger, the `is_informed_bet` gate, the
-follow ladder, and `copy_ledger` writes — is the next task; the ledger table
-exists already so the copy strategy needs no schema change.
+follow ladder, and `copy_ledger` writes — is §6.11; the ledger table exists
+already so the copy strategy needs no schema change.
 
 **Endpoints (verified live, 2026-11-06).** All are public; the bot key is sent
 but not required.
@@ -1142,8 +1163,147 @@ previous score; a failed pass logs and waits for the next tick, leaving the
 persisted board usable. The board is trimmed to `TRADER_WATCH_SIZE` by score,
 so unrefreshed members survive until displaced.
 
-## 7. Sieve DSL Reference (for onboarding LLM)
+### 6.11 S3b Copy-Trading (`copy.rs`)
 
+**Trigger.** `global/new-bet` (`ManifoldEvent::Bet`) on the broadcast
+websocket, evaluated inline in the trade executor's loop exactly like S2's
+`global/new-contract` arm. The stream is ~1.3 messages/s platform-wide, but the
+watch-list lookup gates it: only a bet from one of the ~200 scored traders can
+reach REST, two decision calls, or SQLite. Both decision calls are bounded by
+`COPY_DECISION_TIMEOUT_SECS` (default 2 s) and the market fetch by the HTTP
+client timeout, so a stalled model cannot block the price mirror for long.
+Queued bets wait in the never-drop channel.
+
+`CopyStrategy` is constructed only when `COPY_ENABLED=true`; with the flag off
+the executor performs one `Option` check per bet and never fetches, decides, or
+writes.
+
+**Gate order.** Every gate from (e) on writes one `copy_ledger` row with
+`action = 'SKIP'` and a stable reason. Gates (a)–(d) are deliberate exceptions:
+they run on every bet on the platform, so they must not allocate, lock the
+database, or write rows.
+
+| # | Gate | Default | Skip reason / outcome |
+|---|---|---|---|
+| a | `COPY_ENABLED` | `false` | silent `None` |
+| b | not our own bet, not a redemption, not cancelled | — | silent `None` (our own bets go to the maker-fill path) |
+| c | `TraderBoard::lookup(user_id)` hits | — | silent `None` (high-volume path; one short read lock) |
+| d | Bet ID not seen in the bounded 4096-entry ring | — | silent `None` (duplicate delivery of one bet) |
+| e | `now − created_time ≤ COPY_MAX_AGE_SECS` | 30 s | `stale_bet` |
+| f | `is_filled` and `amount ≥ COPY_MIN_SIZE` | 5 | `unfilled_bet`, `below_min_size` |
+| g | Row ownership: no `news` row, no `snipe` row, not soft-deleted, `ACTIVE` | — | `news_tracked`, `snipe_tracked`, `market_untracked`, `market_closed` |
+| g | Same-direction position already held on the row | — | `already_positioned` |
+| g | One Discovery token, then `GET /v0/market/{id}`; mechanism ∈ CPMM | — | `rate_limited`, `market_fetch_failed: …`, `resolved`, `unsupported_mechanism` |
+| h | `outcomeType == BINARY` | — | `mcq_not_supported`, `unsupported_outcome_type` |
+| i | `outcome` is `YES`/`NO`; direction = their outcome | — | `unsupported_outcome` |
+| j | `is_informed_bet ≥ COPY_MIN_INFORMED` | 0.60 | `informed_decision_failed: …`, `not_informed` |
+| j | One `fair_prob` call on the post-bet state | — | `fair_prob_failed: …` |
+| j | Residual edge ≥ `COPY_MIN_EDGE` | 0.05 | `small_edge` |
+| k | Pool, daily, and per-copy caps; Kelly target ≥ `MIN_TRADE_SIZE` | — | `pool_exhausted`, `daily_cap`, `cap_below_min_size`, `below_min_size` |
+| l | Insert the row if untracked; return the order | — | — |
+
+A market with no `tracked_markets` row gets one through the shared
+`strategy_market::insert_market_row` (the same construction S2 uses):
+`strategy = 'copy'`, empty Sieve source and thread, `budget_mana = cap`,
+`p_market_last = p_current`, `p_internal_log_odds = logit(p_fair)`,
+`belief_updated_at = now`.
+
+**Residual edge, not move extrapolation.** ALGO §S3 step 4 asks to
+"extrapolate their move". The bot does not invent a number for how much more a
+trader will move a market; it requires model edge that survives the move they
+already made. One REST snapshot (post-bet) and one `fair_prob` call give:
+
+```
+residual_yes = p_fair − p_current
+
+their outcome YES:  edge = residual_yes            = p_fair − p_current
+their outcome NO:   edge = −residual_yes           = (1 − p_fair) − (1 − p_current)
+```
+
+`edge ≥ COPY_MIN_EDGE` is required, so a fully consumed move (`|p_fair −
+p_current|` inside the threshold) is skipped. The signed residual (not the
+direction-flipped edge) is what Kelly sees, with `p_current` as the YES price:
+that is exactly the planner's convention, where a negative edge selects the NO
+formula `λ·|edge| / p_market` and a positive one `λ·edge / (1 − p_market)`.
+
+**Sizing and caps.** One per-market ceiling is computed from three caps:
+
+```
+cap  = min(COPY_MAX_MANA,
+           COPY_POOL_MANA  − Db::copy_pool_invested(),
+           COPY_DAILY_MANA − Db::copy_spent_last_24h(now))
+size = min(cap, kelly_target_mana(residual_yes, p_current, cap, λ))
+skip when size < MIN_TRADE_SIZE
+```
+
+`COPY_KELLY_FRACTION` defaults to `0.125`, half the news default: the source
+move is already in the price, so the remaining edge is smaller and less certain
+than a fresh news edge.
+
+- **Pool accounting.** `copy_pool_invested()` is
+  `SUM(invested_mana − realized_pnl_mana)` over `strategy = 'copy'`,
+  `status = 'ACTIVE'`, `deleted_at IS NULL` rows — the same truth the executor
+  persists after every fill and every exit. Realised profit returns to the
+  pool, and the numbers survive a restart.
+- **Daily cap semantics.** `copy_spent_last_24h(now)` is `SUM(mana_amount)`
+  over `copy_ledger` rows whose `action` is an executed buy (`BUY_YES` or
+  `BUY_NO`) and whose `created_at ≥ now − 86 400`. Refused copies and exit
+  signals never consume it, and closing a position does **not** refund it:
+  the point of a daily cap is to bound new deployment per day.
+- **Concurrency.** The strategy runs inline in the single executor loop, so
+  two copies cannot both read the same pool remainder and both spend it.
+
+The inserted row's `budget_mana` is `cap`, not `size`, so the ordinary
+`budget + realized_pnl − invested` invariant holds. An existing copy row keeps
+its original ceiling: the budget is a per-market cap, not a per-copy one.
+
+**Ledger.** `copy_ledger` records one row per evaluation: `p_before`/`p_after`
+from the source bet, `p_informed` and `fair_prob` from the two decision calls,
+`gap` as the signed YES-space residual, and `bet_id`/`bet_amount` as
+provenance. A filled copy uses the ordinary action names (`BUY_YES`,
+`BUY_NO`) with the real `mana_amount` and `manifold_bet_id` from
+`trade_ledger`; a control-plane refusal or zero fill writes `SKIP` with reason
+`unfilled: …`.
+
+**Deviations from ALGO §S3, and why.**
+
+1. **No `p_fair_est` extrapolation.** The residual model edge described above
+   replaces a fabricated "how much further" estimate. It is measurable with one
+   decision call and cannot follow a fully consumed move.
+2. **Binary markets only.** Multiple-choice copying needs per-answer semantics
+   (which answer they bought, that answer's residual edge, and interaction with
+   the sum-to-one projection). A multiple-choice trigger is recorded as
+   `mcq_not_supported` so the gap is visible; no guess is traded.
+3. **A configurable latency bound instead of "the same second".** The decision
+   calls, one REST fetch, and the write take 1–3 s in practice, so the honest
+   contract is `COPY_MAX_AGE_SECS` (default 30) rather than an unenforceable
+   one-second promise.
+4. **Exit signals cancel and re-evaluate; they do not force a sale.** ALGO says
+   the copied trader's exit accelerates belief decay. The bot has no
+   per-position source-trader provenance, so the proxy is: a watched trader
+   sells or redeems on a market where a `copy` row holds that leg ⇒ cancel our
+   resting orders there and run one cached evaluation. The normal exit edge
+   check still decides, so a sale is never forced by an exit signal alone.
+5. **Trader exits are only honoured from watched traders.** This keeps the same
+   watch-list gate as entries (a platform-wide exit watcher would need position
+   provenance to be meaningful).
+
+**TTL, duplicates.** The age gate is a trigger filter only: it never expires a
+row, caps a holding period, or cancels an order. The duplicate filter is an
+in-memory 4096-entry ring (about an hour of platform bets), because replayed
+events after a restart are already stopped by the age gate; the first
+evaluation is the ledger record, so a duplicate writes nothing.
+
+**Provenance and visibility.** `trade_ledger.trigger_post_uri` carries the
+source bet ID. The `[TRADE]` embed renders `🤝 COPY · informed 0.72 · edge
++0.08` when `tracked_markets.strategy = 'copy'`; `p_informed` travels on the
+existing `TradeEvent::Trade` variant (no new event). Copy rows are hidden from
+operator listings (`is_news()` filters them, as it does snipe rows) but the
+executor and the reconcile pass treat them like every other active row:
+prices mirror, maker fills apply, exits fire, and `/panic` sweeps them. A
+`news` row the operator owns is never copied onto and never re-owned.
+
+## 7. Sieve DSL Reference (for onboarding LLM)
 Embed the following verbatim in `onboarding.rs` as `SIEVE_SYSTEM_PROMPT`; `onboarding_agent.rs` appends its agent instructions to it at run time. Word content is matched verbatim apart from ASCII case folding; the engine's tokenizer, normalization, and word-boundary behavior are all described in the prompt itself, and must stay in sync with the engine.
 
 ```

@@ -141,6 +141,7 @@ use crate::book::{
     PlannedTrade, Position, Shape, TradePolicy,
 };
 use crate::config::Config;
+use crate::copy::CopyStrategy;
 use crate::db::Db;
 use crate::error::{AppResult, Context, anyhow, bail};
 use crate::manifold_ws::{BetEvent, ContractProbs, ContractStub, ManifoldEvent};
@@ -808,8 +809,28 @@ pub struct MarketSnapshot {
     /// gate reads it; absent on payloads that omit the field.
     #[serde(rename = "totalLiquidity", default)]
     pub total_liquidity: Option<f64>,
+    /// Lifetime traded volume in mana, when the payload carries it. S3b uses
+    /// it as the denominator of `size_vs_volume` when no 24-hour figure is
+    /// present.
+    #[serde(default)]
+    pub volume: Option<f64>,
+    /// Traded volume over the last 24 hours in mana, when present. Preferred
+    /// over [`Self::volume`] as the size denominator: a single bet is a
+    /// meaningful fraction of a day's flow, not of a market's lifetime.
+    #[serde(rename = "volume24Hours", default)]
+    pub volume_24_hours: Option<f64>,
     #[serde(default)]
     pub answers: Option<Vec<MarketAnswerSnapshot>>,
+}
+
+impl MarketSnapshot {
+    /// The liquidity figure a single bet's size is measured against: recent
+    /// volume when the payload reports it, lifetime volume otherwise.
+    pub fn recent_volume(&self) -> Option<f64> {
+        self.volume_24_hours
+            .or(self.volume)
+            .filter(|volume| volume.is_finite() && *volume > 0.0)
+    }
 }
 
 /// One answer from a multiple choice market snapshot.
@@ -1513,9 +1534,14 @@ pub enum TradeEvent {
         /// Budget still deployable after the trade.
         available_budget: f64,
         bet_id: Option<String>,
-        /// [`crate::types::STRATEGY_NEWS`] or [`crate::types::STRATEGY_SNIPE`];
-        /// the Discord renderer marks snipe trades with their own provenance.
+        /// [`crate::types::STRATEGY_NEWS`], [`crate::types::STRATEGY_SNIPE`], or
+        /// [`crate::types::STRATEGY_COPY`]; the Discord renderer marks the
+        /// autonomous strategies with their own provenance.
         strategy: String,
+        /// S3b `is_informed_bet` output for a copy entry; `None` for every
+        /// other trade. Carried here rather than looked up, so the embed has
+        /// the same numbers the decision used.
+        p_informed: Option<f64>,
     },
     /// A trade check or execution failed.
     Error {
@@ -1586,9 +1612,11 @@ pub struct TradeExecutor {
     own_orders: SyncMutex<OwnRestingOrders>,
     /// S2 new-market sniper; `None` when `SNIPE_ENABLED=false`.
     snipe: Option<SnipeStrategy>,
+    /// S3b copy-trader; `None` when `COPY_ENABLED=false`.
+    copy: Option<CopyStrategy>,
     /// The S3 smart-money watch list. Read-mostly shared state: the hourly
-    /// `crate::traders::run` task owns writes, and the copy strategy (next
-    /// task) reads it through [`TradeExecutor::trader_board`] on every
+    /// `crate::traders::run` task owns writes, and the copy strategy
+    /// ([`TradeExecutor::copy`]) reads it through the same `Arc` on every
     /// `global/new-bet` event.
     trader_board: Arc<TraderBoard>,
     events: broadcast::Sender<TradeEvent>,
@@ -1621,6 +1649,23 @@ impl TradeExecutor {
             None
         };
 
+        // S3b is constructed only when enabled: with the flag off a
+        // platform-wide bet stream costs an `Option` check and nothing else.
+        let copy = if config.copy_enabled {
+            Some(
+                CopyStrategy::new(
+                    config,
+                    db.clone(),
+                    Arc::clone(&store),
+                    client.clone(),
+                    Arc::clone(&trader_board),
+                )
+                .context("initializing the S3b copy-trader")?,
+            )
+        } else {
+            None
+        };
+
         let executor = Self {
             client,
             db,
@@ -1639,6 +1684,7 @@ impl TradeExecutor {
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             own_orders: SyncMutex::new(OwnRestingOrders::default()),
             snipe,
+            copy,
             trader_board,
             events,
         };
@@ -1739,8 +1785,8 @@ impl TradeExecutor {
         Arc::clone(&self.rate)
     }
 
-    /// The scored S3 watch list. The copy strategy (next task) reads it on
-    /// every `global/new-bet` event; the hourly refresh task writes it.
+    /// The scored S3 watch list. The S3b copy strategy reads it on every
+    /// `global/new-bet` event; the hourly refresh task writes it.
     pub fn trader_board(&self) -> Arc<TraderBoard> {
         Arc::clone(&self.trader_board)
     }
@@ -1895,7 +1941,7 @@ impl TradeExecutor {
             };
 
             book.persist(&self.store, &self.db)?;
-            self.emit_trade(book, &record);
+            self.emit_trade(book, &record, None);
 
             // §S1 ladder, own-order lifecycle: an entry executed in this
             // evaluation invalidates resting orders on the opposite side of
@@ -1940,6 +1986,25 @@ impl TradeExecutor {
         trigger_post_uri: Option<&str>,
         now: i64,
     ) -> AppResult<Option<TradeRecord>> {
+        self.execute_planned_with_provenance(market_id, planned, trigger_post_uri, now, None)
+            .await
+    }
+
+    /// [`TradeExecutor::execute_planned`] with S3b provenance.
+    ///
+    /// `p_informed` is the `is_informed_bet` output for a copy entry. It is
+    /// carried into the [`TradeEvent`] so the `[TRADE]` embed can render
+    /// `🤝 COPY · informed 0.72 · edge +0.08` from the same numbers the
+    /// decision used, without a second lookup and without a second event
+    /// variant.
+    pub(crate) async fn execute_planned_with_provenance(
+        &self,
+        market_id: &str,
+        planned: &PlannedTrade,
+        trigger_post_uri: Option<&str>,
+        now: i64,
+        p_informed: Option<f64>,
+    ) -> AppResult<Option<TradeRecord>> {
         let _guard = self.execution_lock.lock().await;
 
         let mut book = self.load_book(market_id)?;
@@ -1965,7 +2030,7 @@ impl TradeExecutor {
         };
 
         book.persist(&self.store, &self.db)?;
-        self.emit_trade(&book, &record);
+        self.emit_trade(&book, &record, p_informed);
 
         // Same own-order lifecycle rule as `decide`: an entry on this leg
         // invalidates a resting order on the opposite outcome.
@@ -2038,6 +2103,78 @@ impl TradeExecutor {
             }
             Err(error) => {
                 snipe.record_unfilled(&order, &format!("execution error: {error}"))?;
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Evaluates and executes one `global/new-bet` broadcast (S3b).
+    ///
+    /// Runs inline in the event loop, exactly like [`Self::handle_new_contract`]:
+    /// the watch-list lookup keeps the expensive path rare (a few bets/hour
+    /// from ~200 watched traders out of ~1.3 messages/s), and both decision
+    /// calls are bounded by `COPY_DECISION_TIMEOUT_SECS`, the market fetch by
+    /// the HTTP client timeout. Queued bets wait in the never-drop channel.
+    ///
+    /// Their exit is handled first: a sale or redemption from a watched trader
+    /// on a market where a `strategy = 'copy'` row holds the same leg cancels
+    /// our resting orders there and runs one cached evaluation. Nothing is
+    /// force-sold — the ordinary edge check decides, and belief decay does the
+    /// rest. A copy entry then goes through
+    /// [`TradeExecutor::execute_planned_with_provenance`], the same executor
+    /// path every other strategy uses.
+    async fn handle_bet(&self, bet: &BetEvent, now: i64) -> AppResult<()> {
+        let Some(copy) = self.copy.as_ref() else {
+            tracing::debug!(
+                contract_id = %bet.contract_id,
+                "bet broadcast; copy-trading is disabled"
+            );
+            return Ok(());
+        };
+
+        if let Some(exit) = copy.exit_signal(bet, now).await? {
+            self.cancel_market_orders(&exit.market_id, "copy_exit").await;
+            if let Err(error) = self
+                .evaluate_cached(&exit.market_id, Some(&exit.bet_id))
+                .await
+            {
+                tracing::error!(
+                    market_id = %exit.market_id,
+                    error = %error,
+                    "evaluation after a copied-trader exit failed"
+                );
+                self.emit_error(Some(exit.market_id), error.to_string());
+            }
+            return Ok(());
+        }
+
+        let Some(order) = copy.on_bet(bet, &self.rate, now).await? else {
+            return Ok(());
+        };
+
+        match self
+            .execute_planned_with_provenance(
+                &order.market_id,
+                &order.planned,
+                Some(&order.trigger),
+                now,
+                Some(order.p_informed),
+            )
+            .await
+        {
+            Ok(Some(record)) => copy.record_filled(&order, &record)?,
+            Ok(None) => {
+                let reason = if self.dry_run {
+                    "dry_run"
+                } else {
+                    "execution refused or nothing filled"
+                };
+                copy.record_unfilled(&order, reason)?;
+            }
+            Err(error) => {
+                copy.record_unfilled(&order, &format!("execution error: {error}"))?;
                 return Err(error);
             }
         }
@@ -2236,7 +2373,7 @@ impl TradeExecutor {
             };
 
             book.persist(&self.store, &self.db)?;
-            self.emit_trade(&book, &record);
+            self.emit_trade(&book, &record, None);
         }
 
         Ok(LiquidationOutcome::Sold)
@@ -2270,8 +2407,10 @@ impl TradeExecutor {
     /// A receiver that is not running yet is normal: the broadcast channel has
     /// no history and events are best-effort. The available budget comes from
     /// the book's aggregate, so it reflects the post-trade position.
-    fn emit_trade(&self, book: &Book, record: &TradeRecord) {
-        let _ = self.events.send(trade_event(&book.market(), record));
+    fn emit_trade(&self, book: &Book, record: &TradeRecord, p_informed: Option<f64>) {
+        let _ = self
+            .events
+            .send(trade_event(&book.market(), record, p_informed));
     }
 
     /// Publishes a trade-loop failure.
@@ -2434,8 +2573,7 @@ impl TradeExecutor {
                                 self.emit_error(Some(market_id), error.to_string());
                             }
                         }
-                        // S2 new-market sniping. S3 (copy-trading) is a later
-                        // phase; its `Bet` event stays parsed but inert below.
+                        // S2 new-market sniping. S3b consumes `Bet` below.
                         Some(ManifoldEvent::NewContract(event)) => {
                             let now = Utc::now().timestamp();
                             if let Err(error) =
@@ -2469,10 +2607,24 @@ impl TradeExecutor {
                                     );
                                 }
                             } else {
-                                tracing::debug!(
-                                    contract_id = %bet.contract_id,
-                                    "bet broadcast; copy-trading is a later phase"
-                                );
+                                // S3b: a watched trader's bet, or a source
+                                // exit on one of our copy positions. Inline
+                                // is deliberate — the watch-list pre-filter
+                                // makes this rare and the decision calls are
+                                // bounded by COPY_DECISION_TIMEOUT_SECS.
+                                let now = Utc::now().timestamp();
+                                if let Err(error) = self.handle_bet(&bet, now).await {
+                                    tracing::error!(
+                                        contract_id = %bet.contract_id,
+                                        bet_id = %bet.id,
+                                        error = %error,
+                                        "copy evaluation or execution failed"
+                                    );
+                                    self.emit_error(
+                                        Some(bet.contract_id.clone()),
+                                        error.to_string(),
+                                    );
+                                }
                             }
                         }
                         // The channel closes only when the socket task is
@@ -3002,7 +3154,7 @@ impl TradeExecutor {
             self.emit_error(Some(bet.contract_id.clone()), message);
         }
 
-        let _ = self.events.send(trade_event(&after, &record));
+        let _ = self.events.send(trade_event(&after, &record, None));
         Ok(())
     }
 
@@ -3510,7 +3662,11 @@ fn is_buy(action: TradeAction) -> bool {
 ///
 /// The available budget is read from the already-updated market snapshot, so it
 /// reflects the post-trade position rather than the size that was requested.
-fn trade_event(market: &TrackedMarket, record: &TradeRecord) -> TradeEvent {
+fn trade_event(
+    market: &TrackedMarket,
+    record: &TradeRecord,
+    p_informed: Option<f64>,
+) -> TradeEvent {
     TradeEvent::Trade {
         market_id: record.market_id.clone(),
         action: record.action,
@@ -3521,6 +3677,7 @@ fn trade_event(market: &TrackedMarket, record: &TradeRecord) -> TradeEvent {
         available_budget: available_budget(market),
         bet_id: record.manifold_bet_id.clone(),
         strategy: market.strategy.clone(),
+        p_informed,
     }
 }
 
@@ -4953,6 +5110,7 @@ mod tests {
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             own_orders: SyncMutex::new(OwnRestingOrders::default()),
             snipe,
+            copy: None,
             trader_board: Arc::new(TraderBoard::empty()),
             events: broadcast::channel(EVENT_CAPACITY).0,
         }
@@ -5340,6 +5498,269 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // S3b: copy-trading through the shared executor
+    // -------------------------------------------------------------------
+
+    /// A copy test harness: a fake Manifold, an in-memory store, a one-trader
+    /// watch list, and an executor whose copy strategy uses scripted decisions.
+    struct CopyHarness {
+        executor: TradeExecutor,
+        db: Db,
+        store: Arc<MarketStore>,
+        manifold: crate::snipe::FakeManifold,
+    }
+
+    async fn copy_harness(fair: f64, informed: f64, market_probability: f64) -> CopyHarness {
+        use crate::copy::{test_config as copy_config, CopyStrategy, ScriptedInformed};
+        use crate::snipe::{binary_market_json, spawn_fake_manifold, ScriptedFairValue};
+        use crate::traders::TraderScore;
+
+        let manifold = spawn_fake_manifold(
+            binary_market_json("Market_copy", market_probability, Some(500.0)),
+            json!({
+                "id": "copy-fill",
+                "amount": 2.0,
+                "shares": 4.0,
+                "isFilled": true
+            }),
+        )
+        .await;
+
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        let board = TraderBoard::empty();
+        board
+            .publish(
+                &db,
+                vec![TraderScore {
+                    user_id: "trader-1".to_owned(),
+                    username: None,
+                    profit_all_time: 5_000.0,
+                    profit_weekly: 500.0,
+                    bet_count: 50,
+                    score: 2.0,
+                    updated_at: 0,
+                }],
+            )
+            .expect("publish board");
+
+        let copy = CopyStrategy::with_seams(
+            &copy_config(),
+            db.clone(),
+            Arc::clone(&store),
+            ManifoldClient::for_test(manifold.base_url.clone()),
+            Arc::new(board),
+            Arc::new(ScriptedFairValue::ok(fair, None)),
+            Arc::new(ScriptedInformed::new(informed)),
+        );
+        let mut executor = offline_executor_with(
+            &db,
+            &store,
+            ManifoldClient::for_test(manifold.base_url.clone()),
+            None,
+        );
+        executor.copy = Some(copy);
+
+        CopyHarness {
+            executor,
+            db,
+            store,
+            manifold,
+        }
+    }
+
+    fn source_bet(id: &str, amount: f64, now: i64) -> BetEvent {
+        BetEvent {
+            id: id.to_owned(),
+            user_id: "trader-1".to_owned(),
+            contract_id: "Market_copy".to_owned(),
+            answer_id: None,
+            outcome: "YES".to_owned(),
+            amount,
+            order_amount: amount,
+            shares: amount * 2.0,
+            prob_before: 0.50,
+            prob_after: 0.55,
+            is_filled: true,
+            limit_prob: None,
+            expires_at: None,
+            is_cancelled: false,
+            is_redemption: false,
+            created_time: now.saturating_mul(1_000),
+            updated_time: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_offline_copy_evaluates_executes_and_writes_both_ledgers() {
+        let harness = copy_harness(0.60, 0.90, 0.50).await;
+        let CopyHarness {
+            executor,
+            db,
+            store,
+            manifold,
+        } = harness;
+        let mut events = executor.events().subscribe();
+        let now = Utc::now().timestamp();
+
+        executor
+            .handle_bet(&source_bet("source-bet", 50.0, now), now)
+            .await
+            .expect("copy evaluation and execution");
+
+        // The shared executor wrote its ordinary ledger row with the source bet
+        // as provenance.
+        let trades = db.recent_trades("Market_copy", 10).expect("trades");
+        assert_eq!(trades.len(), 1, "one fill, one trade row");
+        assert_eq!(trades[0].action, TradeAction::BuyYes);
+        assert_eq!(trades[0].trigger_post_uri.as_deref(), Some("source-bet"));
+        assert_eq!(trades[0].manifold_bet_id.as_deref(), Some("copy-fill"));
+        assert!((trades[0].p_internal - 0.60).abs() < 1e-9);
+
+        // The copy ledger recorded the same fill plus the decision outputs.
+        let copies = db.recent_copies(10).expect("copies");
+        assert_eq!(copies.len(), 1, "one evaluation, one buy row");
+        assert_eq!(copies[0].action, "BUY_YES");
+        assert_eq!(copies[0].trader_id, "trader-1");
+        assert_eq!(copies[0].bet_id.as_deref(), Some("source-bet"));
+        assert_eq!(copies[0].manifold_bet_id.as_deref(), Some("copy-fill"));
+        assert!((copies[0].mana_amount - trades[0].mana_amount).abs() < 1e-9);
+        assert!((copies[0].p_informed.expect("informed") - 0.90).abs() < 1e-9);
+        assert!((copies[0].fair_prob.expect("fair") - 0.60).abs() < 1e-9);
+
+        // The market row is a copy row with the model belief and the cap.
+        let row = store.load("Market_copy").expect("load").expect("tracked");
+        assert!(row.is_copy());
+        assert!((row.p_market_last - 0.50).abs() < 1e-9);
+        assert!((row.p_internal_log_odds - belief::logit(0.60)).abs() < 1e-9);
+        assert!((row.budget_mana - 20.0).abs() < 1e-9);
+
+        // No second position: the leg holds shares and the planner only exits.
+        let book = Book::load(&store, &db, "Market_copy")
+            .expect("load book")
+            .expect("tracked");
+        assert!(book.leg(0).yes_shares > 0.0);
+        let planned = book.plan(now + 1, 4.0, &executor.policy);
+        assert!(
+            !planned.iter().any(|trade| matches!(
+                trade.decision.action,
+                TradeAction::BuyYes | TradeAction::BuyNo
+            )),
+            "the post-fill evaluation must not open a second position: {planned:?}"
+        );
+
+        // Provenance reached the event stream for Discord.
+        match events.try_recv().expect("a trade event") {
+            TradeEvent::Trade {
+                market_id,
+                strategy,
+                p_informed,
+                p_internal,
+                p_market,
+                ..
+            } => {
+                assert_eq!(market_id, "Market_copy");
+                assert_eq!(strategy, crate::types::STRATEGY_COPY);
+                assert_eq!(p_informed, Some(0.90));
+                assert!((p_internal - 0.60).abs() < 1e-9);
+                assert!((p_market - 0.50).abs() < 1e-9);
+            }
+            other => panic!("expected a trade event, got {other:?}"),
+        }
+
+        // One market fetch and one bet call; nothing else.
+        assert_eq!(manifold.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_copy_under_the_kill_switch_writes_one_skip_and_no_trade() {
+        let harness = copy_harness(0.60, 0.90, 0.50).await;
+        let CopyHarness {
+            executor,
+            db,
+            manifold,
+            ..
+        } = harness;
+        db.set_kv(KILL_SWITCH_KEY, "true").expect("kill switch");
+        let now = Utc::now().timestamp();
+
+        executor
+            .handle_bet(&source_bet("source-bet", 50.0, now), now)
+            .await
+            .expect("copy evaluation");
+
+        assert!(db
+            .recent_trades("Market_copy", 10)
+            .expect("trades")
+            .is_empty());
+        let copies = db.recent_copies(10).expect("copies");
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].action, "SKIP");
+        assert!(copies[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("unfilled:"));
+        // Only the market fetch: the refused buy never reached the wire.
+        assert_eq!(manifold.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_copied_trader_exit_cancels_own_orders_and_re_evaluates_once() {
+        let harness = copy_harness(0.60, 0.90, 0.50).await;
+        let CopyHarness {
+            executor,
+            db,
+            store,
+            manifold,
+        } = harness;
+
+        let now = Utc::now().timestamp();
+        let mut held = crate::copy::copy_market_row("Market_copy", 12.0, 0.0);
+        // A fresh, strongly bullish belief: the cached evaluation must find no
+        // exit edge, so the only actor is the source-exit path.
+        held.p_internal_log_odds = belief::logit(0.90);
+        held.belief_updated_at = now;
+        held.budget_mana = 10.0;
+        held.invested_mana = 6.0;
+        store.insert(&held).expect("held copy row");
+
+        let now_ms = Utc::now().timestamp_millis();
+        executor.own_orders().upsert(OwnRestingOrder {
+            bet_id: "rest-copy".to_owned(),
+            market_id: "Market_copy".to_owned(),
+            answer_id: None,
+            outcome: "YES".to_owned(),
+            limit_prob: 0.55,
+            order_amount: 10.0,
+            filled_amount: 0.0,
+            filled_shares: 0.0,
+            created_ms: now_ms - 30_000,
+            expires_ms: Some(now_ms + 30_000),
+        });
+
+        let mut sale = source_bet("source-exit", -5.0, now);
+        sale.shares = -12.0;
+        executor
+            .handle_bet(&sale, now)
+            .await
+            .expect("exit signal");
+
+        // The copy ledger records the signal, and nothing is force-sold: the
+        // cached evaluation runs on a strong belief and produces no trade.
+        let copies = db.recent_copies(10).expect("copies");
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].action, crate::types::COPY_ACTION_EXIT_SIGNAL);
+        assert!(copies[0].reason.as_deref().unwrap_or("").contains("sale"));
+        assert!(db.recent_trades("Market_copy", 10).expect("trades").is_empty());
+        assert!(
+            executor.own_orders().of_market("Market_copy").is_empty(),
+            "the resting order must be cancelled on a source exit"
+        );
+        assert_eq!(manifold.requests(), 1, "one cancel, no evaluation REST");
+    }
+
+    // -------------------------------------------------------------------
     // Live calls. Run with `cargo test -- --ignored --nocapture`
     // -------------------------------------------------------------------
 
@@ -5389,6 +5810,16 @@ mod tests {
         trader_min_bets: 25,
         trader_refresh_min: 60,
         trader_request_budget: 120,
+        copy_enabled: false,
+        copy_min_size: 5.0,
+        copy_min_informed: 0.60,
+        copy_min_edge: 0.05,
+        copy_kelly_fraction: 0.125,
+        copy_max_mana: 10.0,
+        copy_pool_mana: 100.0,
+        copy_daily_mana: 30.0,
+        copy_max_age_secs: 30,
+        copy_decision_timeout_secs: 2,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-mcq-live.db"),
         }
     }
@@ -5568,7 +5999,7 @@ mod tests {
             created_at: 1_700_000_000,
         };
 
-        match trade_event(&market, &record) {
+        match trade_event(&market, &record, None) {
             TradeEvent::Trade {
                 market_id,
                 action,

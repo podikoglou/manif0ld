@@ -40,7 +40,6 @@ use async_trait::async_trait;
 #[cfg(test)]
 use chrono::Utc;
 
-use crate::belief;
 use crate::book::{kelly_target_mana, Book, PlannedTrade, TradeParams};
 use crate::config::Config;
 use crate::db::Db;
@@ -48,11 +47,11 @@ use crate::error::{anyhow, AppResult, Context};
 use crate::manifold_ws::ContractStub;
 use crate::market_store::MarketStore;
 use crate::rate::{Priority, RateLimiter, WRITE_COST_TOKENS};
-use crate::trade::{millis_to_seconds, ManifoldClient, MarketSnapshot};
+use crate::strategy_market::{insert_market_row, resolution_criteria, MarketRow};
+use crate::trade::{millis_to_seconds, ManifoldClient};
 use crate::triage::{FairProb, FairProbInput, TriageClient};
 use crate::types::{
-    MarketId, MarketStatus, SnipeRecord, TrackedAnswer, TrackedMarket, TradeAction, TradeDecision,
-    TradeRecord, STRATEGY_SNIPE,
+    MarketId, SnipeRecord, TradeAction, TradeDecision, TradeRecord, STRATEGY_SNIPE,
 };
 
 /// Types whose outcome model this strategy can price.
@@ -422,14 +421,19 @@ impl SnipeStrategy {
         }
 
         // (i) Insert the snipe market (budget = the per-market cap, not the
-        // actual size) and its answers, mirroring onboarding's row shape.
-        self.track(
-            &snapshot,
-            contract.slug.as_deref().unwrap_or(""),
-            p_initial,
-            fair.p,
-            cap_budget,
-            now,
+        // actual size) and its answers, through the shared row builder.
+        insert_market_row(
+            &self.store,
+            &self.db,
+            MarketRow {
+                snapshot: &snapshot,
+                fallback_slug: contract.slug.as_deref().unwrap_or(""),
+                p_market: p_initial,
+                p_internal: fair.p,
+                budget_mana: cap_budget,
+                strategy: STRATEGY_SNIPE,
+                now,
+            },
         )?;
 
         let book = Book::load(&self.store, &self.db, &snapshot.id)?
@@ -555,84 +559,6 @@ impl SnipeStrategy {
         );
         Ok(None)
     }
-
-    /// Inserts the market row and its answers, mirroring onboarding.
-    fn track(
-        &self,
-        snapshot: &MarketSnapshot,
-        fallback_slug: &str,
-        p_initial: f64,
-        p_model: f64,
-        budget: f64,
-        now: i64,
-    ) -> AppResult<()> {
-        let slug = if snapshot.slug.trim().is_empty() {
-            fallback_slug.to_owned()
-        } else {
-            snapshot.slug.clone()
-        };
-        let market_url = if !snapshot.url.trim().is_empty() {
-            snapshot.url.clone()
-        } else if slug.is_empty() {
-            String::new()
-        } else {
-            format!("https://manifold.markets/{slug}")
-        };
-
-        self.store.insert(&TrackedMarket {
-            id: snapshot.id.clone(),
-            slug,
-            market_url,
-            question: snapshot.question.clone(),
-            description: snapshot.text_description.clone(),
-            resolution_criteria: resolution_criteria(snapshot).to_owned(),
-            close_time: snapshot.close_time_ms.map(millis_to_seconds),
-            status: MarketStatus::Active,
-            budget_mana: budget,
-            invested_mana: 0.0,
-            realized_pnl_mana: 0.0,
-            yes_shares: 0.0,
-            no_shares: 0.0,
-            p_internal_log_odds: belief::logit(p_model),
-            p_market_last: p_initial.clamp(0.01, 0.99),
-            belief_updated_at: now,
-            sieve_source: String::new(),
-            discord_thread_id: String::new(),
-            created_at: now,
-            deleted_at: None,
-            outcome_type: snapshot.outcome_type.clone(),
-            should_answers_sum_to_one: snapshot.should_answers_sum_to_one,
-            strategy: STRATEGY_SNIPE.to_owned(),
-        })?;
-
-        for answer in snapshot.answers.as_deref().unwrap_or(&[]) {
-            let price = answer.probability.unwrap_or(0.5).clamp(0.01, 0.99);
-            self.db.upsert_answer(&TrackedAnswer {
-                id: answer.id.clone(),
-                market_id: snapshot.id.clone(),
-                text: answer.text.clone(),
-                p_internal_log_odds: belief::logit(price),
-                p_market_last: price,
-                belief_updated_at: now,
-                yes_shares: 0.0,
-                no_shares: 0.0,
-                created_at: now,
-                invested_mana: 0.0,
-            })?;
-        }
-
-        Ok(())
-    }
-}
-
-/// The resolution definition used both in the fair-value state and the market
-/// row: explicit criteria when present, description otherwise.
-fn resolution_criteria(snapshot: &MarketSnapshot) -> &str {
-    snapshot
-        .resolution_criteria
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or(&snapshot.text_description)
 }
 
 /// Mutable evaluation context, so each gate records what it already knows.
@@ -842,6 +768,16 @@ pub(crate) fn test_config() -> Config {
         trader_min_bets: 25,
         trader_refresh_min: 60,
         trader_request_budget: 120,
+        copy_enabled: false,
+        copy_min_size: 5.0,
+        copy_min_informed: 0.60,
+        copy_min_edge: 0.05,
+        copy_kelly_fraction: 0.125,
+        copy_max_mana: 10.0,
+        copy_pool_mana: 100.0,
+        copy_daily_mana: 30.0,
+        copy_max_age_secs: 30,
+        copy_decision_timeout_secs: 2,
         db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-snipe-test.db"),
     }
 }
@@ -895,6 +831,7 @@ mod tests {
     use super::*;
 
     use crate::rate::SystemClock;
+    use crate::types::{MarketStatus, TrackedMarket};
 
     fn in_memory() -> (Db, Arc<MarketStore>) {
         let db = Db::open_in_memory().expect("in-memory DB");

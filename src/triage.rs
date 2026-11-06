@@ -95,6 +95,15 @@ const NONE_ALTERNATIVE: &str = "None of the market's answers";
 
 const FAIR_PROB_INSTRUCTIONS: &str = "What is the probability that this market resolves YES?";
 
+const INFORMED_BET_INSTRUCTIONS: &str = "Is this trader's bet on this market likely informed?";
+
+const INFORMED_YES: &str = "The bet reads as informed money: a trader with a measured profit \
+                            edge, a size that is large for this market, placed soon after the \
+                            signal it trades on.";
+
+const INFORMED_NO: &str = "The bet reads as noise: a trader with no measured edge, a size the \
+                           market absorbs without moving, or a pattern consistent with volume \
+                           farming rather than information.";
 const FAIR_ANSWER_INSTRUCTIONS: &str = "Which answer is most likely to win this market?";
 
 const ANSWER_PROBABILITY_INSTRUCTIONS: &str =
@@ -275,6 +284,26 @@ where
     }
 }
 
+/// The one S3b copy-trade question.
+#[derive(Debug, Deserialize, Serialize)]
+struct InformedBetQuestions<I = Noul> {
+    is_informed: I,
+}
+
+impl<I> Query for InformedBetQuestions<I>
+where
+    I: Query,
+{
+    type Response = InformedBetQuestions<I::Response>;
+    type Output = InformedBetQuestions<I::Output>;
+
+    fn decode(&self, response: Self::Response) -> Result<Self::Output, ProviderError> {
+        Ok(InformedBetQuestions {
+            is_informed: self.is_informed.decode(response.is_informed)?,
+        })
+    }
+}
+
 type BinaryQuery = BinaryQuestions<Choice<Polarity>, Score<EvidenceLevel>, Noul, Noul>;
 type BinaryAnswers =
     BinaryQuestions<ChoiceAnswer<Polarity>, ScoreAnswer<EvidenceLevel>, NoulAnswer, NoulAnswer>;
@@ -286,6 +315,39 @@ type FairProbAnswers = FairProbQuestions<ScoreAnswer<ProbabilityDecile>>;
 type FairProbChoiceQuery = FairProbChoiceQuestions<Choice<String>, Score<ProbabilityDecile>>;
 type FairProbChoiceAnswers =
     FairProbChoiceQuestions<ChoiceAnswer<String>, ScoreAnswer<ProbabilityDecile>>;
+type InformedBetQuery = InformedBetQuestions<Noul>;
+type InformedBetAnswers = InformedBetQuestions<NoulAnswer>;
+
+/// Inputs for one S3b informed-bet call.
+///
+/// Exactly the state `docs/ALGO.md` §S3 step 3 names. It deliberately carries
+/// **no posting history, no username, and no per-market profit breakdown**:
+/// the question is whether *this* bet is informed, not who the trader is, and
+/// extra context would only give the model room to rationalise.
+#[derive(Clone, Copy, Debug)]
+pub struct InformedBetInput<'a> {
+    /// The trader's blended leaderboard score (`docs/SPEC.md` §6.10).
+    pub trader_score: f64,
+    /// Trailing-week, deposit-adjusted profit in mana.
+    pub trader_profit_weekly: f64,
+    /// All-time, deposit-adjusted profit in mana.
+    pub trader_profit_all_time: f64,
+    /// Sampled bet count used by the activity gate.
+    pub trader_bet_count: i64,
+    pub question: &'a str,
+    /// Current market probability, in `[0, 1]`.
+    pub market_probability: f64,
+    /// Market volume in mana, when the snapshot carries it.
+    pub volume: Option<f64>,
+    /// Mana size of their bet.
+    pub amount: f64,
+    /// `YES` or `NO`.
+    pub outcome: &'a str,
+    /// Whole seconds between their fill and this evaluation.
+    pub seconds_since: i64,
+    /// `amount / volume`, when volume is known.
+    pub size_vs_volume: Option<f64>,
+}
 
 /// Inputs for one S2 fair-value call.
 ///
@@ -368,6 +430,45 @@ struct FairProbState<'a> {
     creator_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     answers: Vec<&'a str>,
+}
+
+/// State of one S3b informed-bet call.
+///
+/// Only the fields `docs/ALGO.md` §S3 asks for: the trader's three score
+/// numbers and the activity sample, the market question plus a fresh
+/// probability and volume, and the bet's size, side, age, and size relative
+/// to the market. Posting history, usernames, and per-market profit are
+/// absent on purpose.
+#[derive(Debug, Serialize)]
+struct InformedBetState<'a> {
+    trader_stats: TraderStatsState,
+    market: InformedMarketState<'a>,
+    bet: InformedBetDetails<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct TraderStatsState {
+    score: f64,
+    profit_weekly: f64,
+    profit_all_time: f64,
+    bet_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct InformedMarketState<'a> {
+    question: &'a str,
+    market_probability: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct InformedBetDetails<'a> {
+    amount: f64,
+    outcome: &'a str,
+    seconds_since: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_vs_volume: Option<f64>,
 }
 
 /// Which belief the post is about.
@@ -585,6 +686,26 @@ impl TriageClient {
         Ok(fair)
     }
 
+    /// One S3b informed-bet call for a watched trader's `global/new-bet`.
+    ///
+    /// The answer is a single probability in `[0, 1]`: how likely this bet is
+    /// informed money. The copy strategy compares it against
+    /// `COPY_MIN_INFORMED` and skips below it. The deadline is a parameter
+    /// because copy-trading is latency-bound and uses
+    /// `COPY_DECISION_TIMEOUT_SECS` (default 2 s) rather than the triage
+    /// queue's 10 s.
+    pub async fn is_informed_bet(
+        &self,
+        input: &InformedBetInput<'_>,
+        timeout: Duration,
+    ) -> AppResult<f64> {
+        let state = informed_bet_state(input);
+        let result = self
+            .run_with_timeout(&state, informed_bet_questions()?, timeout)
+            .await?;
+        Ok(informed_probability(result.answers.is_informed.noul))
+    }
+
     /// Runs one decisions request with the default hard timeout.
     async fn run<S, Q>(&self, state: &S, questions: Q) -> AppResult<EvaluationResult<Q::Output>>
     where
@@ -673,6 +794,23 @@ fn fair_prob_questions() -> AppResult<FairProbQuery> {
     Ok(FairProbQuestions {
         fair_prob: decile_question(FAIR_PROB_INSTRUCTIONS)?,
     })
+}
+
+fn informed_bet_questions() -> AppResult<InformedBetQuery> {
+    Ok(InformedBetQuestions {
+        is_informed: Noul::new(INFORMED_BET_INSTRUCTIONS)?.criteria(INFORMED_YES, INFORMED_NO)?,
+    })
+}
+
+/// A noul answer is a probability; clamp keeps a slightly out-of-range value
+/// from crossing a threshold it should not, and a non-finite one fails closed
+/// at zero (never copied).
+fn informed_probability(p: f64) -> f64 {
+    if p.is_finite() {
+        p.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn fair_prob_choice_questions(answers: &[String]) -> AppResult<FairProbChoiceQuery> {
@@ -789,8 +927,36 @@ fn fair_prob_state<'a>(input: &FairProbInput<'a>) -> FairProbState<'a> {
     }
 }
 
-fn outcome_from_binary(answers: BinaryAnswers) -> AppResult<TriageOutcome> {
-    let choice = &answers.supports_yes;
+/// Builds the state of one informed-bet call.
+fn informed_bet_state<'a>(input: &InformedBetInput<'a>) -> InformedBetState<'a> {
+    InformedBetState {
+        trader_stats: TraderStatsState {
+            score: finite_or_zero(input.trader_score),
+            profit_weekly: finite_or_zero(input.trader_profit_weekly),
+            profit_all_time: finite_or_zero(input.trader_profit_all_time),
+            bet_count: input.trader_bet_count.max(0),
+        },
+        market: InformedMarketState {
+            question: input.question,
+            market_probability: input.market_probability.clamp(0.0, 1.0),
+            volume: input.volume.filter(|volume| volume.is_finite() && *volume >= 0.0),
+        },
+        bet: InformedBetDetails {
+            amount: finite_or_zero(input.amount).max(0.0),
+            outcome: input.outcome,
+            seconds_since: input.seconds_since.max(0),
+            size_vs_volume: input.size_vs_volume.filter(|value| value.is_finite()),
+        },
+    }
+}
+
+/// Serialises a non-finite number as zero so one malformed statistic cannot
+/// poison the whole state (`serde_json` would otherwise emit `null`).
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn outcome_from_binary(answers: BinaryAnswers) -> AppResult<TriageOutcome> {    let choice = &answers.supports_yes;
     let p_yes = choice.probabilities.get(&Polarity::Yes).copied().ok_or_else(|| {
         anyhow!("triage gave no probability for the Yes outcome; refusing to invent one")
     })?;
@@ -1481,9 +1647,126 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Live calls. Run with `cargo test -- --ignored --nocapture`
+    // S3b informed bet.
     // -------------------------------------------------------------------
 
+    /// Answers as the wire carries them, before typed decoding.
+    type InformedBetResponse = InformedBetQuestions<Answer>;
+
+    fn informed_bet_reply() -> Value {
+        serde_json::json!({"is_informed": {"type": "noul", "noul": 0.72}})
+    }
+
+    fn informed_input<'a>(question: &'a str) -> InformedBetInput<'a> {
+        InformedBetInput {
+            trader_score: 2.5,
+            trader_profit_weekly: 1_200.0,
+            trader_profit_all_time: 9_000.0,
+            trader_bet_count: 25,
+            question,
+            market_probability: 0.44,
+            volume: Some(12_000.0),
+            amount: 250.0,
+            outcome: "YES",
+            seconds_since: 3,
+            size_vs_volume: Some(250.0 / 12_000.0),
+        }
+    }
+
+    #[test]
+    fn decodes_an_informed_bet_reply() {
+        let query = informed_bet_questions().expect("questions build");
+        let answers = query
+            .decode(serde_json::from_value(informed_bet_reply()).expect("reply decodes"))
+            .expect("answers validate");
+        assert!((informed_probability(answers.is_informed.noul) - 0.72).abs() < 1e-12);
+        assert_eq!(
+            serde_json::to_value(&query).expect("questions serialize")["is_informed"]["type"],
+            "noul"
+        );
+    }
+
+    #[test]
+    fn a_missing_informed_key_is_an_error() {
+        let error = serde_json::from_value::<InformedBetResponse>(serde_json::json!({}))
+            .expect_err("a missing question key must fail");
+        assert!(error.to_string().contains("is_informed"), "{error}");
+    }
+
+    #[test]
+    fn informed_probability_is_clamped_to_the_unit_interval() {
+        assert_eq!(informed_probability(-0.4), 0.0);
+        assert_eq!(informed_probability(0.0), 0.0);
+        assert_eq!(informed_probability(0.61), 0.61);
+        assert_eq!(informed_probability(1.4), 1.0);
+        assert_eq!(informed_probability(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn informed_bet_state_carries_only_the_algo_fields() {
+        let input = informed_input("Will the thing happen?");
+        let value = serde_json::to_value(informed_bet_state(&input)).expect("state serializes");
+
+        let object = value.as_object().expect("state is an object");
+        let mut ids = object.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["bet", "market", "trader_stats"]);
+
+        let mut stats = object["trader_stats"]
+            .as_object()
+            .expect("trader stats")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        stats.sort();
+        assert_eq!(
+            stats,
+            ["bet_count", "profit_all_time", "profit_weekly", "score"]
+        );
+
+        let mut market = object["market"]
+            .as_object()
+            .expect("market")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        market.sort();
+        assert_eq!(market, ["market_probability", "question", "volume"]);
+
+        let mut bet = object["bet"].as_object().expect("bet").keys().cloned().collect::<Vec<_>>();
+        bet.sort();
+        assert_eq!(
+            bet,
+            ["amount", "outcome", "seconds_since", "size_vs_volume"]
+        );
+
+        // Not one posting-history or identity field the ALGO question does not
+        // ask for: no handle, no avatar, no per-market split.
+        let text = value.to_string();
+        for forbidden in [
+            "handle", "username", "did", "avatar", "posted_at", "contract_metrics",
+        ] {
+            assert!(!text.contains(forbidden), "unexpected field {forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn informed_bet_state_omits_unknown_volume_and_guards_non_finite_stats() {
+        let input = InformedBetInput {
+            trader_score: f64::NEG_INFINITY,
+            volume: None,
+            size_vs_volume: None,
+            ..informed_input("Will the thing happen?")
+        };
+        let value = serde_json::to_value(informed_bet_state(&input)).expect("state serializes");
+        assert_eq!(value["trader_stats"]["score"], 0.0);
+        assert!(value["market"].get("volume").is_none());
+        assert!(value["bet"].get("size_vs_volume").is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Live calls. Run with `cargo test -- --ignored --nocapture`
+    // -------------------------------------------------------------------
     /// Configuration with placeholder credentials, except the live OpenRouter
     /// key, which the decisions client needs.
     fn live_config() -> Config {
@@ -1533,6 +1816,16 @@ mod tests {
         trader_min_bets: 25,
         trader_refresh_min: 60,
         trader_request_budget: 120,
+        copy_enabled: false,
+        copy_min_size: 5.0,
+        copy_min_informed: 0.60,
+        copy_min_edge: 0.05,
+        copy_kelly_fraction: 0.125,
+        copy_max_mana: 10.0,
+        copy_pool_mana: 100.0,
+        copy_daily_mana: 30.0,
+        copy_max_age_secs: 30,
+        copy_decision_timeout_secs: 2,
             db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-live.db"),
         }
     }
