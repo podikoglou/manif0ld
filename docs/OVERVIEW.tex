@@ -1,4 +1,4 @@
-% Overview of bsky-manifold-arb (Bluesky -> Manifold auto-trader).
+% Overview of manif0ld (Bluesky -> Manifold auto-trader).
 % Written against src/ (main, ingest, extract, sieve, pipeline, triage,
 % belief, trade, discord, onboarding) and docs/SPEC.md.
 % Compile: pdflatex OVERVIEW.tex
@@ -28,7 +28,7 @@
 \begin{document}
 
 \begin{center}
-  {\LARGE\bfseries bsky-manifold-arb}\\[3pt]
+  {\LARGE\bfseries manif0ld}\\[3pt]
   {\large A Bluesky $\to$ Manifold auto-trader --- how it works}\\[3pt]
   {\small One Rust binary, one tokio runtime, one SQLite database. The value is \emph{filtering}: turn the Bluesky firehose into a handful of ``this matters for market $X$'' posts, and trade only on strong edge. Discord is the only control plane.}
 \end{center}
