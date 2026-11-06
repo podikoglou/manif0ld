@@ -209,31 +209,60 @@ pub async fn synthesize(
     )
     .await;
 
-    // The response is intentionally discarded: the agent communicates only
-    // through its tools, and the accepted program is read from the slot.
+    // The agent's own text is ignored, but its error is not: a model request
+    // that fails or stalls is the only explanation for a run that stops
+    // mid-turn, and discarding it left the operator with a generic "stopped
+    // without submitting" and no clue what actually happened.
     tracing::info!(
         market = %market.id,
         max_turns = MAX_AGENT_TURNS,
         "onboarding research agent starting"
     );
-    let _ = agent.prompt(build_sieve_user_prompt(market)).await;
+    let run_error = agent
+        .prompt(build_sieve_user_prompt(market))
+        .await
+        .err();
     tracing::info!(
         market = %market.id,
         submitted = state.submitted().is_some(),
         attempts = state.attempts.load(Ordering::SeqCst),
+        error = run_error.as_ref().map(|error| error_chain(error)),
         "onboarding research agent stopped"
     );
 
     match state.take_submitted() {
         Some(script) => Ok(script),
-        None => match state.last_error() {
-            Some(error) => bail!(
-                "onboarding agent stopped without a compiling Sieve rule. \
-                 Last compiler error:\n{error}"
-            ),
-            None => bail!("onboarding agent stopped without submitting a Sieve rule"),
-        },
+        None => {
+            let compiler_error = state
+                .last_error()
+                .map(|error| format!("\nLast compiler error:\n{error}"))
+                .unwrap_or_default();
+            match run_error {
+                Some(error) => bail!(
+                    "the onboarding agent run failed: {}{compiler_error}",
+                    error_chain(&error)
+                ),
+                None => bail!(
+                    "onboarding agent stopped without submitting a Sieve rule{compiler_error}"
+                ),
+            }
+        }
     }
+}
+
+/// Joins an error and its sources into one line.
+///
+/// `Display` prints only the outermost variant, which for a wrapped provider
+/// failure hides the transport cause (a timeout, a status, a decode error).
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut current = error.source();
+    while let Some(cause) = current {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        current = cause.source();
+    }
+    message
 }
 
 /// Flattens an `anyhow` chain to the message text of its deepest cause.
