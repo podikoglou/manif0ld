@@ -3,9 +3,9 @@
 //! Onboarding has two separated phases so the Discord layer can report progress
 //! and create a thread before anything becomes live:
 //!
-//! 1. [`OnboardingService::prepare`] fetches the market, asks the onboarding
-//!    model for a Sieve rule, and compiles it with retries. It performs no
-//!    writes.
+//! 1. [`OnboardingService::prepare`] fetches the market, runs the research agent
+//!    in [`crate::onboarding_agent`] to write a compiling Sieve rule, and
+//!    validates the rule. It performs no writes.
 //! 2. [`OnboardingService::activate`] persists the draft, registers the compiled
 //!    engine, and refreshes the market cache. Any failure after the database
 //!    insert rolls the new row back.
@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
-use rig::completion::Message;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -28,9 +27,10 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{anyhow, bail, AppResult, Context};
+use crate::onboarding_agent;
 use crate::pipeline::MarketCache;
-use crate::sieve::{self, EngineRegistry};
-use crate::triage::{extract_json_object, snippet, LlmClient};
+use crate::sieve::EngineRegistry;
+use crate::triage::{snippet, LlmClient};
 use crate::types::{MarketStatus, TrackedMarket};
 
 /// Manifold slug lookup endpoint; the slug is appended as a path segment.
@@ -38,9 +38,6 @@ const MANIFOLD_SLUG_URL: &str = "https://api.manifold.markets/v0/slug";
 
 /// Timeout for Manifold lookups.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// LLM attempts allowed for one Sieve program.
-const MAX_SIEVE_ATTEMPTS: usize = 5;
 
 /// System prompt for Sieve synthesis, copied verbatim from the specification.
 pub const SIEVE_SYSTEM_PROMPT: &str = r##"You are an expert filtration engineer writing a program in the Sieve DSL.
@@ -139,38 +136,16 @@ pub struct ManifoldSlugAnswer {
     pub probability: Option<f64>,
 }
 
-/// The LLM's answer to the Sieve synthesis prompt.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct SieveSynthesis {
-    #[serde(default)]
-    pub sieve_program: String,
-}
-
-/// Validation result of one generated Sieve program.
+/// One program submitted to `submit_sieve` by the onboarding agent.
 ///
-/// The compiled engine is consumed before [`Validation`] is produced, so every
-/// variant holds plain `Send` data that may live across an `.await`.
-#[derive(Debug)]
-enum Validation {
-    /// The program parsed and compiled.
-    Compiled(SieveSynthesis),
-    /// Validation failed. `script` is the program, or the raw answer when it
-    /// did not parse; `error` is the parser or compiler message.
-    Failed { script: String, error: String },
-}
-
-/// One program produced by the Sieve synthesis loop and its validation result.
-///
-/// The synthesis loop sends one event per generation; the caller replaces its
-/// previous report with the current one. `error` is `None` when the program
-/// compiled, so a successful attempt still carries the final script.
+/// The agent sends one event per submission; the caller replaces its previous
+/// report with the current one. `error` is `None` when the program compiled, so
+/// a successful attempt still carries the final script.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SieveAttempt {
-    /// 1-based attempt number within the compile loop.
+    /// 1-based submission number within the agent run.
     pub attempt: usize,
-    /// Total attempts allowed before synthesis gives up.
-    pub max_attempts: usize,
-    /// The program the model wrote, or the raw LLM output when it did not parse.
+    /// The complete program the agent submitted.
     pub script: String,
     /// The parser or compiler error, absent when the program compiled.
     pub error: Option<String>,
@@ -185,18 +160,9 @@ pub struct SieveAttempt {
 pub enum OnboardUpdate {
     /// A coarse phase message shown while a slow step runs.
     Phase(String),
-    /// One completed Sieve synthesis attempt: the program and, on failure, its
-    /// validation error.
+    /// One completed Sieve submission: the program and, on failure, its
+    /// compiler error.
     Sieve(SieveAttempt),
-}
-
-impl OnboardUpdate {
-    /// The update to show while waiting for the model's next Sieve answer.
-    fn asking_for_rule(attempt: usize) -> Self {
-        Self::Phase(format!(
-            "Attempt {attempt}/{MAX_SIEVE_ATTEMPTS} — asking the model for a Sieve rule…"
-        ))
-    }
 }
 
 /// A fully resolved market that has not been persisted yet.
@@ -215,6 +181,7 @@ pub struct OnboardingDraft {
 pub struct OnboardingService {
     ai: LlmClient,
     model: String,
+    firecrawl: Arc<firecrawl::Client>,
     db: Db,
     registry: Arc<EngineRegistry>,
     cache: Arc<MarketCache>,
@@ -231,6 +198,10 @@ impl OnboardingService {
         Ok(Self {
             ai: LlmClient::new()?,
             model: config.onboarding_model.clone(),
+            firecrawl: Arc::new(
+                firecrawl::Client::new(&config.firecrawl_api_key)
+                    .context("building the Firecrawl client")?,
+            ),
             db,
             registry,
             cache,
@@ -278,9 +249,7 @@ impl OnboardingService {
             }
         }
 
-        let synthesis = self.synthesize(&market, updates).await?;
-
-        let sieve_source = synthesis.sieve_program;
+        let sieve_source = self.synthesize(&market, updates).await?;
         let tracked = build_market(&market, &slug, budget, initial_prob, sieve_source.clone());
 
         let now = Utc::now().timestamp();
@@ -369,87 +338,26 @@ impl OnboardingService {
             .with_context(|| format!("parsing Manifold market {slug} response"))
     }
 
-    /// Asks the onboarding model for a compileable Sieve rule.
+    /// Runs the research agent for one market and returns its Sieve program.
     ///
-    /// This is an agentic compile loop, not a single generation: the
-    /// conversation grows turn by turn, each model answer followed by a
-    /// validation report (the compiler error, or nothing if it compiled) as
-    /// the next user message. A parse or compile failure costs one attempt.
-    /// After [`MAX_SIEVE_ATTEMPTS`] failures the error includes the last
-    /// compiler (or parser) message and the raw LLM output so the operator can
-    /// see what the model produced. Only parse and compile correctness is
-    /// judged: matching behavior has no ground truth at onboarding time, so no
-    /// synthetic example is ever asserted against.
-    ///
-    /// Every generation is reported on `updates` the moment it is validated, so
-    /// the operator sees the current script and, when it failed, the error, as
-    /// each attempt completes rather than after the last one gives up. A phase
-    /// message marks the wait for the model in between.
+    /// This delegates to [`crate::onboarding_agent::synthesize`], which owns the
+    /// research loop, the Firecrawl tools, and the unbounded `submit_sieve`
+    /// compile loop. The returned program has already compiled, and every
+    /// submission was reported on `updates`.
     async fn synthesize(
         &self,
         market: &ManifoldSlugMarket,
         updates: &mpsc::Sender<OnboardUpdate>,
-    ) -> AppResult<SieveSynthesis> {
-        let mut turns: Vec<Arc<Message>> =
-            vec![Arc::new(Message::user(build_sieve_user_prompt(market)))];
-        let mut last_output = String::new();
-        let mut last_error = String::new();
-
-        for attempt in 1..=MAX_SIEVE_ATTEMPTS {
-            let _ = updates.send(OnboardUpdate::asking_for_rule(attempt)).await;
-            let raw = self
-                .ai
-                .complete_chat(&self.model, SIEVE_SYSTEM_PROMPT, &turns)
-                .await
-                .with_context(|| {
-                    format!(
-                        "synthesizing a Sieve rule with model {} (attempt {attempt} of {MAX_SIEVE_ATTEMPTS})",
-                        self.model
-                    )
-                })?;
-            last_output = raw.clone();
-
-            // Report the current attempt: the extracted program when the answer
-            // parsed, otherwise the raw answer, plus its validation error. A
-            // compiled program is a terminal report with no error.
-            let (script, error) = match validate_synthesis(&raw) {
-                Validation::Compiled(synthesis) => {
-                    let _ = updates
-                        .send(OnboardUpdate::Sieve(SieveAttempt {
-                            attempt,
-                            max_attempts: MAX_SIEVE_ATTEMPTS,
-                            script: synthesis.sieve_program.clone(),
-                            error: None,
-                        }))
-                        .await;
-                    return Ok(synthesis);
-                }
-                Validation::Failed { script, error } => (script, error),
-            };
-            last_error = error.clone();
-            let _ = updates
-                .send(OnboardUpdate::Sieve(SieveAttempt {
-                    attempt,
-                    max_attempts: MAX_SIEVE_ATTEMPTS,
-                    script,
-                    error: Some(error),
-                }))
-                .await;
-
-            // The conversation remembers this answer and the report on it, so
-            // the next prompt only needs the fix request.
-            turns.push(Arc::new(Message::assistant(raw)));
-            turns.push(Arc::new(Message::user(format!(
-                "Your previous answer failed validation.\n\
-                 Error: {last_error}\n\
-                 Respond with corrected JSON only."
-            ))));
-        }
-
-        bail!(
-            "Sieve rule synthesis failed after {MAX_SIEVE_ATTEMPTS} attempts: {last_error}\n\
-             Last LLM output:\n{last_output}"
+    ) -> AppResult<String> {
+        let model = self.ai.completion_model(&self.model)?;
+        onboarding_agent::synthesize(
+            model,
+            Arc::clone(&self.firecrawl),
+            market,
+            updates,
         )
+        .await
+        .with_context(|| format!("synthesizing a Sieve rule with model {}", self.model))
     }
 }
 
@@ -512,10 +420,11 @@ pub fn validate_market(market: &ManifoldSlugMarket) -> AppResult<()> {
     Ok(())
 }
 
-/// Builds the user message for Sieve synthesis.
+/// Builds the user message for the onboarding research agent.
 ///
-/// The response-shape instruction lives here rather than in
-/// [`SIEVE_SYSTEM_PROMPT`] so the DSL reference stays verbatim.
+/// The agent instructions live in
+/// [`crate::onboarding_agent::AGENT_INSTRUCTIONS`] so the DSL reference in
+/// [`SIEVE_SYSTEM_PROMPT`] stays verbatim.
 pub fn build_sieve_user_prompt(market: &ManifoldSlugMarket) -> String {
     let close_time = market
         .close_time_ms
@@ -552,49 +461,11 @@ Market description: {description}
 Resolution criteria: {resolution}
 Market close time: {close_time}
 
-Write one Sieve program that matches posts plausibly related to this market.
-Respond as JSON only, using exactly this shape:
-{{
-  "sieve_program": "match Market_{id} {{ ... }}"
-}}"#,
+Research this market, then write and submit one Sieve program."#,
         id = market.id,
         question = market.question,
         answers_section = answers_section,
     )
-}
-
-/// Parses a synthesis answer into its Sieve program.
-pub fn parse_sieve_synthesis(raw: &str) -> AppResult<SieveSynthesis> {
-    let value = extract_json_object(raw).context("parsing Sieve synthesis response")?;
-    let synthesis: SieveSynthesis =
-        serde_json::from_value(value).context("parsing Sieve synthesis JSON")?;
-
-    if synthesis.sieve_program.trim().is_empty() {
-        bail!("Sieve synthesis response contained an empty sieve_program");
-    }
-
-    Ok(synthesis)
-}
-
-/// Validates one generated program: parse, then compile.
-///
-/// The compiled engine is dropped before the result is returned, so
-/// [`Validation`] holds only plain `Send` data and its caller can report it
-/// across an `.await`.
-fn validate_synthesis(raw: &str) -> Validation {
-    match parse_sieve_synthesis(raw) {
-        Ok(synthesis) => match sieve::compile(&synthesis.sieve_program) {
-            Ok(_) => Validation::Compiled(synthesis),
-            Err(error) => Validation::Failed {
-                script: synthesis.sieve_program.clone(),
-                error: error.to_string(),
-            },
-        },
-        Err(error) => Validation::Failed {
-            script: raw.to_owned(),
-            error: error.to_string(),
-        },
-    }
 }
 
 /// Builds the tracked-market row for a validated market.
@@ -670,6 +541,7 @@ async fn get_json(http: &Client, url: &str, query: &[(&str, &str)]) -> AppResult
 mod tests {
     use super::*;
     use crate::pipeline::MarketCache;
+    use crate::sieve;
 
     const GOOD_SIEVE: &str = r#"
         @subject = ("bitcoin" | "btc" | *"coin"+);
@@ -734,6 +606,7 @@ mod tests {
         OnboardingService {
             ai: LlmClient::for_test(),
             model: "test-model".to_owned(),
+            firecrawl: Arc::new(firecrawl::Client::new("fc-test").expect("test Firecrawl client")),
             db,
             registry,
             cache,
@@ -763,16 +636,6 @@ mod tests {
         assert!(parse_slug("https://manifold.markets/").is_err());
         assert!(parse_slug("ftp://manifold.markets/Alice/market").is_err());
         assert!(parse_slug("not a url").is_err());
-    }
-
-    #[test]
-    fn asking_for_rule_phase_names_the_attempt_and_total() {
-        assert_eq!(
-            OnboardUpdate::asking_for_rule(2),
-            OnboardUpdate::Phase(
-                "Attempt 2/5 — asking the model for a Sieve rule…".to_owned()
-            )
-        );
     }
 
     #[test]
@@ -819,14 +682,16 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_contains_market_context_and_response_shape() {
+    fn user_prompt_contains_market_context_and_research_instruction() {
         let prompt = build_sieve_user_prompt(&sample_market());
 
         assert!(prompt.contains("Will the Bitcoin ETF launch by Friday?"));
         assert!(prompt.contains("A market about the Bitcoin ETF approval."));
         assert!(prompt.contains("Resolves YES if a spot ETF launches."));
         assert!(prompt.contains("Market close time: 2023-11-14T22:13:20+00:00"));
-        assert!(prompt.contains("\"sieve_program\""));
+        assert!(prompt.contains(
+            "Research this market, then write and submit one Sieve program."
+        ));
         assert!(!prompt.contains("vip"));
     }
 
@@ -844,30 +709,6 @@ mod tests {
             resolution_lines,
             vec!["Resolution criteria: A market about the Bitcoin ETF approval."]
         );
-    }
-
-    #[test]
-    fn parse_synthesis_accepts_plain_fenced_and_prose_wrapped_json() {
-        let json = r#"{"sieve_program": "match Market_test { \"bitcoin\" }"}"#;
-
-        for raw in [
-            json.to_owned(),
-            format!("```json\n{json}\n```"),
-            format!("Here is the program:\n{json}\nDone."),
-        ] {
-            let synthesis = parse_sieve_synthesis(&raw).expect("synthesis JSON should parse");
-            assert_eq!(
-                synthesis.sieve_program,
-                r#"match Market_test { "bitcoin" }"#
-            );
-        }
-    }
-
-    #[test]
-    fn parse_synthesis_rejects_missing_or_empty_program() {
-        assert!(parse_sieve_synthesis(r#"{"other": []}"#).is_err());
-        assert!(parse_sieve_synthesis(r#"{"sieve_program": "   "}"#).is_err());
-        assert!(parse_sieve_synthesis("no json here").is_err());
     }
 
     #[test]

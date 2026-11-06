@@ -83,7 +83,7 @@ const MAX_SIGNAL_LINES: usize = 10;
 /// Onboarding performs Manifold, LLM, and Bluesky lookups with up to three
 /// synthesis attempts, which easily exceeds the 3-second interaction deadline;
 /// the command defers first and reports a timeout followup when hit.
-const ONBOARD_TIMEOUT: Duration = Duration::from_secs(120);
+const ONBOARD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Runtime dependencies shared by the gateway handler and event consumers.
 ///
@@ -764,7 +764,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
                 ctx,
                 interaction,
                 progress_id,
-                "Timed out after 120 seconds.",
+                "Timed out after 600 seconds.",
             )
             .await;
         }
@@ -778,7 +778,7 @@ async fn track(state: &DiscordState, ctx: &Context, interaction: &CommandInterac
             let failed = last_failure.lock().ok().and_then(|last| last.clone());
             let content = match failed {
                 Some(attempt) => {
-                    let header = format!("Failed after {} attempts.", attempt.max_attempts);
+                    let header = "Agent stopped without a compiling rule.".to_owned();
                     sieve_report(&header, &attempt.script, attempt.error.as_deref())
                 }
                 None => {
@@ -1294,12 +1294,12 @@ async fn send_followup(ctx: &Context, interaction: &CommandInteraction, content:
     }
 }
 
-/// Renders one Sieve synthesis report for a message's `content`.
+/// Renders one Sieve submission report for a message's `content`.
 ///
-/// The program the model wrote sits in its own `sieve` block and, when
-/// validation failed, the error sits in a second block below it, so the error
-/// can neither be mistaken for prose nor be read as part of the program. A
-/// report without an error is the compiled candidate. Content stays within
+/// The program the agent submitted sits in its own `sieve` block and, when it
+/// did not compile, the compiler error sits in a second block below it, so the
+/// error can neither be mistaken for prose nor be read as part of the program.
+/// A report without an error is the compiled candidate. Content stays within
 /// Discord's character limit: the script is truncated first, and the error is
 /// bounded too, so both blocks and the closing fences always survive.
 fn sieve_report(header: &str, script: &str, error: Option<&str>) -> String {
@@ -1323,17 +1323,11 @@ fn sieve_report(header: &str, script: &str, error: Option<&str>) -> String {
     format!("{header}\n{opening}{script}{closing}{suffix}")
 }
 
-/// The one-line header of a Sieve synthesis report.
+/// The one-line header of a Sieve submission report.
 fn sieve_header(attempt: &SieveAttempt) -> String {
     match attempt.error {
-        Some(_) => format!(
-            "Attempt {}/{} failed",
-            attempt.attempt, attempt.max_attempts
-        ),
-        None => format!(
-            "Attempt {}/{} compiled",
-            attempt.attempt, attempt.max_attempts
-        ),
+        Some(_) => format!("Attempt {} failed", attempt.attempt),
+        None => format!("Attempt {} compiled", attempt.attempt),
     }
 }
 
@@ -2160,22 +2154,22 @@ mod tests {
         assert_eq!(truncate_chars("anything", 0), "");
     }
 
-    // -- Sieve synthesis report ---------------------------------------------
+    // -- Sieve submission report --------------------------------------------
 
     #[test]
     fn sieve_report_shows_script_and_error_in_separate_blocks() {
         let report = sieve_report(
-            "Attempt 2/5 failed",
+            "Attempt 2 failed",
             "match Market_x { \"unterminated }",
             Some("unterminated string literal at 1:24"),
         );
         assert!(
-            report.starts_with("Attempt 2/5 failed\n```sieve\n"),
+            report.starts_with("Attempt 2 failed\n```sieve\n"),
             "report: {report}"
         );
         assert_eq!(
             report,
-            "Attempt 2/5 failed\n\
+            "Attempt 2 failed\n\
              ```sieve\n\
              match Market_x { \"unterminated }\n\
              ```\n\n\
@@ -2191,13 +2185,13 @@ mod tests {
     #[test]
     fn sieve_report_without_error_shows_only_the_script() {
         let report = sieve_report(
-            "Attempt 3/5 compiled",
+            "Attempt 3 compiled",
             "match Market_x { \"launch\" }",
             None,
         );
         assert_eq!(
             report,
-            "Attempt 3/5 compiled\n```sieve\nmatch Market_x { \"launch\" }\n```",
+            "Attempt 3 compiled\n```sieve\nmatch Market_x { \"launch\" }\n```",
             "report: {report}"
         );
         assert!(!report.contains("Error"));
@@ -2208,7 +2202,7 @@ mod tests {
     fn sieve_report_truncates_long_parts_but_keeps_both_fences() {
         let long_script: String = "x".repeat(3000);
         let long_error: String = "y".repeat(3000);
-        let report = sieve_report("Attempt 1/5 failed", &long_script, Some(&long_error));
+        let report = sieve_report("Attempt 1 failed", &long_script, Some(&long_error));
         assert!(report.chars().count() <= DISCORD_CONTENT_LIMIT);
         assert!(report.contains('…'), "truncation marker missing in: {report}");
         assert_eq!(report.matches("```").count(), 4, "report: {report}");
@@ -2220,17 +2214,16 @@ mod tests {
     fn sieve_header_names_the_attempt_and_outcome() {
         let failed = SieveAttempt {
             attempt: 2,
-            max_attempts: 5,
             script: "x".to_owned(),
             error: Some("boom".to_owned()),
         };
-        assert_eq!(sieve_header(&failed), "Attempt 2/5 failed");
+        assert_eq!(sieve_header(&failed), "Attempt 2 failed");
 
         let compiled = SieveAttempt {
             error: None,
             ..failed
         };
-        assert_eq!(sieve_header(&compiled), "Attempt 2/5 compiled");
+        assert_eq!(sieve_header(&compiled), "Attempt 2 compiled");
     }
 
     #[test]

@@ -36,9 +36,7 @@
 //! 30-second default); the API token is held by the rig provider and never
 //! appears in an error or log line.
 
-use std::sync::Arc;
-
-use rig::completion::{CompletionRequest, Message};
+use rig::completion::CompletionRequest;
 use serde_json::Value;
 
 use crate::config::{parse_model_spec, Config, ModelProvider};
@@ -136,26 +134,6 @@ impl LlmClient {
     /// caller (see [`extract_json_object`]).
     pub async fn complete(&self, model: &str, system: &str, user: &str) -> AppResult<String> {
         let request = CompletionRequest::new(user).preamble(system);
-        self.send(model, request).await
-    }
-
-    /// Sends a multi-turn chat-completion request and returns the assistant text.
-    ///
-    /// `turns` is the conversation so far, newest message last, without the
-    /// system prompt: the request is built as `[system, turns…]`. This is how
-    /// sieve synthesis replays its previous answers and compiler errors as a
-    /// real conversation instead of text appended to one growing user prompt.
-    pub async fn complete_chat(
-        &self,
-        model: &str,
-        system: &str,
-        turns: &[Arc<Message>],
-    ) -> AppResult<String> {
-        let (prompt, prior) = match turns.split_last() {
-            Some((prompt, prior)) => (prompt.clone(), prior.to_vec()),
-            None => (Arc::new(Message::user("Continue.")), Vec::new()),
-        };
-        let request = CompletionRequest::new(prompt).preamble(system).messages(prior);
         self.send(model, request).await
     }
 

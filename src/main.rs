@@ -20,6 +20,7 @@ mod error;
 mod extract;
 mod ingest;
 mod onboarding;
+mod onboarding_agent;
 mod pipeline;
 mod sieve;
 mod trade;
