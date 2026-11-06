@@ -434,7 +434,14 @@ pub fn apply_scaled(
 
 ### 6.6 Trade Execution (`trade.rs`)
 
-**Sizing** (fractional Kelly, λ = `KELLY_FRACTION`, capped at 50% of available budget):
+**Market kinds.** `tracked_markets.outcome_type` is `BINARY` or
+`MULTIPLE_CHOICE` and is refreshed from `GET /v0/market/{id}` on every
+evaluation. A multiple-choice market trades one position per `market_answers`
+row; `should_answers_sum_to_one` records whether the answers compete for one
+winner (`cpmm-multi-1`) or are independent binaries (`cpmm-multi-2`).
+
+**Sizing** (fractional Kelly, λ = `KELLY_FRACTION`, capped at 50% of the
+relevant budget):
 
 ```
 Edge = P_internal − P_market
@@ -449,7 +456,11 @@ TargetMana = f × available_budget
 available_budget = budget_mana + realized_pnl_mana − invested_mana
 ```
 
-**Decision (called after each belief update and on a 60s ticker per active market):**
+For an answer entry the target is additionally capped at
+`MC_MAX_ANSWER_FRACTION × budget_mana`.
+
+**Binary decision (called after each belief update and on a 60s ticker per
+active market):**
 
 ```
 edge = p_internal − p_market
@@ -465,31 +476,83 @@ if no position and edge < −ENTRY_EDGE_THRESHOLD and target_mana >= MIN_TRADE_S
     → BUY_NO(target_mana)
 ```
 
-**No partial positions, no scale-in, no limit orders.** One entry per position lifecycle. Exit is all-or-nothing.
+**Multiple-choice decision (same 60s ticker, same material-signal trigger):**
+
+1. **Sync answers.** New answers are inserted with
+   `p_internal = logit(price)`; existing rows get a price-only update. Belief
+   columns belong to triage and are never overwritten by a sync.
+2. **Sync positions.** One
+   `GET /v0/market/{id}/positions?userId={bot}` call returns a root summary row
+   plus one row per answer. The root row is ignored for accounting and used as
+   a checksum: root invested and share totals must equal the sum of the answer
+   rows, otherwise log `warn!` and trust the answer rows. For an MCQ market
+   `tracked_markets.invested_mana` is the sum of the answer rows.
+3. **Edges.**
+   - Independent (`shouldAnswersSumToOne = false`):
+     `edge_i = p_internal_i − price_i`.
+   - Sum-to-one: `q_i = p_internal_i / Σ p_internal_j`,
+     `edge_i = q_i − price_i`. Edges then sum to zero, so an impulse on one
+     answer creates offsetting negative edges on its rivals.
+4. **Exits first**, all-or-nothing per side:
+   `yes_shares > 0 and edge < EXIT_EDGE_THRESHOLD → SELL_YES`;
+   `no_shares > 0`, independent market, `edge > −EXIT_EDGE_THRESHOLD →
+   SELL_NO`.
+5. **Entries.** Candidates have no position, a price in `[0.02, 0.98]`, and
+   `|edge| ≥ ENTRY_EDGE_THRESHOLD`; they are ordered by `|edge|` descending and
+   sized against the remaining budget. At most `MC_MAX_NEW_PER_TICK` entries per
+   evaluation and `MC_MAX_POSITIONS` open answers per market.
+6. **Sum-to-one markets are YES-only.** A NO leg there is a basket over the
+   field, and Manifold may add internal arbitrage legs on its own. Independent
+   markets allow both sides.
+
+**No partial positions, no scale-in, no limit orders.** One entry per position
+lifecycle. Exit is all-or-nothing.
+
+**Dry run.** `TRADING_DRY_RUN` defaults to `true`. Buys are sent with
+`"dryRun": true` (simulated fill, no position), sells are only logged, and
+nothing is persisted. The canary phase flips it to `false` with tiny caps.
 
 **Manifold API calls:**
 
 | Action | Endpoint | Body |
 |---|---|---|
-| Buy | `POST /v0/bet` | `{contractId, amount, outcome:"YES"|"NO", limitProb: 0.99 for YES / 0.01 for NO}` |
-| Sell | `POST /v0/market/{id}/sell` | `{outcome:"YES"|"NO", shares: <amount>}` |
-| Position | `GET /v0/bets?contractId={id}&userId={bot_user_id}` (bot ID from `GET /v0/me` at startup) | — |
-| Market | `GET /v0/market/{id}` | — |
+| Buy | `POST /v0/bet` | `{contractId, answerId?, amount, outcome:"YES"\|"NO", limitProb: 0.99 for YES / 0.01 for NO, dryRun?}` |
+| Sell | `POST /v0/market/{id}/sell` | `{answerId?, outcome:"YES"\|"NO", shares: <amount>}`; `answerId` is required on a multiple-choice market |
+| Positions | `GET /v0/market/{id}/positions?userId={bot_user_id}` (bot ID from `GET /v0/me` at startup) | — |
+| Market | `GET /v0/market/{id}` (includes `answers[].probability`) | — |
 
-Using `limitProb=0.99` (YES) / `0.01` (NO) emulates a market buy that fills at the current price, sweeping the AMM if needed. Verify this behavior on a test market before going live.
+Using `limitProb=0.99` (YES) / `0.01` (NO) emulates a market buy that fills at
+the current price, sweeping the AMM if needed.
 
-**Position sync:** Every 60 seconds, fetch `/v0/bets` for each active market; reconcile local `yes_shares`/`no_shares`/`invested_mana` with Manifold's response. If they disagree, trust Manifold and log a `warn!`. This is the only robustness we need against bet failures.
+**Position sync:** Every 60 seconds, `evaluate_market` fetches the market and the
+positions for each active market and reconciles local state. Binary markets use
+the root `ContractMetric`; multiple-choice markets use the per-answer rows with
+the root checksum. If they disagree, trust Manifold and log a `warn!`.
 
-**Ledger:** Every successful bet writes a row to `trade_ledger` and updates `tracked_markets.invested_mana`, `realized_pnl_mana`, `yes_shares`, `no_shares`.
+**Ledger:** Every successful bet writes a row to `trade_ledger`, including
+`answer_id` for a multiple-choice market, and updates
+`tracked_markets.invested_mana`, `realized_pnl_mana`, `yes_shares`, and
+`no_shares`.
 
-**Budget invariant:** Assert `invested_mana <= budget_mana` before every buy. If violated (should be impossible after position sync), reject the trade and alert Discord.
+**Budget invariant:** Assert `invested_mana <= budget_mana + realized_pnl_mana`
+before every buy. If violated (should be impossible after position sync), reject
+the trade and alert Discord. Per-market budgets stay isolated; answers share
+their market's budget.
+
 
 ### 6.7 Onboarding (`onboarding.rs`)
 
 Triggered by `/track url:<url> budget:<mana>`:
 
 1. **Parse slug** from URL's last path segment.
-2. **Fetch market:** `GET https://api.manifold.markets/v0/slug/{slug}`. Verify `outcomeType == "BINARY"` and `isResolved == false`. Extract `{id, question, textDescription, resolutionCriteria?, closeTime, probability, url}`. The canonical `url` is persisted as `tracked_markets.market_url` and shown in the ONBOARDED embed; the bare slug cannot reconstruct it because the creator segment is not part of the slug.
+2. **Fetch market:** `GET https://api.manifold.markets/v0/slug/{slug}`. Verify
+   `outcomeType` is `BINARY` or `MULTIPLE_CHOICE` and `isResolved == false`.
+   Extract `{id, question, textDescription, resolutionCriteria?, closeTime,
+   probability?, url, outcomeType, shouldAnswersSumToOne, answers?}`. For a
+   multiple-choice market every answer is stored with
+   `p_internal = logit(price)`. The canonical `url` is persisted as
+   `tracked_markets.market_url` and shown in the ONBOARDED embed; the bare slug
+   cannot reconstruct it because the creator segment is not part of the slug.
 3. **Onboarding research agent:** `ONBOARDING_MODEL` runs as a `rig` agent in
    `onboarding_agent.rs`. The preamble is `SIEVE_SYSTEM_PROMPT` plus the agent
    instructions, and the model must support tool calling. The agent has four

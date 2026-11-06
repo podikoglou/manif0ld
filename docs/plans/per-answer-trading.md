@@ -382,18 +382,31 @@ belief rows, invested still `0`, invariants clean. **Requires a restart onto the
 new binary.**
 
 
-### Phase 2 — Decision layer, dry-run only
+### Phase 2 — Decision layer, dry-run only — **DONE 2026-11-06**
 
-- `AnswerView`, `plan_actions`, normalization, caps, exits.
-- `evaluate_market` MCQ branch; execution behind `TRADING_DRY_RUN`.
-- `BetResult` accepts a null `id` so the dry-run response parses.
-- Refactor `ManifoldClient` behind an `async_trait ManifoldApi` so the executor
-  can be driven by a fake in tests (the crate already depends on `async-trait`).
-- Log every planned action with `answer`, `edge`, `size`, `reason`.
+Shipped:
 
-Gate: at least 24 hours of dry-run decisions, and **at least one material
-signal** during that window. If triage still produces none, fix the evidence
-gate (Section 12) before continuing — otherwise the wiring is untested.
+- `AnswerView`, `answer_edges`, `plan_actions`: sum-to-one normalization,
+  independent edges, exits first, `|edge|` ordering, Kelly with the per-answer
+  fraction cap, `MC_MAX_NEW_PER_TICK`, `MC_MAX_POSITIONS`, and the
+  `[0.02, 0.98]` price band.
+- `evaluate_market` MCQ branch. `sync_all` now calls only `evaluate_market`, so
+  a tick makes one market and one positions request per market.
+- `TRADING_DRY_RUN` defaults to `true`: buys go to Manifold with
+  `"dryRun": true`, sells are logged, nothing is persisted.
+- `BetResult` accepts the null `id` that a dry run returns.
+- Config keys: `TRADING_DRY_RUN`, `MC_MAX_POSITIONS`, `MC_MAX_NEW_PER_TICK`,
+  `MC_MAX_ANSWER_FRACTION`, with parsing and range tests.
+- Planner table tests (normalization, both sides, exits first, caps, budget
+  share, price band, zero mass) and a live dry-run probe that places a
+  simulated answer bet and asserts no ledger row and no position.
+- Deferred: the `ManifoldApi` trait refactor. The planner is pure and the live
+  probe drives the real client, so the fake-API test has no immediate payoff.
+
+Gate: a window of dry-run decisions that includes **at least one material
+signal**. If triage still produces none, fix the evidence gate (Section 12)
+before the canary; otherwise the execution path stays untested by production
+traffic.
 
 ### Phase 3 — Canary
 
