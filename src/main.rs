@@ -18,6 +18,7 @@ mod discord;
 mod error;
 mod extract;
 mod ingest;
+mod llm;
 mod market_store;
 mod onboarding;
 mod onboarding_agent;

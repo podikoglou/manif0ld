@@ -20,7 +20,7 @@
 //! [`rig::typesafeai::DynamicScoreAnswer`] path; a missing `probabilities` is a
 //! decode error, which fails the call closed rather than inventing a number.
 //!
-//! [`LlmClient`] stays for onboarding, which is still a chat agent run.
+//! The chat transport for onboarding lives in [`crate::llm`]; unused here.
 //!
 //! # From probabilities to a belief impulse
 //!
@@ -43,35 +43,11 @@ use crate::config::{parse_model_spec, Config, ModelProvider};
 use crate::error::{anyhow, bail, AppResult, Context};
 use crate::types::{ExtractedPost, TrackedAnswer, TrackedMarket};
 
-/// Longest response excerpt included in an error message, in bytes.
-pub(crate) const ERROR_SNIPPET_BYTES: usize = 500;
-
 /// OpenRouter's decisions endpoint. Chat completions cannot reach it.
 const DECISIONS_ENDPOINT: &str = "https://openrouter.ai/api/alpha/decisions";
 
 /// Upper bound on one decisions call. Joey answers in tens of milliseconds.
 const DECISIONS_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Upper bound on opening one TCP/TLS connection to an LLM provider.
-const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Longest silence tolerated while an LLM provider answers.
-///
-/// `reqwest` resets this on every successful read, so it bounds a request whose
-/// connection goes quiet, without capping how long a live stream may run.
-/// Observed model turns answer in a few seconds, so this only ever fires on a
-/// dead connection.
-const LLM_READ_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Longest one onboarding model request may run, from connect to last byte.
-///
-/// [`LLM_READ_TIMEOUT`] cannot end a stream that keeps arriving: OpenRouter
-/// holds a queued upstream request open with `: OPENROUTER PROCESSING` comment
-/// lines, and every comment counts as a read and resets that timeout. A stalled
-/// turn then runs with no log line and no error until the whole `/track` run
-/// hits its 600-second wall. This total deadline ends one turn of the research
-/// agent instead.
-const ONBOARDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Expected evidence strength, on the 0-3 rubric, below which a post is noise.
 const MIN_STRENGTH: f64 = 0.5;
@@ -588,186 +564,11 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// Truncates response text to [`ERROR_SNIPPET_BYTES`] without splitting a
-/// character or exceeding the byte budget.
-pub(crate) fn snippet(text: &str) -> String {
-    let text = text.trim();
-    if text.len() <= ERROR_SNIPPET_BYTES {
-        return text.to_owned();
-    }
-    let mut end = ERROR_SNIPPET_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
-}
-
-/// Shared chat client for onboarding, built on rig.
-///
-/// Cloneable so each agent run can hold a handle; the underlying rig clients
-/// share connection pools.
-#[derive(Clone)]
-pub struct LlmClient {
-    cloudflare: Option<rig::providers::openai::OpenAI>,
-    openrouter: Option<rig::providers::openai::OpenAI>,
-}
-
-/// Builds the HTTP transport both chat providers share.
-///
-/// `total` bounds one whole request, including a streamed reply, because a
-/// read timeout cannot end a stream that keeps arriving. Every request rig
-/// sends for an agent turn goes through this transport.
-fn chat_transport(total: Duration) -> AppResult<rig::http_client::ReqwestClient> {
-    let client = rig::rig_reqwest::reqwest::Client::builder()
-        .connect_timeout(LLM_CONNECT_TIMEOUT)
-        .read_timeout(LLM_READ_TIMEOUT)
-        .timeout(total)
-        .build()
-        .context("building the LLM HTTP client")?;
-    Ok(rig::http_client::ReqwestClient::from(client))
-}
-
-impl LlmClient {
-    /// Builds the client from the process environment.
-    ///
-    /// Initializes Cloudflare and/or OpenRouter depending on the credentials
-    /// present in the process environment. Both providers share one transport
-    /// from [`chat_transport`], because the bundled `reqwest` client rig
-    /// defaults to has no request timeout at all.
-    pub fn new() -> AppResult<Self> {
-        let transport = chat_transport(ONBOARDING_REQUEST_TIMEOUT)?;
-
-        let (cloudflare, cf_err) = match rig::providers::openai::OpenAIConfig::from_env_with(
-            &rig::providers::cloudflare::DIALECT,
-        ) {
-            Ok(config) => (Some(config.connect(transport.clone())), None),
-            Err(e) => (None, Some(e)),
-        };
-        let (openrouter, or_err) = match rig::providers::openai::OpenAIConfig::from_env_with(
-            &rig::providers::openai::wire::OPENROUTER,
-        ) {
-            Ok(config) => (Some(config.connect(transport)), None),
-            Err(e) => (None, Some(e)),
-        };
-        if cloudflare.is_none() && openrouter.is_none() {
-            bail!(
-                "failed to initialize LLM client; neither Cloudflare nor OpenRouter credentials were valid \
-                 (Cloudflare: {}; OpenRouter: {})",
-                cf_err.map_or_else(|| "none".to_string(), |e| e.to_string()),
-                or_err.map_or_else(|| "none".to_string(), |e| e.to_string()),
-            );
-        }
-        Ok(Self {
-            cloudflare,
-            openrouter,
-        })
-    }
-
-    /// Builds a `rig` completion model for an agent run.
-    ///
-    /// Onboarding uses this to hand the onboarding model to
-    /// [`rig::AgentBuilder`].
-    pub fn completion_model(
-        &self,
-        raw_model: &str,
-    ) -> AppResult<rig::DynModel<rig::operation::Completion>> {
-        let (provider, model) = parse_model_spec(raw_model)?;
-        let model: rig::DynModel<rig::operation::Completion> = match provider {
-            ModelProvider::Cloudflare => self
-                .cloudflare
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Cloudflare AI Gateway client is not initialized; please set \
-                         CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
-                    )
-                })?
-                .completion(model)
-                .into(),
-            ModelProvider::OpenRouter => self
-                .openrouter
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "OpenRouter client is not initialized; please set OPENROUTER_API_KEY"
-                    )
-                })?
-                .completion(model)
-                .into(),
-            ModelProvider::OpenRouterDecisions => bail!(
-                "model '{raw_model}' uses the OpenRouter decisions endpoint and cannot drive an agent"
-            ),
-        };
-        Ok(model)
-    }
-
-    /// Builds a client with placeholder credentials for unit tests.
-    ///
-    /// No test calls it, so the surrounding environment is never read.
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self {
-            cloudflare: Some(rig::providers::cloudflare::new("test-key")),
-            openrouter: Some(rig::providers::openrouter::new("test-key")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use rig::completion::CompletionRequest;
     use rig::typesafeai::types::Answer;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// A stream that only sends keepalives must fail on the total request
-    /// deadline. OpenRouter holds a queued turn open with `: OPENROUTER
-    /// PROCESSING` comment lines, and every comment is a read that resets the
-    /// read timeout, so silence never arrives for a read timeout to catch.
-    #[test]
-    fn keepalive_stream_ends_on_the_request_deadline() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
-
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .expect("listener binds");
-        let address = listener.local_addr().expect("listener has an address");
-        let server = runtime.spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("connection accepted");
-            let mut buffer = [0u8; 4096];
-            let head = socket.read(&mut buffer).await.expect("request read");
-            assert!(head > 0, "client sent no request bytes");
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
-                .await
-                .expect("headers written");
-            while socket.write_all(b": OPENROUTER PROCESSING\n\n").await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-
-        let config = rig::providers::openai::OpenAIConfig {
-            base_url: format!("http://{address}"),
-            ..rig::providers::openai::OpenAIConfig::with_key(
-                &rig::providers::openai::wire::OPENROUTER,
-                "test-key",
-            )
-        };
-        let transport = chat_transport(Duration::from_millis(200)).expect("transport builds");
-        let model = config.connect(transport).completion("test-model");
-
-        let call = runtime.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                model.call(CompletionRequest::new("hi")),
-            )
-            .await
-        });
-        server.abort();
-        let answer = call.expect("a stalled stream ran past the request deadline");
-        assert!(answer.is_err(), "a stalled stream must fail");
-    }
 
     /// Answers as the wire carries them, before rubric mapping.
     type BinaryResponse = BinaryQuestions<Answer, Answer, Answer, Answer>;
@@ -1132,14 +933,6 @@ mod tests {
 
         let error = outcome_from_choice(answers, &tracked).expect_err("no mass must fail");
         assert!(error.to_string().contains("no probability mass"), "{error}");
-    }
-
-    #[test]
-    fn snippet_truncates_on_a_character_boundary() {
-        let text = "é".repeat(ERROR_SNIPPET_BYTES);
-        let snippet = snippet(&text);
-        assert!(snippet.len() <= ERROR_SNIPPET_BYTES + 3);
-        assert!(snippet.ends_with('…'));
     }
 
     #[test]

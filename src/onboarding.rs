@@ -27,10 +27,10 @@ use crate::belief;
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{anyhow, bail, AppResult, Context};
+use crate::llm::LlmClient;
 use crate::market_store::MarketStore;
 use crate::onboarding_agent;
 use crate::sieve::EngineRegistry;
-use crate::triage::{snippet, LlmClient};
 use crate::types::{MarketStatus, TrackedMarket};
 
 /// Manifold slug lookup endpoint; the slug is appended as a path segment.
@@ -38,6 +38,9 @@ const MANIFOLD_SLUG_URL: &str = "https://api.manifold.markets/v0/slug";
 
 /// Timeout for Manifold lookups.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Longest response excerpt included in an error message, in bytes.
+const ERROR_SNIPPET_BYTES: usize = 500;
 
 /// System prompt for Sieve synthesis, mirrored in the specification (§7).
 pub const SIEVE_SYSTEM_PROMPT: &str = r##"You are an expert filtration engineer writing a program in the Sieve DSL.
@@ -614,6 +617,20 @@ async fn get_json(http: &Client, url: &str, query: &[(&str, &str)]) -> AppResult
         .with_context(|| format!("parsing JSON from {url}: {}", snippet(&raw)))
 }
 
+/// Truncates response text to [`ERROR_SNIPPET_BYTES`] without splitting a
+/// character or exceeding the byte budget.
+fn snippet(text: &str) -> String {
+    let text = text.trim();
+    if text.len() <= ERROR_SNIPPET_BYTES {
+        return text.to_owned();
+    }
+    let mut end = ERROR_SNIPPET_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,5 +938,13 @@ mod tests {
             store.cached("Market_bad").is_none(),
             "the rolled-back market must leave the cache"
         );
+    }
+
+    #[test]
+    fn snippet_truncates_on_a_character_boundary() {
+        let text = "é".repeat(ERROR_SNIPPET_BYTES);
+        let snippet = snippet(&text);
+        assert!(snippet.len() <= ERROR_SNIPPET_BYTES + 3);
+        assert!(snippet.ends_with('…'));
     }
 }
