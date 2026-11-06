@@ -2573,6 +2573,127 @@ mod tests {
         assert_close(answers[0].probability.expect("price"), 0.6);
     }
 
+    // -------------------------------------------------------------------
+    // Live calls. Run with `cargo test -- --ignored --nocapture`
+    // -------------------------------------------------------------------
+
+    fn live_config() -> Config {
+        dotenvy::dotenv().ok();
+        let key = std::env::var("MANIFOLD_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+            .expect("MANIFOLD_API_KEY must be set for the live probe");
+        Config {
+            jetstream_url: "wss://jetstream2.us-east.bsky.network/subscribe".to_owned(),
+            cloudflare_account_id: None,
+            triage_model: "openrouter-decisions/baseten/joey-1".to_owned(),
+            onboarding_model: "openrouter/anthropic/claude".to_owned(),
+            firecrawl_api_key: "fc-".to_owned(),
+            manifold_api_key: key,
+            discord_bot_token: "d-".to_owned(),
+            discord_guild_id: 1,
+            discord_control_channel_id: 1,
+            discord_operator_user_id: 1,
+            default_market_budget: 100.0,
+            kelly_fraction: 0.25,
+            entry_edge_threshold: 0.05,
+            exit_edge_threshold: 0.01,
+            min_trade_size: 1.0,
+            belief_kappa: 1.1,
+            belief_halflife_hours: 4.0,
+            triage_min_evidence: 0.7,
+            db_path: std::path::PathBuf::from("/tmp/opencode/manif0ld-mcq-live.db"),
+        }
+    }
+
+    fn live_mc_market(id: &str, question: &str) -> TrackedMarket {
+        TrackedMarket {
+            id: id.to_owned(),
+            slug: id.to_owned(),
+            market_url: String::new(),
+            question: question.to_owned(),
+            description: String::new(),
+            resolution_criteria: String::new(),
+            close_time: None,
+            status: MarketStatus::Active,
+            budget_mana: 100.0,
+            invested_mana: 0.0,
+            realized_pnl_mana: 0.0,
+            yes_shares: 0.0,
+            no_shares: 0.0,
+            p_internal_log_odds: 0.0,
+            p_market_last: 0.5,
+            belief_updated_at: 0,
+            sieve_source: String::new(),
+            discord_thread_id: String::new(),
+            created_at: 0,
+            deleted_at: None,
+            outcome_type: "MULTIPLE_CHOICE".to_owned(),
+            should_answers_sum_to_one: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "network call; needs MANIFOLD_API_KEY"]
+    fn live_sync_reads_every_answer_of_both_mechanisms() {
+        let config = live_config();
+        let db = Db::open_in_memory().expect("in-memory DB");
+        db.insert_market(&live_mc_market(
+            "thlctZn5PU",
+            "Israel election: Who will be the next prime minister?",
+        ))
+        .expect("insert sum-to-one market");
+        db.insert_market(&live_mc_market(
+            "hEpuZQpgR2",
+            "US Midterms MEGA Market",
+        ))
+        .expect("insert independent market");
+        let cache = Arc::new(MarketCache::load(&db).expect("cache loads"));
+        let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
+        let executor = runtime
+            .block_on(TradeExecutor::new(&config, db.clone(), Arc::clone(&cache)))
+            .expect("executor builds");
+
+        let sum_to_one = runtime
+            .block_on(executor.sync_market("thlctZn5PU"))
+            .expect("sum-to-one sync");
+        let independent = runtime
+            .block_on(executor.sync_market("hEpuZQpgR2"))
+            .expect("independent sync");
+
+        assert_eq!(sum_to_one.outcome_type, "MULTIPLE_CHOICE");
+        assert!(sum_to_one.should_answers_sum_to_one);
+        assert_eq!(independent.outcome_type, "MULTIPLE_CHOICE");
+        assert!(!independent.should_answers_sum_to_one);
+
+        let sum_answers = db.list_answers("thlctZn5PU").expect("answers");
+        let mega_answers = db.list_answers("hEpuZQpgR2").expect("answers");
+        assert_eq!(sum_answers.len(), 7);
+        assert_eq!(mega_answers.len(), 53);
+
+        let total: f64 = sum_answers.iter().map(|answer| answer.p_market_last).sum();
+        assert!(
+            (total - 1.0).abs() < 0.02,
+            "sum-to-one prices must add up, got {total}"
+        );
+        assert!(
+            mega_answers
+                .iter()
+                .all(|answer| (MIN_TRADING_PROB..=MAX_TRADING_PROB).contains(&answer.p_market_last)),
+            "every answer price must be clamped into the trading range"
+        );
+        assert!(
+            mega_answers
+                .iter()
+                .any(|answer| answer.p_market_last == MIN_TRADING_PROB
+                    || answer.p_market_last == MAX_TRADING_PROB),
+            "the MEGA market has resolved answers at 0 or 1"
+        );
+        assert_eq!(sum_to_one.invested_mana, 0.0);
+        assert_eq!(independent.invested_mana, 0.0);
+        assert!(sum_answers.iter().all(|answer| answer.invested_mana == 0.0));
+    }
+
     #[test]
     fn trade_event_reports_the_post_trade_available_budget() {
         // After a successful sell the released basis and profit are available
