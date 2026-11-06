@@ -362,7 +362,10 @@ impl TriageClient {
         let state = build_state(market, answers, post, followers, p_market);
         let (outcome, cost_usd) = if answers.is_empty() {
             let result = self.run(&state, binary_questions()?).await?;
-            (outcome_from_binary(result.answers), result.usage.and_then(cost))
+            (
+                outcome_from_binary(result.answers)?,
+                result.usage.and_then(cost),
+            )
         } else {
             let result = self.run(&state, choice_questions(answers)?).await?;
             (
@@ -496,9 +499,12 @@ fn build_state<'a>(
     }
 }
 
-fn outcome_from_binary(answers: BinaryAnswers) -> TriageOutcome {
-    let p_yes = *answers.supports_yes.probabilities.get(&Polarity::Yes).unwrap_or(&0.0);
-    TriageOutcome {
+fn outcome_from_binary(answers: BinaryAnswers) -> AppResult<TriageOutcome> {
+    let choice = &answers.supports_yes;
+    let p_yes = choice.probabilities.get(&Polarity::Yes).copied().ok_or_else(|| {
+        anyhow!("triage gave no probability for the Yes outcome; refusing to invent one")
+    })?;
+    Ok(TriageOutcome {
         p_evidence: answers.is_evidence.noul,
         p_target: p_yes,
         alternatives: 2,
@@ -506,7 +512,7 @@ fn outcome_from_binary(answers: BinaryAnswers) -> TriageOutcome {
         p_priced: answers.already_priced.noul,
         target: Target::Binary,
         cost_usd: None,
-    }
+    })
 }
 
 fn outcome_from_choice(answers: ChoiceAnswers, tracked: &[TrackedAnswer]) -> AppResult<TriageOutcome> {
@@ -814,7 +820,8 @@ mod tests {
         let query = binary_questions().expect("questions build");
         let answers = query.decode(live_answers()).expect("answers should validate");
 
-        let outcome = outcome_from_binary(answers);
+        let outcome =
+            outcome_from_binary(answers).expect("a complete reply should convert");
         assert!((outcome.p_evidence - 0.9425).abs() < 1e-4);
         assert!((outcome.p_target - 0.0565).abs() < 1e-4);
         assert!((outcome.strength - 2.6054).abs() < 1e-4);
@@ -824,9 +831,45 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_yes_probability_is_an_error() {
+        // Layer 1: the wire decode rejects a reply whose choice probabilities
+        // do not cover every requested alternative.
+        let query = binary_questions().expect("questions build");
+        let mut value = live_reply();
+        value["supports_yes"]["probabilities"]
+            .as_object_mut()
+            .expect("probabilities map")
+            .remove("yes");
+        let error = query
+            .decode(serde_json::from_value(value).expect("reply should decode"))
+            .expect_err("decode must fail when the probability map is incomplete");
+        assert!(error.to_string().contains("labels differ"), "{error}");
+
+        // Layer 2: extraction refuses to invent a number even if a malformed
+        // reply reaches it as typed answers.
+        let typed = BinaryAnswers {
+            is_evidence: NoulAnswer { noul: 0.9 },
+            supports_yes: ChoiceAnswer {
+                choice: Polarity::Yes,
+                probabilities: [(Polarity::No, 1.0)].into_iter().collect(),
+                confidence: 0.9,
+            },
+            evidence_strength: ScoreAnswer {
+                score: 2.0,
+                probabilities: Default::default(),
+                confidence: 0.5,
+            },
+            already_priced: NoulAnswer { noul: 0.1 },
+        };
+        let error = outcome_from_binary(typed).expect_err("missing mass must fail");
+        assert!(error.to_string().contains("no probability for the Yes"), "{error}");
+    }
+
+    #[test]
     fn live_reply_produces_a_negative_impulse() {
         let query = binary_questions().expect("questions build");
-        let outcome = outcome_from_binary(query.decode(live_answers()).expect("answers validate"));
+        let outcome = outcome_from_binary(query.decode(live_answers()).expect("answers validate"))
+            .expect("a complete reply should convert");
 
         let scale = assess(&outcome, policy()).expect("strong evidence passes the policy");
         assert!(scale < 0.0, "the post favors NO, got {scale}");
