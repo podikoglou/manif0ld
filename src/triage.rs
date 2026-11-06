@@ -552,30 +552,62 @@ impl TriageClient {
     /// answer texts plus [`NONE_ALTERNATIVE`], and `answer_probability`, the
     /// probability that the supported answer wins, on the same decile rubric.
     pub async fn fair_prob(&self, input: &FairProbInput<'_>) -> AppResult<FairProb> {
+        self.fair_prob_with_timeout(input, DECISIONS_TIMEOUT).await
+    }
+
+    /// [`TriageClient::fair_prob`] with a caller-supplied deadline.
+    ///
+    /// S2 sniping is latency-bound: a market moves within seconds of creation,
+    /// so the snipe path uses `SNIPE_DECISION_TIMEOUT_SECS` (default 2 s)
+    /// instead of the triage queue's 10 s. The timeout is a parameter here
+    /// rather than a constant so neither caller has to fork the request body,
+    /// the rubric, or the decoding.
+    pub async fn fair_prob_with_timeout(
+        &self,
+        input: &FairProbInput<'_>,
+        timeout: Duration,
+    ) -> AppResult<FairProb> {
         let state = fair_prob_state(input);
         if input.answers.is_empty() {
-            let result = self.run(&state, fair_prob_questions()?).await?;
+            let result = self
+                .run_with_timeout(&state, fair_prob_questions()?, timeout)
+                .await?;
             let mut fair = fair_prob_from_binary(result.answers);
             fair.cost_usd = result.usage.and_then(cost);
             return Ok(fair);
         }
 
         let result = self
-            .run(&state, fair_prob_choice_questions(input.answers)?)
+            .run_with_timeout(&state, fair_prob_choice_questions(input.answers)?, timeout)
             .await?;
         let mut fair = fair_prob_from_choice(result.answers);
         fair.cost_usd = result.usage.and_then(cost);
         Ok(fair)
     }
 
-    /// Runs one decisions request with a hard timeout.
+    /// Runs one decisions request with the default hard timeout.
     async fn run<S, Q>(&self, state: &S, questions: Q) -> AppResult<EvaluationResult<Q::Output>>
     where
         S: Serialize + Sync,
         Q: Query,
     {
+        self.run_with_timeout(state, questions, DECISIONS_TIMEOUT)
+            .await
+    }
+
+    /// Runs one decisions request with an explicit hard timeout.
+    async fn run_with_timeout<S, Q>(
+        &self,
+        state: &S,
+        questions: Q,
+        timeout: Duration,
+    ) -> AppResult<EvaluationResult<Q::Output>>
+    where
+        S: Serialize + Sync,
+        Q: Query,
+    {
         let model = self.client.evaluation();
-        let result = tokio::time::timeout(DECISIONS_TIMEOUT, model.evaluate(state, questions))
+        let result = tokio::time::timeout(timeout, model.evaluate(state, questions))
             .await
             .with_context(|| format!("decisions request to {} timed out", self.model))?
             .map_err(|error| anyhow!("decisions request to {} failed: {error}", self.model))?;

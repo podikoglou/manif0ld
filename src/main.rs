@@ -26,6 +26,7 @@ mod onboarding_agent;
 mod pipeline;
 mod rate;
 mod sieve;
+mod snipe;
 mod trade;
 mod triage;
 mod types;

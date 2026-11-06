@@ -46,7 +46,9 @@ use crate::market_store::MarketStore;
 use crate::onboarding::{OnboardUpdate, OnboardingDraft, ResearchStep, SieveAttempt};
 use crate::pipeline::{Pipeline, PipelineEvent};
 use crate::trade::TradeEvent;
-use crate::types::{available_budget, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket};
+use crate::types::{
+    available_budget, MarketStatus, SignalRecord, TrackedAnswer, TrackedMarket, STRATEGY_SNIPE,
+};
 
 /// Maximum number of autocomplete choices Discord accepts.
 const MAX_AUTOCOMPLETE_CHOICES: usize = 25;
@@ -1975,9 +1977,10 @@ async fn consume_trade_events(
                 p_market,
                 available_budget,
                 bet_id,
+                strategy,
             }) => {
                 let channel = channel_for_market(&store, &config, Some(&market_id));
-                let embed = CreateEmbed::new()
+                let mut embed = CreateEmbed::new()
                     .title(format!("[TRADE] {action}"))
                     .field("Market", &market_id, false)
                     .field("Mana amount", format!("{mana_amount:.4}"), true)
@@ -1993,6 +1996,17 @@ async fn consume_trade_events(
                         bet_id.unwrap_or_else(|| "(not returned)".to_owned()),
                         true,
                     );
+                // S2 provenance: `p_market` on a snipe entry is the creation
+                // price, so the spread is the gap the snipe traded on. Snipe
+                // rows have no thread; `channel_for_market` already falls back
+                // to the control channel.
+                if strategy == STRATEGY_SNIPE {
+                    embed = embed.field(
+                        "Strategy",
+                        format!("⛏ SNIPE · gap {:+.3}", p_internal - p_market),
+                        true,
+                    );
+                }
                 send_embed(&http, channel, embed).await;
             }
             Ok(TradeEvent::Error { market_id, message }) => {

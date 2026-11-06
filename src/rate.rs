@@ -92,9 +92,9 @@ pub enum Priority {
     /// through.
     Reconcile,
     /// Discovery sweeps: lowest class, same reserve behaviour as
-    /// [`Priority::Reconcile`]. Reserved for the discovery sweeps of
-    /// `docs/ALGO.md` §2; no call site spends it yet.
-    #[allow(dead_code)]
+    /// [`Priority::Reconcile`]. Spent by the S2 new-market market fetch
+    /// (`crate::snipe`); later used by the discovery sweeps of `docs/ALGO.md`
+    /// §2.
     Discovery,
 }
 

@@ -143,10 +143,11 @@ use crate::book::{
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{AppResult, Context, anyhow, bail};
-use crate::manifold_ws::{BetEvent, ContractProbs, ManifoldEvent};
+use crate::manifold_ws::{BetEvent, ContractProbs, ContractStub, ManifoldEvent};
 use crate::market_store::MarketStore;
 use crate::pipeline::PipelineEvent;
 use crate::rate::{Priority, RateLimiter, SystemClock, WRITE_COST_TOKENS};
+use crate::snipe::SnipeStrategy;
 use crate::types::{
     MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision, TradeRecord,
     available_budget,
@@ -561,6 +562,23 @@ impl ManifoldClient {
     }
 }
 
+/// Test seam: a client pointed at a local endpoint instead of Manifold.
+///
+/// Only compiled in test builds. It keeps the production constructor (which
+/// performs the one `GET /v0/me`) out of offline tests without adding a second
+/// HTTP implementation.
+#[cfg(test)]
+impl ManifoldClient {
+    pub(crate) fn for_test(base_url: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.into(),
+            api_key: "test-key".to_owned(),
+            bot_user_id: "bot-1".to_owned(),
+        }
+    }
+}
+
 /// Rejects outcomes other than `YES` and `NO`.
 fn validate_outcome(outcome: &str) -> AppResult<&str> {
     match outcome {
@@ -630,9 +648,23 @@ fn bet_body(
 pub struct MarketSnapshot {
     pub id: String,
     pub question: String,
+    /// Manifold's slug for the market, used to build a page URL when the
+    /// snapshot has no explicit `url`.
+    #[serde(default)]
+    pub slug: String,
+    /// Canonical Manifold page URL, when the API returns one.
+    #[serde(default)]
+    pub url: String,
+    /// `cpmm-1`, `cpmm-multi-1`, `cpmm-multi-2`, `dpm-2`, and so on.
+    #[serde(default)]
+    pub mechanism: String,
     /// `None` on non-BINARY markets (e.g. `MULTIPLE_CHOICE`).
     #[serde(default)]
     pub probability: Option<f64>,
+    /// The creator's opening probability, present on most markets. S2 reads it
+    /// as the fallback for [`Self::probability`] on a freshly created market.
+    #[serde(rename = "initialProb", default)]
+    pub initial_prob: Option<f64>,
     #[serde(rename = "outcomeType")]
     pub outcome_type: String,
     /// True when exactly one answer can win and answer prices sum to one.
@@ -644,6 +676,14 @@ pub struct MarketSnapshot {
     pub close_time_ms: Option<i64>,
     #[serde(rename = "textDescription", default)]
     pub text_description: String,
+    /// The market's explicit resolution rules; onboarding falls back to the
+    /// description when absent, and S2 feeds it to the fair-value question.
+    #[serde(rename = "resolutionCriteria", default)]
+    pub resolution_criteria: Option<String>,
+    /// Total mana subsidised into the market's liquidity pool. S2's liquidity
+    /// gate reads it; absent on payloads that omit the field.
+    #[serde(rename = "totalLiquidity", default)]
+    pub total_liquidity: Option<f64>,
     #[serde(default)]
     pub answers: Option<Vec<MarketAnswerSnapshot>>,
 }
@@ -1349,6 +1389,9 @@ pub enum TradeEvent {
         /// Budget still deployable after the trade.
         available_budget: f64,
         bet_id: Option<String>,
+        /// [`crate::types::STRATEGY_NEWS`] or [`crate::types::STRATEGY_SNIPE`];
+        /// the Discord renderer marks snipe trades with their own provenance.
+        strategy: String,
     },
     /// A trade check or execution failed.
     Error {
@@ -1416,6 +1459,8 @@ pub struct TradeExecutor {
     /// The bot's own resting limit orders; see [`OwnRestingOrders`]. Guarded
     /// by [`SyncMutex`], never held across an await.
     own_orders: SyncMutex<OwnRestingOrders>,
+    /// S2 new-market sniper; `None` when `SNIPE_ENABLED=false`.
+    snipe: Option<SnipeStrategy>,
     events: broadcast::Sender<TradeEvent>,
 }
 
@@ -1429,6 +1474,17 @@ impl TradeExecutor {
             .await
             .context("initializing the Manifold client")?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
+
+        // S2 is constructed only when enabled: with the flag off the executor
+        // spends no decision call and writes no snipe ledger row at all.
+        let snipe = if config.snipe_enabled {
+            Some(
+                SnipeStrategy::new(config, db.clone(), Arc::clone(&store), client.clone())
+                    .context("initializing the S2 new-market sniper")?,
+            )
+        } else {
+            None
+        };
 
         let executor = Self {
             client,
@@ -1444,6 +1500,7 @@ impl TradeExecutor {
             execution_lock: Mutex::new(()),
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             own_orders: SyncMutex::new(OwnRestingOrders::default()),
+            snipe,
             events,
         };
 
@@ -1710,6 +1767,131 @@ impl TradeExecutor {
         }
 
         Ok(first)
+    }
+
+    /// Executes one externally planned buy or sell through the shared path.
+    ///
+    /// S2 owns the *plan* (the market is new and has no news trigger), but not
+    /// the execution: this method takes the execution lock, loads the book,
+    /// reads the kill switch, and calls [`TradeExecutor::execute`] — the same
+    /// code that enforces the budget invariant, spends the Trade-class rate
+    /// token, builds the fair-capped whole-percent limit, tracks the expiring
+    /// rest, writes `trade_ledger`, persists the position columns, and emits
+    /// the Discord event. No part of that ladder is duplicated here.
+    ///
+    /// `Ok(None)` means nothing was persisted: an inactive market, the kill
+    /// switch, a rate refusal, dry-run mode, or a buy that filled no shares
+    /// (its remainder rests and is tracked by `execute`).
+    pub async fn execute_planned(
+        &self,
+        market_id: &str,
+        planned: &PlannedTrade,
+        trigger_post_uri: Option<&str>,
+        now: i64,
+    ) -> AppResult<Option<TradeRecord>> {
+        let _guard = self.execution_lock.lock().await;
+
+        let mut book = self.load_book(market_id)?;
+        if book.status() != MarketStatus::Active {
+            return Ok(None);
+        }
+
+        let kill_switch = self.kill_switch_on()?;
+        if is_buy(planned.decision.action) && kill_switch {
+            tracing::warn!(
+                market_id = %market_id,
+                action = %planned.decision.action,
+                "global kill switch is on; refusing a planned buy"
+            );
+            return Ok(None);
+        }
+
+        let Some(record) = self
+            .execute(&mut book, planned, trigger_post_uri, now, self.dry_run)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        book.persist(&self.store, &self.db)?;
+        self.emit_trade(&book, &record);
+
+        // Same own-order lifecycle rule as `decide`: an entry on this leg
+        // invalidates a resting order on the opposite outcome.
+        if is_buy(planned.decision.action) {
+            if let Err(error) = self
+                .cancel_opposite_after_entry(&book, &planned.decision, now)
+                .await
+            {
+                tracing::error!(
+                    market_id = %market_id,
+                    error = %error,
+                    "opposite-side resting-order cancellation failed after a planned buy"
+                );
+            }
+        }
+
+        Ok(Some(record))
+    }
+
+    /// Evaluates and executes one `global/new-contract` broadcast (S2).
+    ///
+    /// The evaluation runs inline in the event loop: new contracts are an
+    /// hours-scale stream (`docs/ALGO.md` §6.1 measured none in two minutes),
+    /// and the expensive parts are bounded — the fair-value call by
+    /// `SNIPE_DECISION_TIMEOUT_SECS` (default 2 s) and the market fetch by the
+    /// HTTP client timeout. Queued websocket events wait in the never-drop
+    /// channel and are mirrored on the next loop pass.
+    ///
+    /// # Why the regular path cannot double-bet after a snipe
+    ///
+    /// Our own bet produces an `updated-contract` broadcast, so
+    /// [`TradeExecutor::evaluate_cached`] may run on this market moments later.
+    /// It cannot open a second position: `Book::plan` only considers entries
+    /// for a leg with **no** shares, and the snipe fill created one. Belief is
+    /// never moved by our own trade, so the only plan the regular path can
+    /// produce is an exit. A fill that was entirely rested (zero shares) leaves
+    /// the leg flat; the next normal entry is then bounded by the same
+    /// per-market ceiling (`budget_mana = min(SNIPE_MAX_MANA, pool)`), because
+    /// the snipe order is not retried here.
+    async fn handle_new_contract(&self, contract: &ContractStub, now: i64) -> AppResult<()> {
+        let Some(snipe) = self.snipe.as_ref() else {
+            tracing::debug!(
+                contract_id = %contract.id,
+                "new contract broadcast; sniping is disabled"
+            );
+            return Ok(());
+        };
+
+        let Some(order) = snipe.evaluate(contract, now, &self.rate).await? else {
+            return Ok(());
+        };
+
+        match self
+            .execute_planned(
+                &order.market_id,
+                &order.planned,
+                Some(&order.trigger),
+                now,
+            )
+            .await
+        {
+            Ok(Some(record)) => snipe.record_filled(&order, &record)?,
+            Ok(None) => {
+                let reason = if self.dry_run {
+                    "dry_run"
+                } else {
+                    "execution refused or nothing filled"
+                };
+                snipe.record_unfilled(&order, reason)?;
+            }
+            Err(error) => {
+                snipe.record_unfilled(&order, &format!("execution error: {error}"))?;
+                return Err(error);
+            }
+        }
+
+        Ok(())
     }
 
     /// Loads the book, failing when the market is not tracked.
@@ -2101,16 +2283,23 @@ impl TradeExecutor {
                                 self.emit_error(Some(market_id), error.to_string());
                             }
                         }
-                        // S2 (new-market sniping) and S3 (copy-trading) are
-                        // later phases of `docs/ALGO.md`; both events are
-                        // parsed but intentionally inert here.
+                        // S2 new-market sniping. S3 (copy-trading) is a later
+                        // phase; its `Bet` event stays parsed but inert below.
                         Some(ManifoldEvent::NewContract(event)) => {
-                            tracing::debug!(
-                                contract_id = %event.contract.id,
-                                slug = ?event.contract.slug,
-                                outcome_type = ?event.contract.outcome_type,
-                                "new contract broadcast; sniping is a later phase"
-                            );
+                            let now = Utc::now().timestamp();
+                            if let Err(error) =
+                                self.handle_new_contract(&event.contract, now).await
+                            {
+                                tracing::error!(
+                                    contract_id = %event.contract.id,
+                                    error = %error,
+                                    "snipe evaluation or execution failed"
+                                );
+                                self.emit_error(
+                                    Some(event.contract.id.clone()),
+                                    error.to_string(),
+                                );
+                            }
                         }
                         Some(ManifoldEvent::Bet(bet)) => {
                             if bet.user_id == self.client.bot_user_id() {
@@ -3180,6 +3369,7 @@ fn trade_event(market: &TrackedMarket, record: &TradeRecord) -> TradeEvent {
         p_market: record.p_market,
         available_budget: available_budget(market),
         bet_id: record.manifold_bet_id.clone(),
+        strategy: market.strategy.clone(),
     }
 }
 
@@ -4546,17 +4736,24 @@ mod tests {
     /// (unused) HTTP client, and a fresh rate bucket. Every maker-fill test
     /// avoids the network by feeding websocket-shaped `BetEvent`s straight
     /// into [`TradeExecutor::on_own_bet_event`].
-    fn offline_executor(
+    fn offline_executor(db: &Db, store: &Arc<MarketStore>) -> TradeExecutor {
+        offline_executor_with(
+            db,
+            store,
+            ManifoldClient::for_test("http://127.0.0.1:1"),
+            None,
+        )
+    }
+
+    /// [`offline_executor`] with an explicit client and optional sniper.
+    fn offline_executor_with(
         db: &Db,
         store: &Arc<MarketStore>,
+        client: ManifoldClient,
+        snipe: Option<crate::snipe::SnipeStrategy>,
     ) -> TradeExecutor {
         TradeExecutor {
-            client: ManifoldClient {
-                http: reqwest::Client::new(),
-                base_url: "http://127.0.0.1:1".to_owned(),
-                api_key: "unused".to_owned(),
-                bot_user_id: "bot-1".to_owned(),
-            },
+            client,
             db: db.clone(),
             store: Arc::clone(store),
             policy: TradePolicy {
@@ -4572,6 +4769,7 @@ mod tests {
             execution_lock: Mutex::new(()),
             terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             own_orders: SyncMutex::new(OwnRestingOrders::default()),
+            snipe,
             events: broadcast::channel(EVENT_CAPACITY).0,
         }
     }
@@ -4777,6 +4975,184 @@ mod tests {
             .expect("load book")
             .expect("tracked");
         assert_close(book.leg(0).yes_shares, 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // S2: sniping through the shared executor
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_planned_reuses_the_budget_invariant_of_execute() {
+        let market = market_with(1.0, 0.0, 0.0, 0.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("insert market");
+        let executor = offline_executor(&db, &store);
+
+        let planned = PlannedTrade {
+            leg: 0,
+            decision: TradeDecision {
+                action: TradeAction::BuyYes,
+                amount_mana: 10.0,
+                shares: None,
+                answer_id: None,
+            },
+            p_internal: 0.8,
+            p_market: 0.4,
+        };
+
+        let error = executor
+            .execute_planned("Market_test", &planned, Some("contract-1"), 0)
+            .await
+            .expect_err("a buy over the market budget must be refused");
+
+        assert!(
+            error.to_string().contains("budget invariant"),
+            "expected the shared budget refusal, got {error}"
+        );
+        assert!(
+            db.recent_trades("Market_test", 10)
+                .expect("ledger")
+                .is_empty(),
+            "a refused buy writes no trade row"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_planned_honours_the_kill_switch_without_a_write() {
+        let market = market_with(100.0, 0.0, 0.0, 0.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("insert market");
+        db.set_kv(KILL_SWITCH_KEY, "true").expect("kill switch");
+        let executor = offline_executor(&db, &store);
+
+        let planned = PlannedTrade {
+            leg: 0,
+            decision: TradeDecision {
+                action: TradeAction::BuyYes,
+                amount_mana: 5.0,
+                shares: None,
+                answer_id: None,
+            },
+            p_internal: 0.8,
+            p_market: 0.4,
+        };
+
+        let record = executor
+            .execute_planned("Market_test", &planned, Some("contract-1"), 0)
+            .await
+            .expect("handled");
+        assert!(record.is_none());
+        assert!(db
+            .recent_trades("Market_test", 10)
+            .expect("ledger")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_offline_snipe_evaluates_executes_and_writes_both_ledgers() {
+        use crate::snipe::{
+            binary_market_json, contract_stub, spawn_fake_manifold, ScriptedFairValue, SnipeStrategy,
+        };
+
+        let manifold = spawn_fake_manifold(
+            binary_market_json("Market_snipe", 0.4, Some(500.0)),
+            json!({
+                "id": "snipe-bet",
+                "amount": 1.6667,
+                "shares": 4.1667,
+                "isFilled": true
+            }),
+        )
+        .await;
+
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        let config = crate::snipe::test_config();
+        let fair = Arc::new(ScriptedFairValue::ok(0.8, None));
+        let snipe = SnipeStrategy::with_fair_value(
+            &config,
+            db.clone(),
+            Arc::clone(&store),
+            ManifoldClient::for_test(manifold.base_url.clone()),
+            fair,
+        );
+        let executor = offline_executor_with(
+            &db,
+            &store,
+            ManifoldClient::for_test(manifold.base_url.clone()),
+            Some(snipe),
+        );
+        let mut events = executor.events().subscribe();
+        let now = Utc::now().timestamp();
+
+        executor
+            .handle_new_contract(&contract_stub("Market_snipe"), now)
+            .await
+            .expect("snipe evaluation and execution");
+
+        // The shared executor wrote its ordinary ledger row, with the contract
+        // id as provenance.
+        let trades = db.recent_trades("Market_snipe", 10).expect("trades");
+        assert_eq!(trades.len(), 1, "one fill, one trade row");
+        assert_eq!(trades[0].action, TradeAction::BuyYes);
+        assert_eq!(trades[0].trigger_post_uri.as_deref(), Some("Market_snipe"));
+        assert_eq!(trades[0].manifold_bet_id.as_deref(), Some("snipe-bet"));
+
+        // The snipe ledger recorded the real fill, not the intention.
+        let snipes = db.recent_snipes(10).expect("snipes");
+        assert_eq!(snipes.len(), 1, "one evaluation, one buy row");
+        assert_eq!(snipes[0].contract_id, "Market_snipe");
+        assert_eq!(snipes[0].action, "BUY_YES");
+        assert_eq!(snipes[0].manifold_bet_id.as_deref(), Some("snipe-bet"));
+        assert!((snipes[0].mana_amount - trades[0].mana_amount).abs() < 1e-9);
+        assert!(snipes[0].reason.as_deref().unwrap_or("").contains("gap"));
+
+        // The market row is a snipe row with the model belief.
+        let row = store
+            .load("Market_snipe")
+            .expect("load")
+            .expect("tracked");
+        assert!(row.is_snipe());
+        assert!(row.deleted_at.is_none());
+        assert!((row.p_market_last - 0.4).abs() < 1e-9);
+        assert!((row.p_internal_log_odds - belief::logit(0.8)).abs() < 1e-9);
+        assert!((row.budget_mana - 10.0).abs() < 1e-9);
+
+        // The regular planner can only exit from here: the leg holds shares,
+        // and the entry branch requires a flat leg.
+        let book = Book::load(&store, &db, "Market_snipe")
+            .expect("load book")
+            .expect("tracked");
+        assert!(book.leg(0).yes_shares > 0.0);
+        let planned = book.plan(now + 1, 4.0, &executor.policy);
+        assert!(
+            !planned
+                .iter()
+                .any(|trade| matches!(trade.decision.action, TradeAction::BuyYes | TradeAction::BuyNo)),
+            "the post-fill evaluation must not open a second position: {planned:?}"
+        );
+
+        // Provenance reached the event stream for Discord.
+        match events.try_recv().expect("a trade event") {
+            TradeEvent::Trade {
+                market_id,
+                strategy,
+                p_internal,
+                p_market,
+                ..
+            } => {
+                assert_eq!(market_id, "Market_snipe");
+                assert_eq!(strategy, crate::types::STRATEGY_SNIPE);
+                assert!((p_internal - 0.8).abs() < 1e-9);
+                assert!((p_market - 0.4).abs() < 1e-9);
+            }
+            other => panic!("expected a trade event, got {other:?}"),
+        }
+
+        // One market fetch and one bet call; nothing else.
+        assert_eq!(manifold.requests(), 2);
     }
 
     // -------------------------------------------------------------------

@@ -116,6 +116,16 @@ MIN_TRADE_SIZE=1.0
 BELIEF_KAPPA=1.1
 BELIEF_HALFLIFE_HOURS=4.0
 
+# S2 new-market sniping (off by default)
+SNIPE_ENABLED=false
+SNIPE_POOL_MANA=100        # dedicated global pool, separate from per-market budgets
+SNIPE_MAX_MANA=10          # per-snipe cap (clamped to the pool remaining at use time)
+SNIPE_MIN_LIQ=100          # minimum totalLiquidity
+SNIPE_MIN_GAP=0.10         # minimum |p_model - p_initial|
+SNIPE_KELLY_FRACTION=0.25
+SNIPE_TTL_SECS=3600        # eligibility window from contract creation
+SNIPE_DECISION_TIMEOUT_SECS=2
+
 # Storage
 DB_PATH=./data/manif0ld.db
 ```
@@ -871,7 +881,7 @@ the two teardown end states are explicit: `/untrack` hides the row
    same split and naming is used by `/status market`, so the two views never
    disagree; the last field states how many chunks were dropped.
 2. `[SIGNAL]` — author handle + followers, link to Bluesky post, answer (MCQ), evidence / direction / strength / priced probabilities, `P_internal` before → after.
-3. `[TRADE]` — action (BUY_YES / SELL_YES / etc.), amount, shares delta, `P_internal` vs `P_market`, remaining available budget.
+3. `[TRADE]` — action (BUY_YES / SELL_YES / etc.), amount, shares delta, `P_internal` vs `P_market`, remaining available budget. A snipe trade adds `Strategy: ⛏ SNIPE · gap ±x.xxx` (§6.9).
 4. `[ERROR]` — any trade rejection, Manifold API error, LLM call failure, or rate-limit breach.
 
 **Action buttons** on the ONBOARDED embed:
@@ -883,6 +893,124 @@ the two teardown end states are explicit: `/untrack` hides the row
   action is validated and idempotent: a market that is already `CLOSED` or no
   longer tracked is reported without any sale, and a market that Manifold has
   resolved is not sold because its positions settle automatically.
+
+### 6.9 S2 New-Market Sniping (`snipe.rs`)
+
+**Trigger.** `global/new-contract` (`ManifoldEvent::NewContract`) on the
+broadcast websocket. The trade executor handles it inline: new contracts are an
+hours-scale stream (measured: none in two minutes), and both remote steps are
+bounded — the market fetch by the HTTP client and the decision call by
+`SNIPE_DECISION_TIMEOUT_SECS` (default 2 s). Queued events wait in the
+never-drop channel.
+
+`SnipeStrategy` is constructed only when `SNIPE_ENABLED=true`; with the flag off
+the executor never evaluates, fetches, or writes a snipe row.
+
+**Gate order** (each skip writes one `snipe_ledger` row with `action = 'SKIP'`
+and the reason; free gates run before any REST spend):
+
+| # | Gate | Default | Skip reason |
+|---|---|---|---|
+| 1 | Stub `outcomeType` is `BINARY` or `MULTIPLE_CHOICE` | — | `unsupported_outcome_type` |
+| 2 | Stub `mechanism` ∈ {`cpmm-1`, `cpmm-multi-1`, `cpmm-multi-2`} when present | — | `unsupported_mechanism` |
+| 3 | `SNIPE_ENABLED` | `false` | `disabled` |
+| 4 | Age from stub `createdTime` ≤ `SNIPE_TTL_SECS` | 3600 | `ttl_expired` |
+| 5 | No existing `tracked_markets` row (`load`, including soft-deleted) | — | `already_tracked` |
+| 6 | Discovery-class rate token, then one `GET /v0/market/{id}` | — | `rate_limited` |
+| 7 | Snapshot not resolved; snapshot type/mechanism supported | — | `resolved`, `unsupported_*` |
+| 8 | Multiple choice has at least one answer | — | `no_answers`, `no_probability` |
+| 9 | `SNIPE_POOL_MANA − SUM(invested − realized_pnl)` ≥ `MIN_TRADE_SIZE` | pool 100 | `pool_exhausted` |
+| 10 | `totalLiquidity` ≥ `SNIPE_MIN_LIQ` | 100 | `low_liquidity`, `liquidity_unknown` |
+| 11 | One `fair_prob` call with the snipe deadline | 2 s | `decision_failed: …` |
+| 12 | Multiple choice: model names a tracked answer and its price exists | — | `no_answer_selected`, `answer_not_in_market`, `answer_price_missing` |
+| 13 | `\|p_model − p_initial\|` ≥ `SNIPE_MIN_GAP` | 0.10 | `small_gap` |
+| 14 | A sum-to-one market is never a NO leg | — | `sum_to_one_no_leg` |
+| 15 | Kelly target ≥ `MIN_TRADE_SIZE` | 1.0 | `below_min_size` |
+| 16 | Insert row + answers, resolve the book leg, return the order | — | — |
+
+**Fair value.** One `TriageClient::fair_prob` call (decile rubric; §6.4). It
+carries `{question, resolution_criteria, close_time, initial_prob,
+creator_id?}` and, on a multiple-choice market, the answer texts. The market
+object has one `initialProb`, not one per answer, so the multiple-choice state
+carries `initialProb` when Manifold provides it and `0.5` otherwise; the gap is
+always computed against the **chosen answer's actual price**.
+
+**`p_initial` and the gap.** On a binary market `p_initial` is the snapshot
+`probability` (falling back to `initialProb`); at creation it is the price. On
+a multiple-choice market the model picks an answer (the abstain alternative
+returns `answer: None` and is skipped), and `p_initial` is that answer's
+`answers[].probability`. `gap = p_model − p_initial`; a positive gap buys YES,
+a negative one buys NO (independent `cpmm-multi-2` markets only — a `cpmm-multi-1`
+NO leg is a basket and the regular planner never opens one).
+
+**Sizing.** The shared fractional-Kelly formula (`book::kelly_target_mana`), on
+one budget value:
+
+```
+cap      = min(SNIPE_MAX_MANA, SNIPE_POOL_MANA − snipe_pool_invested())
+size     = min(cap, kelly_target_mana(gap, p_initial, cap,
+                                       λ = SNIPE_KELLY_FRACTION,
+                                       entry_edge_threshold = SNIPE_MIN_GAP))
+skip if  size < MIN_TRADE_SIZE
+```
+
+**Per-market budget and the pool.** The inserted row's `budget_mana` is `cap`,
+not `size`, so the existing
+`available = budget + realized_pnl − invested` invariant holds unchanged for
+the row. The pool is the sum over `strategy = 'snipe'`, `status = 'ACTIVE'`,
+`deleted_at IS NULL` rows of `invested − realized_pnl`; realized profit returns
+to the pool automatically. The pool sum does not count money resting in an
+unfilled snipe order; that commitment is bounded by the same per-market
+`cap` ceiling.
+
+**Execution.** `SnipeStrategy` returns a `PlannedTrade` plus provenance; the
+executor's `execute_planned` takes the execution lock, loads the book, reads the
+kill switch, and calls the existing `execute` — budget invariant, Trade-class
+token, fair-capped whole-percent limit, expiring rest, own-order tracking,
+`trade_ledger`, position persistence, and the Discord event. No second trade
+path exists. `trade_ledger.trigger_post_uri` carries the contract ID.
+
+A row that passes every gate is inserted before execution, so an execution
+refusal (kill switch, rate floor, dry run, zero fill) leaves a tracked snipe
+row with no position; the snipe row simply waits for the next price or
+reconcile evaluation like any other active row. Only the ledger distinguishes
+the refusal.
+
+On a sum-to-one multiple-choice market the fair cap is built from the planner's
+normalized leg belief (§6.6), while sizing uses the raw `gap`; the fill
+therefore never exceeds the normalized fair value even when the raw gap is
+larger.
+
+**Why it cannot double-bet.** Our own bet produces an `updated-contract`, so
+the regular cached evaluation may run moments later. `Book::plan` only opens a
+leg with no shares; the snipe fill created one, and belief never moves on our
+own trade, so the regular path can only produce an exit. A zero-share fill
+leaves the leg flat, but the snipe order is not retried; the next normal entry
+is bounded by the row's `cap`.
+
+**Ledger.** Every gate writes a `SKIP` row with whatever `p_initial`,
+`p_model`, and `gap` were already known. The buy row is written **after**
+execution with the real `mana_amount` and `manifold_bet_id` from `trade_ledger`
+(the wire limit lives in `trade_ledger`, not here); a refusal or a zero-share
+fill writes `SKIP` with reason `unfilled: …`. `cost_usd` is the decision-call
+cost when OpenRouter reports it.
+
+**TTL.** `SNIPE_TTL_SECS` gates eligibility only: a contract whose `createdTime`
+is older than the TTL when the broadcast is evaluated is skipped
+(`ttl_expired`). It does not expire the tracked row, cap the holding period, or
+cancel later orders. It can be reached after a long executor stall or a
+replayed event; with a healthy socket a new-market event is milliseconds old.
+
+**Provenance.** Snipe rows have no Discord thread, so the trade lands in the
+control channel through the normal `channel_for_market` fallback. The `[TRADE]`
+embed gains a `Strategy: ⛏ SNIPE · gap ±x.xxx` field when
+`tracked_markets.strategy = 'snipe'`; the existing `P_int vs P_mkt` field already
+shows `p_model` against the creation price for a fresh entry.
+
+**Visibility.** Snipe rows are hidden from operator listings (`/status`,
+autocomplete) and from the Sieve registry, but the executor (`active()`) and
+the reconcile pass treat them like every other active row: prices mirror, makes
+fills apply, exits fire, and `/panic` sweeps them.
 
 ## 7. Sieve DSL Reference (for onboarding LLM)
 
