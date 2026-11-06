@@ -109,6 +109,10 @@ impl Db {
             conn.execute_batch(include_str!("../migrations/005_answer_trading.sql"))
                 .context("applying database migration 005 (answer trading)")?;
         }
+        // 006: remove the obsolete Jetstream cursor. The statement is a guarded
+        // `DELETE`, so it is idempotent and needs no structural check.
+        conn.execute_batch(include_str!("../migrations/006_remove_jetstream_cursor.sql"))
+            .context("applying database migration 006 (remove jetstream cursor)")?;
         Ok(())
     }
 
@@ -1242,6 +1246,37 @@ mod tests {
         assert_eq!(db.get_kv("example_key").expect("get deleted"), None);
         // Deleting a missing key is idempotent.
         db.delete_kv("example_key").expect("delete missing kv");
+    }
+
+    #[test]
+    fn open_removes_the_obsolete_jetstream_cursor() {
+        let path = std::env::temp_dir().join(format!(
+            "manif0ld-test-{}-{}/cursor/manif0ld.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        {
+            // Simulate a database written by a build that still replayed.
+            let conn = Connection::open(&path).expect("raw connection");
+            conn.execute_batch(include_str!("../migrations/001_init.sql"))
+                .expect("base schema applies");
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES ('jetstream_cursor_us', '1793983780195469')",
+                [],
+            )
+            .expect("seed cursor");
+        }
+
+        let db = Db::open(&path).expect("open file DB");
+        assert_eq!(
+            db.get_kv("jetstream_cursor_us").expect("get cursor"),
+            None,
+            "the obsolete cursor must be deleted on open"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 
     #[test]
