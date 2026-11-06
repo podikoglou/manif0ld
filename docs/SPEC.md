@@ -555,8 +555,11 @@ Triggered by `/track url:<url> budget:<mana>`:
    cannot reconstruct it because the creator segment is not part of the slug.
 3. **Onboarding research agent:** `ONBOARDING_MODEL` runs as a `rig` agent in
    `onboarding_agent.rs`. The preamble is `SIEVE_SYSTEM_PROMPT` plus the agent
-   instructions, and the model must support tool calling. The agent has four
-   tools:
+   instructions, and the model must support tool calling. Every request carries
+   the fixed OpenRouter `session_id` `manif0ld-onboarding`, so sticky routing
+   keeps the preamble and tool schemas on one provider and its prompt cache
+   stays warm across turns and `/track` runs. The option is inert on the
+   Cloudflare wire. The agent has four tools:
    - `web_search` — Firecrawl search over web and news (at most 8 results per
      call). The agent uses at most 8 searches.
    - `read_page` — Firecrawl Markdown scrape of one http(s) page, truncated to
