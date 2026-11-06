@@ -612,23 +612,30 @@ pub struct LlmClient {
     openrouter: Option<rig::providers::openai::OpenAI>,
 }
 
+/// Builds the HTTP transport both chat providers share.
+///
+/// `total` bounds one whole request, including a streamed reply, because a
+/// read timeout cannot end a stream that keeps arriving. Every request rig
+/// sends for an agent turn goes through this transport.
+fn chat_transport(total: Duration) -> AppResult<rig::http_client::ReqwestClient> {
+    let client = rig::rig_reqwest::reqwest::Client::builder()
+        .connect_timeout(LLM_CONNECT_TIMEOUT)
+        .read_timeout(LLM_READ_TIMEOUT)
+        .timeout(total)
+        .build()
+        .context("building the LLM HTTP client")?;
+    Ok(rig::http_client::ReqwestClient::from(client))
+}
+
 impl LlmClient {
     /// Builds the client from the process environment.
     ///
     /// Initializes Cloudflare and/or OpenRouter depending on the credentials
     /// present in the process environment. Both providers share one transport
-    /// with [`LLM_READ_TIMEOUT`] and overall [`ONBOARDING_REQUEST_TIMEOUT`]
-    /// applied, because the bundled `reqwest` client rig defaults to has no
-    /// request timeout at all.
+    /// from [`chat_transport`], because the bundled `reqwest` client rig
+    /// defaults to has no request timeout at all.
     pub fn new() -> AppResult<Self> {
-        let transport = rig::http_client::ReqwestClient::from(
-            rig::rig_reqwest::reqwest::Client::builder()
-                .connect_timeout(LLM_CONNECT_TIMEOUT)
-                .read_timeout(LLM_READ_TIMEOUT)
-                .timeout(ONBOARDING_REQUEST_TIMEOUT)
-                .build()
-                .context("building the LLM HTTP client")?,
-        );
+        let transport = chat_transport(ONBOARDING_REQUEST_TIMEOUT)?;
 
         let (cloudflare, cf_err) = match rig::providers::openai::OpenAIConfig::from_env_with(
             &rig::providers::cloudflare::DIALECT,
@@ -710,7 +717,57 @@ impl LlmClient {
 mod tests {
     use super::*;
 
+    use rig::completion::CompletionRequest;
     use rig::typesafeai::types::Answer;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stream that only sends keepalives must fail on the total request
+    /// deadline. OpenRouter holds a queued turn open with `: OPENROUTER
+    /// PROCESSING` comment lines, and every comment is a read that resets the
+    /// read timeout, so silence never arrives for a read timeout to catch.
+    #[test]
+    fn keepalive_stream_ends_on_the_request_deadline() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime builds");
+
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let server = runtime.spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("connection accepted");
+            let mut buffer = [0u8; 4096];
+            let head = socket.read(&mut buffer).await.expect("request read");
+            assert!(head > 0, "client sent no request bytes");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .await
+                .expect("headers written");
+            while socket.write_all(b": OPENROUTER PROCESSING\n\n").await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let config = rig::providers::openai::OpenAIConfig {
+            base_url: format!("http://{address}"),
+            ..rig::providers::openai::OpenAIConfig::with_key(
+                &rig::providers::openai::wire::OPENROUTER,
+                "test-key",
+            )
+        };
+        let transport = chat_transport(Duration::from_millis(200)).expect("transport builds");
+        let model = config.connect(transport).completion("test-model");
+
+        let call = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                model.call(CompletionRequest::new("hi")),
+            )
+            .await
+        });
+        server.abort();
+        let answer = call.expect("a stalled stream ran past the request deadline");
+        assert!(answer.is_err(), "a stalled stream must fail");
+    }
 
     /// Answers as the wire carries them, before rubric mapping.
     type BinaryResponse = BinaryQuestions<Answer, Answer, Answer, Answer>;
