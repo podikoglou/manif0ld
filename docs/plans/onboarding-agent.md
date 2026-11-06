@@ -406,7 +406,7 @@ Run the three gates after each logical step:
 ```sh
 cargo build --release
 cargo test
-cargo clippy -p bsky-manifold-arb --all-targets --no-deps -- -D warnings
+cargo clippy -p manif0ld --all-targets --no-deps -- -D warnings
 ```
 
 ## 12. Risks and decisions
