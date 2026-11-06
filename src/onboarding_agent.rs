@@ -28,11 +28,13 @@
 /// print [`root_cause`].
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use firecrawl::{
     Client, Document, Format, ScrapeOptions, SearchOptions, SearchResultOrDocument, SearchSource,
 };
 use rig::message::ToolName;
+use rig::providers::openrouter::extension::OpenRouterOptions;
 use rig::tool::{DynamicTool, ToolErrorKind, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -62,6 +64,14 @@ const MAX_DRY_RUN_POST_CHARS: usize = 2_000;
 
 /// Longest post excerpt echoed back in a dry-run result.
 const DRY_RUN_EXCERPT_CHARS: usize = 160;
+
+/// Longest one Firecrawl call may run before the model is told it timed out.
+///
+/// The `firecrawl` client builds its own `reqwest::Client` with no timeout, and
+/// tools run one at a time, so a stalled search or scrape holds the entire
+/// agent run open with no log line and no error until the `/track` wall. A
+/// timeout turns that silence into a tool result the model can react to.
+const FIRECRAWL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Instructions appended to [`SIEVE_SYSTEM_PROMPT`] for the agent run.
 pub const AGENT_INSTRUCTIONS: &str = r##"You are the onboarding research agent for a prediction-market trader.
@@ -138,6 +148,36 @@ impl SubmitState {
     }
 }
 
+/// One sticky routing session for every onboarding request.
+///
+/// OpenRouter's sticky routing pins a session to one provider endpoint, so the
+/// onboarding preamble and the tool schemas stay in that provider's prompt
+/// cache. Without a session id, each request may land on a different provider
+/// and pay to write the same cache again.
+///
+/// The id is constant instead of per run because the cached prefix is the same
+/// for every market: one session reuses it across turns and across `/track`
+/// runs. OpenRouter expires a sticky session after ten minutes without a
+/// request, and it falls back to another provider when the sticky one fails.
+/// The option is inert when `ONBOARDING_MODEL` names a Cloudflare model.
+const ONBOARDING_SESSION_ID: &str = "manif0ld-onboarding";
+
+/// Builds the onboarding agent with its preamble, tools, and provider options.
+///
+/// `provider_option` is typed: the OpenRouter entry is only sent to the
+/// OpenRouter wire, and the Cloudflare wire ignores it.
+fn build_agent(
+    model: impl Into<rig::DynModel<rig::operation::Completion>>,
+    tools: Vec<DynamicTool>,
+) -> rig::Agent {
+    rig::AgentBuilder::new(model)
+        .preamble(agent_preamble())
+        .dynamic_tools(tools)
+        .default_max_turns(MAX_AGENT_TURNS)
+        .provider_option(OpenRouterOptions::new().session_id(ONBOARDING_SESSION_ID))
+        .build()
+}
+
 /// Researches `market` with the agent and returns the first compiling program.
 ///
 /// The agent's final response text is ignored. The accepted program comes from
@@ -158,11 +198,7 @@ pub async fn synthesize(
         read_page_tool(Arc::clone(&firecrawl), updates.clone()),
     ];
 
-    let agent = rig::AgentBuilder::new(model)
-        .preamble(agent_preamble())
-        .dynamic_tools(tools)
-        .default_max_turns(MAX_AGENT_TURNS)
-        .build();
+    let agent = build_agent(model, tools);
 
     let _ = updates
         .send(OnboardUpdate::Phase(
@@ -436,6 +472,26 @@ fn dry_run_sieve_tool(updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
     )
 }
 
+/// Reports a failed research call on `updates` and returns the error the model
+/// reads.
+///
+/// The activity line matters as much as the error: without it a tool that
+/// stalls or is rejected leaves the operator looking at a frozen progress
+/// message with no indication that anything went wrong.
+async fn tool_failure(
+    updates: &mpsc::Sender<OnboardUpdate>,
+    tool: &str,
+    message: String,
+) -> ToolExecutionError {
+    let _ = updates
+        .send(OnboardUpdate::Activity(ResearchStep::Failed {
+            tool: tool.to_owned(),
+            error: message.clone(),
+        }))
+        .await;
+    ToolExecutionError::new(ToolErrorKind::Other, message)
+}
+
 /// Builds the `web_search` tool.
 fn web_search_tool(client: Arc<Client>, updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
     let parameters = json!({
@@ -479,22 +535,41 @@ fn web_search_tool(client: Arc<Client>, updates: mpsc::Sender<OnboardUpdate>) ->
                     )))
                     .await;
 
-                let response = client
-                    .search(
+                let searched = tokio::time::timeout(
+                    FIRECRAWL_TIMEOUT,
+                    client.search(
                         &query,
                         SearchOptions {
                             limit: Some(limit),
                             sources: Some(vec![SearchSource::Web, SearchSource::News]),
                             ..Default::default()
                         },
-                    )
-                    .await
-                    .map_err(|error| {
-                        ToolExecutionError::new(
-                            ToolErrorKind::Other,
+                    ),
+                )
+                .await;
+                let response = match searched {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
+                        return Err(tool_failure(
+                            &updates,
+                            "web_search",
                             format!("web_search failed: {error}"),
                         )
-                    })?;
+                        .await)
+                    }
+                    Err(_) => {
+                        return Err(tool_failure(
+                            &updates,
+                            "web_search",
+                            format!(
+                                "web_search timed out after {}s for query `{query}`; \
+                                 try a narrower query, or continue without it",
+                                FIRECRAWL_TIMEOUT.as_secs()
+                            ),
+                        )
+                        .await)
+                    }
+                };
 
                 let results: Vec<Value> = response
                     .data
@@ -590,22 +665,41 @@ fn read_page_tool(client: Arc<Client>, updates: mpsc::Sender<OnboardUpdate>) -> 
                     )))
                     .await;
 
-                let document = client
-                    .scrape(
+                let scraped = tokio::time::timeout(
+                    FIRECRAWL_TIMEOUT,
+                    client.scrape(
                         &raw_url,
                         ScrapeOptions {
                             formats: Some(vec![Format::Markdown]),
                             only_main_content: Some(true),
                             ..Default::default()
                         },
-                    )
-                    .await
-                    .map_err(|error| {
-                        ToolExecutionError::new(
-                            ToolErrorKind::Other,
+                    ),
+                )
+                .await;
+                let document = match scraped {
+                    Ok(Ok(document)) => document,
+                    Ok(Err(error)) => {
+                        return Err(tool_failure(
+                            &updates,
+                            "read_page",
                             format!("read_page failed: {error}"),
                         )
-                    })?;
+                        .await)
+                    }
+                    Err(_) => {
+                        return Err(tool_failure(
+                            &updates,
+                            "read_page",
+                            format!(
+                                "read_page timed out after {}s for `{raw_url}`; \
+                                 try another source, or continue without it",
+                                FIRECRAWL_TIMEOUT.as_secs()
+                            ),
+                        )
+                        .await)
+                    }
+                };
 
                 let markdown = document.markdown.as_deref().unwrap_or_default();
                 if markdown.trim().is_empty() {
@@ -898,6 +992,35 @@ mod tests {
         let preamble = agent_preamble();
         assert!(preamble.starts_with(SIEVE_SYSTEM_PROMPT));
         assert!(preamble.contains("onboarding research agent"));
+    }
+
+    #[tokio::test]
+    async fn every_agent_request_carries_the_onboarding_session_id() {
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+
+        assert!(
+            ONBOARDING_SESSION_ID.len() <= 256,
+            "OpenRouter rejects a session id longer than 256 characters"
+        );
+
+        let model = MockCompletionModel::from_turns([MockTurn::text("done")]);
+        let agent = build_agent(model.clone(), Vec::new());
+        agent
+            .prompt("research the market")
+            .run()
+            .await
+            .expect("the scripted turn succeeds");
+
+        let requests = model.requests();
+        let [request] = requests.as_slice() else {
+            panic!("one request: {requests:?}");
+        };
+        assert_eq!(
+            request.provider_options,
+            rig::completion::ProviderOptions::new()
+                .set(OpenRouterOptions::new().session_id(ONBOARDING_SESSION_ID)),
+            "the agent must pin its requests to one sticky session"
+        );
     }
 
     #[test]
