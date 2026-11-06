@@ -56,7 +56,7 @@ manif0ld/
     ├── types.rs         # domain types: Market, ExtractedPost, Trade, Belief, etc.
     ├── db.rs            # rusqlite schema + queries
     ├── extract.rs       # Jetstream event → ExtractedPost (structural extraction only)
-    ├── ingest.rs        # Jetstream websocket, reconnect, cursor persistence
+    ├── ingest.rs        # Jetstream websocket, reconnect, live-tail subscribe
     ├── sieve.rs         # EngineRegistry + per-market CompiledSieve wrapper
     ├── triage.rs        # OpenRouter decisions call, question wording, impulse fold
     ├── belief.rs        # log-odds state, decay, impulse
@@ -194,7 +194,7 @@ CREATE TABLE trade_ledger (
 CREATE TABLE kv (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
-);  -- 'jetstream_cursor_us', 'global_kill_switch'
+);  -- 'global_kill_switch'
 ```
 
 ### 5.1 Market lifecycle and soft deletion
@@ -221,11 +221,11 @@ CREATE TABLE kv (
 - Connect to `JETSTREAM_URL` with `wantedCollections=app.bsky.feed.post`.
 - Filter each event: keep only `kind == "commit"` and `commit.operation == "create"`. Discard the rest.
 - Hand the raw event to `extract.rs` (§6.2) to produce an `ExtractedPost`.
-- Persist `time_us` cursor to `kv` every 5 seconds.
-- On reconnect: append `&cursor={last_us}`; exponential backoff on failure (1s → 2s → 4s → ... → 60s cap).
+- **Always subscribe at the live tail.** Never send a `cursor` parameter and never replay. Reconciliation is not worth it: the belief update uses the wall clock (`Utc::now()`), so a burst of old posts skips the decay that belongs between them and moves belief away from a price that already contains that news. A missed post costs one trade; a replayed post can produce a false edge and a bad trade.
+- On reconnect: exponential backoff (1s → 2s → 4s → ... → 60s cap). Posts published while the socket is down are lost by design.
 - Emit each `ExtractedPost` to a bounded broadcast channel (capacity ~1024). If the channel is full, drop oldest and log a rate-limited `warn!`.
 
-`ingest.rs` does no text processing beyond event filtering and cursor management. All structural extraction lives in `extract.rs`.
+`ingest.rs` does no text processing beyond event filtering. All structural extraction lives in `extract.rs`.
 
 ### 6.2 Post Extraction (`extract.rs`)
 
@@ -742,7 +742,7 @@ modifier    = "+" | "~" | "*" ;
 
 **Phase 1 — Foundation:**
 - Crate setup, config, SQLite schema + `db.rs` queries.
-- Jetstream WS client (`ingest.rs`) + extractor (`extract.rs`) with cursor persistence.
+- Jetstream WS client (`ingest.rs`) + extractor (`extract.rs`); live-tail subscribe, no replay.
 - `EngineRegistry` + a hand-written Sieve rule for a known market; verify posts flow through the matcher.
 - Assert that `extract.rs` output preserves raw case and punctuation (unit test: post with mixed case and leetspeak should still be extracted verbatim; expansion happens later in Sieve).
 
@@ -767,7 +767,7 @@ modifier    = "+" | "~" | "*" ;
 - [ ] Hand-test the whole pipeline against a known market with `budget=10`.
 - [ ] Confirm Manifold `limitProb=0.99` behaves as a market buy on a real test bet.
 - [ ] Confirm CF AI Gateway model identifiers.
-- [ ] Confirm Jetstream cursor replay on reconnect (kill -9 test).
+- [ ] Confirm a restart and a reconnect both resume at the live tail: the connect URL carries no `cursor`, and `messages_processed` never jumps after startup.
 - [ ] Confirm budget invariant holds across a buy → sell → buy cycle.
 - [ ] Confirm panic switch stops all buys within 2s.
 - [ ] Confirm `extract.rs` does not mutate case, punctuation, or Unicode — a post `"S.C.A.M 🚨"` reaches Sieve byte-for-byte intact; Sieve's `"scam"~` literal matches it, and `"SCAM"!` does not.
