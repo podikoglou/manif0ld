@@ -397,6 +397,27 @@ is queue-saturated, drop oldest and log `warn!`. Surface this count in
 `/status` per market. A decisions call times out after 10 seconds and sends
 again on the queue's next turn; nothing is retried inside the call.
 
+**`fair_prob` (S2):** `TriageClient::fair_prob` is a second decisions call, one
+per newly created market, for new-market sniping. It asks the probability that
+the market resolves YES and returns `{p, answer, cost_usd}`. The state is
+`{question, resolution_criteria, close_time, initial_prob, creator_id?}`, plus
+the answer texts on a multiple-choice market. It has no market history and no
+current price, because at creation `initial_prob` **is** the price.
+`resolution_criteria` is the key input, and `description` is absent.
+
+ALGO §4 sketches `fair_prob` as a score from 0 to 100. The vendored
+`rig::typesafeai` `Score` accepts only 2 to 10 levels, so a 101-level score is
+not expressible. The call uses a 10-level **decile rubric** instead ("between
+0% and 10%", …, "between 90% and 100%") and maps the model's expected
+zero-based band `s` to the band midpoint, `p = (s + 0.5) / 10`, clamped to
+`[0.01, 0.99]`. The strategy sees the same probability either way.
+
+On a multiple-choice market the one call sends `supported_answer`, a `choice`
+over the answer texts plus **"None of the market's answers"**, and
+`answer_probability`, the same decile rubric for the probability that the
+supported answer wins. The abstain choice returns `answer: None`, and the
+strategy must not snipe then.
+
 ### 6.5 Belief Engine (`belief.rs`)
 
 Log-odds with exponential decay toward market price. No credibility multipliers, no claim clustering, no slow-path consolidation.
