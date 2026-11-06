@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn open_creates_parent_directories_and_schema() {
         let path = std::env::temp_dir().join(format!(
-            "bsky-manifold-arb-test-{}-{}/nested/arb.db",
+            "manif0ld-test-{}-{}/nested/manif0ld.db",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
