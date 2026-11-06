@@ -26,10 +26,12 @@
 //! The module is deliberately stateless beyond the incrementing txid: every
 //! reconnect re-sends the subscription, and consumers rebuild mirrored
 //! state from the event stream. Events are delivered on an mpsc channel
-//! that is sized generously and **never drops**: when the buffer is full
-//! the socket loop itself blocks on `send`, pushing backpressure into the
-//! socket read instead of discarding tradeable data.
+//! that is sized generously and **never drops**: the socket loop queues
+//! parsed events locally first, and the send of each one is raced against
+//! the keepalive tick, so a full channel pushes backpressure into the
+//! socket read without ever stopping the app-level ping.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -41,7 +43,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::config::Config;
-use crate::error::{AppResult, Context};
+use crate::error::{AppResult, Context, anyhow};
 
 /// Endpoint of the Manifold broadcast websocket (verified live: no query
 /// parameters, no auth for the topics we use).
@@ -60,6 +62,13 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Interval between client keepalive pings. The server kills a silent
 /// connection within ~94 s; pinging at 20 s keeps that competitor far away.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Read-idle watchdog. The platform baseline measured in `docs/ALGO.md` §6.1
+/// is ≥2 msg/s average on the subscribed topics, so ten minutes with no
+/// frame at all — not even a pong — is a dead or NAT-orphaned connection.
+/// A silent connection is otherwise kept half-open until some write fails;
+/// silence is treated exactly like a close: reconnect with backoff.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Upper bound for reconnect backoff.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -339,31 +348,65 @@ where
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut parse_warn = RateLimited::new(BAD_PAYLOAD_LOG_INTERVAL);
     let mut full_warn = RateLimited::new(CHANNEL_FULL_LOG_INTERVAL);
+    // Parsed events wait here between the read arm and the flush, so a
+    // channel send that blocks takes neither the keepalive arm nor the read
+    // arm down with it (both are separate select branches below).
+    let mut pending: VecDeque<ManifoldEvent> = VecDeque::new();
 
-    let result: AppResult<()> = loop {
+    let result: AppResult<()> = 'main: loop {
         tokio::select! {
             // The interval's first tick fires immediately, pinging once
             // right after the ack; the server counts it as a lastSeen
             // refresh, so the extra frame costs nothing.
             _ = keepalive.tick() => {
                 txid = txid.wrapping_add(1);
-                if let Err(error) = sink.send(Message::Text(ping_message(txid).into())).await {
-                    break Err(error).context("sending the manifold keepalive ping");
+                if let Err(error) = send_ping(&mut sink, txid).await {
+                    break 'main Err(error);
                 }
             }
-            message = stream.next() => match message {
-                None => break Ok(()),
-                Some(Err(error)) => break Err(error).context("reading a manifold message"),
-                Some(Ok(Message::Text(text))) => {
-                    if let Err(error) =
-                        dispatch_frame(text.as_str(), tx, &mut parse_warn, &mut full_warn).await
-                    {
-                        break Err(error);
+            // Read-idle watchdog: total silence for [`READ_IDLE_TIMEOUT`] is
+            // a dead or NAT-orphaned connection, treated like a close.
+            message = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()) => match message {
+                Err(_elapsed) => break 'main Err(anyhow!(
+                    "no manifold frame arrived for the read-idle timeout ({READ_IDLE_TIMEOUT:?}); \
+                     treating the connection as dead"
+                )),
+                Ok(None) => break 'main Ok(()),
+                Ok(Some(Err(error))) =>
+                    break 'main Err(error).context("reading a manifold message"),
+                Ok(Some(Ok(Message::Text(text)))) =>
+                    queue_frame(text.as_str(), &mut pending, &mut parse_warn),
+                Ok(Some(Ok(Message::Close(_)))) => break 'main Ok(()),
+                // Ping, Pong, and Binary frames carry no broadcast data.
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+
+        // Flush the parsed events. Each send shares a select with the
+        // keepalive tick, so a full event channel (a stalled consumer)
+        // delays the next read — backpressure, as intended — without
+        // delaying the ping that keeps the connection alive (the server
+        // sweeps a silent connection at ~94 s). The sends stay sequential
+        // and forward-ordered, so delivery is still never-drop.
+        while let Some(event) = pending.front().cloned() {
+            if tx.capacity() == 0 && full_warn.ready() {
+                tracing::warn!(
+                    "manifold event channel is full; the socket loop is now blocking on sends"
+                );
+            }
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    txid = txid.wrapping_add(1);
+                    if let Err(error) = send_ping(&mut sink, txid).await {
+                        break 'main Err(error);
                     }
                 }
-                Some(Ok(Message::Close(_))) => break Ok(()),
-                // Ping, Pong, and Binary frames carry no broadcast data.
-                Some(Ok(_)) => {}
+                sent = tx.send(event) => {
+                    pending.pop_front();
+                    if let Err(error) = sent {
+                        break 'main Err(error).context("queueing a manifold event");
+                    }
+                }
             }
         }
     };
@@ -371,6 +414,19 @@ where
     // Best-effort close handshake; the peer may already be gone.
     let _ = sink.close().await;
     result
+}
+
+/// Sends one keepalive ping; exactly one per tick, in tick order.
+async fn send_ping<T>(
+    sink: &mut futures_util::stream::SplitSink<WebSocketStream<T>, Message>,
+    txid: u64,
+) -> AppResult<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    sink.send(Message::Text(ping_message(txid).into()))
+        .await
+        .context("sending the manifold keepalive ping")
 }
 
 /// Outcome of waiting for the subscribe ack.
@@ -451,20 +507,19 @@ enum ParsedFrame {
     Bad,
 }
 
-/// Parses one frame and queues its events on `tx`.
+/// Parses one raw text frame onto the pending queue.
 ///
 /// Parse failures never touch the connection: the frame is logged (rate
 /// limited) and dropped. Delivery failures do end the loop: a dropped
-/// receiver means no app is left, so returning the error lets the runner
-/// stop instead of reconnecting to nobody.
-async fn dispatch_frame(
-    raw: &str,
-    tx: &mpsc::Sender<ManifoldEvent>,
-    parse_warn: &mut RateLimited,
-    full_warn: &mut RateLimited,
-) -> AppResult<()> {
+/// receiver means no app is left, so the flush loop's `tx.send` error
+/// propagates and the runner stops instead of reconnecting to nobody.
+///
+/// The parse is synchronous and never awaits, which is what keeps it out of
+/// the way of the two select arms that guard connection health (the
+/// keepalive tick and the read-idle watchdog).
+fn queue_frame(raw: &str, pending: &mut VecDeque<ManifoldEvent>, parse_warn: &mut RateLimited) {
     match parse_frame(raw) {
-        ParsedFrame::Skip => Ok(()),
+        ParsedFrame::Skip => {}
         ParsedFrame::Bad => {
             if parse_warn.ready() {
                 tracing::debug!(
@@ -472,22 +527,12 @@ async fn dispatch_frame(
                     "dropping unparseable manifold broadcast frame"
                 );
             }
-            Ok(())
         }
         ParsedFrame::Events(events) => {
-            for event in events {
-                // A bounded mpsc `send` blocks while the buffer is full, so
-                // a slow consumer slows the socket loop instead of losing
-                // events (`docs/ALGO.md` §6.1: manifold events are never
-                // dropped).
-                if tx.capacity() == 0 && full_warn.ready() {
-                    tracing::warn!(
-                        "manifold event channel is full; the socket loop is now blocking on sends"
-                    );
-                }
-                tx.send(event).await.context("queueing a manifold event")?;
-            }
-            Ok(())
+            // Events wait in `pending` in arrival order; the flush loop
+            // sends them out one by one, raced against the keepalive so a
+            // full channel cannot starve the connection.
+            pending.extend(events);
         }
     }
 }
@@ -654,10 +699,11 @@ mod tests {
     async fn events(raw: &str) -> Vec<ManifoldEvent> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut parse_warn = RateLimited::new(BAD_PAYLOAD_LOG_INTERVAL);
-        let mut full_warn = RateLimited::new(CHANNEL_FULL_LOG_INTERVAL);
-        dispatch_frame(raw, &tx, &mut parse_warn, &mut full_warn)
-            .await
-            .expect("the test receiver stays alive");
+        let mut pending = VecDeque::new();
+        queue_frame(raw, &mut pending, &mut parse_warn);
+        for event in pending {
+            tx.send(event).await.expect("the test receiver stays alive");
+        }
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);

@@ -15,7 +15,9 @@
 //! Prices arrive live; REST is demoted to housekeeping (`docs/ALGO.md` §1):
 //! a 5-minute `Priority::Reconcile` pass chunks `GET /v0/market-probs` and
 //! replaces the old per-market `/positions` sync with one paginated portfolio
-//! snapshot. `MANIFOLD_WS_ENABLED=0` restores the legacy polling loop for the
+//! snapshot, and each pass ends with a REST-free cached-state sweep of every
+//! active market so a quiet market still reaches its belief-decay exit.
+//! `MANIFOLD_WS_ENABLED=0` restores the legacy polling loop for the
 //! duration of the canary — see [`TradeExecutor::run`].
 //!
 //! Positions, accounting, and the trading policy live in [`crate::book`]. The
@@ -59,9 +61,12 @@
 //! The API key is stored in [`ManifoldClient`] and sent in the `Authorization`
 //! header. It never appears in an error, a log line, or the `Debug` output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+/// Synchronous mutex (aliased against tokio's). Used only for locks that are
+/// taken and released inside one synchronous block.
+use std::sync::Mutex as SyncMutex;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -274,13 +279,16 @@ impl ManifoldClient {
     ///
     /// One entry per held position: a root row without an `answerId` plus one
     /// row per answer of a multiple-choice market, exactly the row shapes the
-    /// per-market `/positions` parser accepts. `complete` is false whenever
-    /// the page came back full, meaning callers must not infer "no metrics for
-    /// a market" as "the bot holds nothing there".
+    /// per-market `/positions` parser accepts. Returns the parsed map, the
+    /// *raw* entry count the server consumed (empty lists included — the
+    /// parser drops those, but they still advance pagination), and whether
+    /// the page was short of the limit, meaning no further pages exist.
+    /// Callers must not infer "no metrics for a market" as "the bot holds
+    /// nothing there" from anything but a fully paginated snapshot.
     pub async fn portfolio_page(
         &self,
         offset: usize,
-    ) -> AppResult<(HashMap<MarketId, Vec<Value>>, bool)> {
+    ) -> AppResult<(HashMap<MarketId, Vec<Value>>, usize, bool)> {
         let path = format!(
             "/v0/get-user-contract-metrics-with-contracts?userId={}&perAnswer=true&limit={}&offset={}",
             self.bot_user_id, PORTFOLIO_PAGE_SIZE, offset
@@ -291,8 +299,10 @@ impl ManifoldClient {
             .await?;
 
         let by_contract = parse_metrics_by_contract(&value);
-        let entries: usize = by_contract.values().map(Vec::len).sum();
-        Ok((by_contract, entries < PORTFOLIO_PAGE_SIZE))
+        // Pagination advances by raw entries: the server consumed a row for
+        // every list entry, including the empty lists the parser drops.
+        let raw_entries = raw_metrics_entry_count(&value);
+        Ok((by_contract, raw_entries, raw_entries < PORTFOLIO_PAGE_SIZE))
     }
 
     /// Buys `amount` mana of `outcome` shares at the best available price.
@@ -528,6 +538,9 @@ pub struct BetResult {
     #[serde(default, rename = "betId")]
     pub bet_id: String,
     pub amount: f64,
+    /// Sell responses may omit `shares`; `execute` already falls back to the
+    /// requested count downstream, so a missing field becomes 0.0.
+    #[serde(default)]
     pub shares: f64,
     #[serde(rename = "probBefore", default)]
     pub prob_before: Option<f64>,
@@ -691,6 +704,30 @@ fn parse_metrics_by_contract(value: &Value) -> HashMap<MarketId, Vec<Value>> {
     by_contract
 }
 
+/// Counts the raw `metricsByContract` rows in one portfolio page.
+///
+/// [`parse_metrics_by_contract`] drops contract entries it cannot use (an
+/// empty list, a non-array value), but the server consumed row space for
+/// every entry in the raw response. Completeness (is this the last page?)
+/// and the next pass's `offset` must both be computed from this raw count:
+/// a page that fills its limit with rows the parser drops would otherwise
+/// end pagination early and wrongly declare absent markets flat, zeroing
+/// real positions.
+fn raw_metrics_entry_count(value: &Value) -> usize {
+    let Some(metrics) = value.get("metricsByContract").and_then(Value::as_object) else {
+        return 0;
+    };
+
+    metrics
+        .values()
+        .map(|entry| match entry.as_array() {
+            Some(array) if !array.is_empty() => array.len(),
+            // An entry the parser would drop still occupied a row.
+            _ => 1,
+        })
+        .sum()
+}
+
 /// Reads a JSON number, defaulting to zero for missing or non-numeric fields.
 fn number_at(value: Option<&Value>) -> f64 {
     value.and_then(Value::as_f64).unwrap_or(0.0)
@@ -761,14 +798,44 @@ impl From<MarketProbs> for ProbPatch {
 /// all-extreme patch is the practical signature of a resolution broadcast.
 /// Price patches carry no `isResolved` flag, so the legacy loop's snapshot
 /// check (`evaluate_market`) is replaced by this guard: a resolved market
-/// must not trade — its positions settle automatically — and the evaluation
-/// resumes by itself only if the probability ever moves off the extreme.
+/// must not trade — its positions settle automatically — and, because the
+/// mirror clamps the stored price to 0.99/0.01, the skip is recorded in
+/// [`TerminalMirrors`] until a full [`TradeExecutor::sync_market`] refresh
+/// proves the market is tradable again.
 fn patch_is_terminal(patch: &ProbPatch) -> bool {
     let at_extreme = |prob: f64| prob <= 0.0 || prob >= 1.0;
     if let Some(root) = patch.root {
         return at_extreme(root);
     }
     !patch.answers.is_empty() && patch.answers.iter().all(|(_, prob)| at_extreme(*prob))
+}
+
+/// In-memory set of markets whose latest price observation was a terminal
+/// (resolution-signature) patch.
+///
+/// The price mirror clamps probabilities into the trading range, so the
+/// stored columns cannot show that a market resolved: a later material
+/// signal would then drive a buy against prices pinned at 0.99/0.01 —
+/// doomed against a settled contract. While a market is in this set its
+/// [`TradeExecutor::evaluate_cached`] checks skip it, and only a full
+/// [`TradeExecutor::sync_market`] REST snapshot (kind refresh, answer
+/// discovery, position truth) clears it. Nothing here is persisted: a
+/// restart re-derives the flag from the next event stream observation.
+#[derive(Debug, Default)]
+struct TerminalMirrors(HashSet<MarketId>);
+
+impl TerminalMirrors {
+    fn mark(&mut self, market_id: &str) {
+        self.0.insert(market_id.to_owned());
+    }
+
+    fn clear(&mut self, market_id: &str) {
+        self.0.remove(market_id);
+    }
+
+    fn contains(&self, market_id: &str) -> bool {
+        self.0.contains(market_id)
+    }
 }
 
 /// Per-market evaluation throttle for websocket price bursts.
@@ -914,6 +981,10 @@ pub struct TradeExecutor {
     /// reconcile backstop spends Reconcile-class tokens.
     rate: RateLimiter,
     execution_lock: Mutex<()>,
+    /// Markets whose latest mirrored price was a terminal patch; see
+    /// [`TerminalMirrors`]. Guarded by [`SyncMutex`], released before
+    /// anything awaits.
+    terminal_mirrors: SyncMutex<TerminalMirrors>,
     events: broadcast::Sender<TradeEvent>,
     /// Whether live prices stream from the websocket. `false` selects the
     /// legacy 60-second REST loop in [`TradeExecutor::run`].
@@ -940,6 +1011,7 @@ impl TradeExecutor {
             halflife_hours: config.belief_halflife_hours,
             rate: RateLimiter::per_minute(config.rate_limit_per_min, Box::new(SystemClock)),
             execution_lock: Mutex::new(()),
+            terminal_mirrors: SyncMutex::new(TerminalMirrors::default()),
             events,
             ws_enabled: config.manifold_ws_enabled,
         })
@@ -1009,6 +1081,9 @@ impl TradeExecutor {
     /// `Book::reconcile`, so loading the book is enough to decide on. The
     /// gating is exactly the legacy path's: status `ACTIVE`, kill switch,
     /// budget invariant (asserted per planned buy), and `TRADING_DRY_RUN`.
+    /// The terminal-mirror skip (see [`TerminalMirrors`]) also applies here,
+    /// since every call site — signal, price update, and the post-reconcile
+    /// pass — funnels through this method.
     ///
     /// Kind changes and brand-new answers are not caught here by design — the
     /// slow reconcile detects them (`docs/ALGO.md` phase 1).
@@ -1017,6 +1092,14 @@ impl TradeExecutor {
         market_id: &str,
         trigger_post_uri: Option<&str>,
     ) -> AppResult<Option<TradeRecord>> {
+        if self.terminal_mirror(market_id) {
+            tracing::debug!(
+                market_id = %market_id,
+                "last price observation was a resolution patch; skipping evaluation"
+            );
+            return Ok(None);
+        }
+
         let _guard = self.execution_lock.lock().await;
 
         let mut book = self.load_book(market_id)?;
@@ -1147,6 +1230,20 @@ impl TradeExecutor {
         let now = Utc::now().timestamp();
         self.prepare(&mut book, &snapshot, now).await?;
 
+        // The full REST snapshot is position truth for this market: only a
+        // refresh that proves the market is *not* resolved clears a
+        // terminal-mirror flag, and no other observation channel ever does.
+        // If the snapshot shows it resolved the skip stays, whatever the
+        // event stream does next.
+        if snapshot.is_resolved {
+            tracing::debug!(
+                market_id = %market_id,
+                "full sync found the market resolved; the terminal skip stays"
+            );
+        } else {
+            self.clear_terminal_mirror(market_id);
+        }
+
         if book.shape() == Shape::Answers {
             tracing::debug!(
                 market_id = %market_id,
@@ -1177,6 +1274,35 @@ impl TradeExecutor {
             }
         }
         errors
+    }
+
+    /// Runs one REST-free cached-state trade check for every active market.
+    ///
+    /// This is the post-reconcile evaluation sweep: the legacy 60-second
+    /// ticker caught exits caused by belief decay on markets that have gone
+    /// quiet — no sieve post sparks a signal, no websocket event fires, so
+    /// without a sweep such a market is never evaluated and its exit edge
+    /// never fires. The 5-minute reconcile pass is the new home for that
+    /// periodic role. Each check goes through [`TradeExecutor::evaluate_cached`],
+    /// so the decision logic is not forked and every per-market gate
+    /// (status, kill switch, terminal-mirror skip) is already inside it.
+    /// No debounce is needed: 5 minutes is self-limiting cadence.
+    ///
+    /// Per-market failures are logged and emitted so one broken market does
+    /// not stop the sweep. Called from the spawned reconcile task in
+    /// [`TradeExecutor::run`], never inline, so the executor stays available
+    /// to websocket events while it runs.
+    async fn evaluate_all_cached(&self) {
+        for market in self.store.active() {
+            if let Err(error) = self.evaluate_cached(&market.id, None).await {
+                tracing::error!(
+                    market_id = %market.id,
+                    error = %error,
+                    "periodic cached trade check failed"
+                );
+                self.emit_error(Some(market.id), error.to_string());
+            }
+        }
     }
 
     /// Sells every YES and NO share in one market.
@@ -1288,11 +1414,17 @@ impl TradeExecutor {
 
     /// Runs the trade executor.
     ///
-    /// With `MANIFOLD_WS_ENABLED` (the default) the loop has three arms:
+    /// With `MANIFOLD_WS_ENABLED` (the default) the loop has four arms:
     /// material pipeline signals (a trade check against the mirrored prices),
-    /// websocket `ManifoldEvent`s (price mirror + debounced trade check), and
-    /// a 5-minute reconcile ticker (batched REST backstop). The legacy branch
-    /// below restores the old polling loop when the flag is `0`.
+    /// websocket `ManifoldEvent`s (price mirror + debounced trade check), a
+    /// 5-minute reconcile ticker (batched REST backstop, run on its own task
+    /// with the summary returned over a channel so the loop never stops
+    /// draining events while it runs), and the drained result arm that also
+    /// frees the reconcile slot. Each reconcile pass is followed by a
+    /// REST-free cached-state evaluation of every active market, which
+    /// restores the legacy ticker's catch of belief-decay exits on markets
+    /// that go quiet. The legacy branch below restores the old polling loop
+    /// when the flag is `0`.
     ///
     /// No single failure stops the loop: trade errors are logged, broadcast
     /// lag is logged, and a closed pipeline channel ends the loop.
@@ -1319,6 +1451,16 @@ impl TradeExecutor {
         let mut ws_open = true;
         let mut ws_closed_at: Option<Instant> = None;
         let mut ws_down_warned = false;
+
+        // The reconcile pass runs on its own task instead of inline in the
+        // tick arm: an inline pass stops this loop from draining websocket
+        // events while REST is pending, which can fill the event channel and
+        // block the socket loop's sends away from its keepalive ping (the
+        // server sweeps a silent connection at ~94 s). Summaries come back
+        // through this one-slot channel; at most one pass runs at a time — a
+        // tick while one is running is skipped, not queued.
+        let (reconcile_tx, mut reconcile_rx) = mpsc::channel::<ReconcileSummary>(1);
+        let mut reconcile_task: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
             tokio::select! {
@@ -1349,7 +1491,15 @@ impl TradeExecutor {
                                 "trade event consumer lagged; some signals were skipped"
                             );
                         }
-                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Shutting down: a still-running reconcile task
+                            // would trade after the loop is gone, so it is
+                            // aborted with everything else.
+                            if let Some(task) = reconcile_task.take() {
+                                task.abort();
+                            }
+                            return Ok(());
+                        }
                     }
                 }
                 maybe = manifold_events.recv(), if ws_open => {
@@ -1467,19 +1617,52 @@ impl TradeExecutor {
                         }
                     }
 
-                    let summary = self.reconcile_pass().await;
-                    tracing::info!(
-                        markets_seen = summary.markets_seen,
-                        mismatches = summary.mismatches,
-                        tokens_spent = summary.tokens_spent,
-                        tokens_skipped = summary.tokens_skipped,
-                        "reconcile pass complete"
-                    );
-                    if summary.tokens_skipped > 0 {
-                        tracing::warn!(
-                            skipped = summary.tokens_skipped,
-                            "some reconcile reads were skipped for the trade reserve"
+                    if reconcile_task.is_some() {
+                        tracing::debug!("reconcile pass already running; skipping this tick");
+                        continue;
+                    }
+                    let executor = Arc::clone(&self);
+                    let reporting = reconcile_tx.clone();
+                    reconcile_task = Some(tokio::spawn(async move {
+                        let summary = executor.reconcile_pass().await;
+
+                        // The legacy 60-second ticker caught exits caused by
+                        // belief decay on quiet markets (no posts, so no
+                        // signal; no websocket event, so no evaluation).
+                        // After every pass the cached state is complete
+                        // enough to decide on, and this periodic sweep runs
+                        // `evaluate_cached` for every active market with the
+                        // same gating as the ws path (status, kill switch,
+                        // terminal-mirror skip — no debounce is needed at
+                        // 5-minute cadence). Nothing here calls REST per
+                        // market; fresh REST state is what the pass just
+                        // fetched.
+                        executor.evaluate_all_cached().await;
+
+                        let _ = reporting.send(summary).await;
+                    }));
+                }
+                maybe = reconcile_rx.recv(), if reconcile_task.is_some() => {
+                    // The pass signalled completion (or died without one);
+                    // the slot is free for the next tick either way.
+                    reconcile_task = None;
+                    // The sender the loop holds outlives this arm, so a
+                    // `None` means the task ended without reporting
+                    // (cancelled at shutdown is the expected case).
+                    if let Some(summary) = maybe {
+                        tracing::info!(
+                            markets_seen = summary.markets_seen,
+                            mismatches = summary.mismatches,
+                            tokens_spent = summary.tokens_spent,
+                            tokens_skipped = summary.tokens_skipped,
+                            "reconcile pass complete"
                         );
+                        if summary.tokens_skipped > 0 {
+                            tracing::warn!(
+                                skipped = summary.tokens_skipped,
+                                "some reconcile reads were skipped for the trade reserve"
+                            );
+                        }
                     }
                 }
             }
@@ -1557,7 +1740,11 @@ impl TradeExecutor {
     ///
     /// Probabilities are clamped into the trading range exactly as
     /// [`Book::observe_prices`] clamps a REST snapshot, so both observation
-    /// channels store comparable values.
+    /// channels store comparable values. A terminal patch (the resolution
+    /// signature, see [`patch_is_terminal`]) additionally marks the market in
+    /// [`TerminalMirrors`]: the clamp hides the resolution, so without the
+    /// mark a later material signal would try to trade a settled contract.
+    /// Only a full [`TradeExecutor::sync_market`] clears the mark.
     fn mirror_prices(&self, market_id: &str, patch: &ProbPatch) -> AppResult<()> {
         let answers: Vec<(MarketId, f64)> = patch
             .answers
@@ -1575,7 +1762,36 @@ impl TradeExecutor {
                 .root
                 .map(|prob| prob.clamp(MIN_TRADING_PROB, MAX_TRADING_PROB)),
             &answers,
-        )
+        )?;
+
+        if patch_is_terminal(patch) {
+            self.mark_terminal_mirror(market_id);
+        }
+        Ok(())
+    }
+
+    /// Records that `market_id`'s last observed price patch was terminal.
+    fn mark_terminal_mirror(&self, market_id: &str) {
+        self.terminal_mirrors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark(market_id);
+    }
+
+    /// Reports whether `market_id`'s last observed price patch was terminal.
+    fn terminal_mirror(&self, market_id: &str) -> bool {
+        self.terminal_mirrors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(market_id)
+    }
+
+    /// Full-sync completion of a market's terminal-mirror state.
+    fn clear_terminal_mirror(&self, market_id: &str) {
+        self.terminal_mirrors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear(market_id);
     }
 
     /// The slow REST reconcile backstop (every [`RECONCILE_INTERVAL`]).
@@ -1594,7 +1810,9 @@ impl TradeExecutor {
     ///    snapshot is reconciled through [`Book::reconcile`] (the same
     ///    warn-on-mismatch-trust-remote comparison), and when the pagination
     ///    is complete, tracked markets *absent* from it are treated as flat.
-    /// 3. A single summary line, logged by the caller of this method.
+    /// 3. A single summary line, logged by `run` when the pass reports back
+    ///    over its channel; `evaluate_all_cached` sweeps every active market
+    ///    over the freshly synced state right after.
     ///
     /// Per-market failures are logged and emitted so one broken market cannot
     /// stall the pass.
@@ -1662,17 +1880,20 @@ impl TradeExecutor {
             if pages == 0 && !summary.acquire(&self.rate, "portfolio") {
                 break;
             }
-            let (page, final_page) = match self.client.portfolio_page(offset).await {
-                Ok((page, final_page)) => (page, final_page),
+            let (page, raw_entries, final_page) = match self.client.portfolio_page(offset).await {
+                Ok((page, raw_entries, final_page)) => (page, raw_entries, final_page),
                 Err(error) => {
                     tracing::error!(error = %error, "portfolio snapshot fetch failed");
                     break;
                 }
             };
-            let page_size: usize = page.values().map(Vec::len).sum();
+            // The offset advances by the raw row count the server consumed:
+            // empty metric lists are dropped by the parser but still occupy
+            // a row, and an under-counted offset would re-fetch them next
+            // page. Completeness is likewise declared from the raw count.
             by_contract.extend(page);
             complete = final_page;
-            offset += page_size;
+            offset += raw_entries;
             pages += 1;
             if final_page {
                 break;
@@ -1734,12 +1955,28 @@ impl TradeExecutor {
     }
 
     /// Reconciles one market's position through the book, counting mismatches.
+    ///
+    /// Takes the executor's `execution_lock` so a portfolio snapshot that was
+    /// taken before a command cannot overwrite a position the command just
+    /// filled: an operator's `/track`-sized trade and this application of a
+    /// pre-trade snapshot must not interleave.
+    ///
+    /// # Lock ordering
+    ///
+    /// The lock is held only across local book work (load, `Book::reconcile`,
+    /// persist) — no REST call and no other lock is acquired while it is
+    /// held, so it cannot deadlock with the command handlers (Discord
+    /// commands acquire the same lock inside `evaluate_market`/`liquidate`,
+    /// also with nothing nested under it). One lock at a time, briefly,
+    /// everywhere: that is the whole ordering rule.
     async fn reconcile_book_position(
         &self,
         market_id: &str,
         positions: &MarketPositions,
         mismatches: &mut usize,
     ) -> AppResult<()> {
+        let _guard = self.execution_lock.lock().await;
+
         let mut book = self.load_book(market_id)?;
         if book.status() != MarketStatus::Active {
             return Ok(());
@@ -2229,6 +2466,21 @@ mod tests {
     }
 
     #[test]
+    fn bet_result_tolerates_a_sell_response_without_shares() {
+        // Sell responses can omit `shares`; downstream already falls back to
+        // the requested count, so the field must default instead of failing.
+        let raw = json!({
+            "id": "sell-2",
+            "amount": -6.0,
+            "isFilled": true
+        });
+        let bet: BetResult = serde_json::from_value(raw).expect("sell shape should deserialize");
+
+        assert_eq!(bet.shares, 0.0, "missing shares becomes the fallback sentinel");
+        assert_close(bet.net_proceeds(), 6.0);
+    }
+
+    #[test]
     fn position_parser_reads_a_yes_only_position() {
         let raw = json!([{
             "userId": "bot-1",
@@ -2485,6 +2737,53 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_pagination_counts_raw_entries_not_parsed_ones() {
+        // 5 raw rows on the page: "bin" carries 3, "mc" carries 1, and
+        // "empty" carries one row the parser drops (its list is empty).
+        // The raw count is what advances `offset` and what decides "is
+        // this the final page?": counting the parsed map instead would
+        // under-count by one, stack up duplicate rows each page, and —
+        // when a page is full of dropped rows — wrongly declare the
+        // snapshot complete and zero absent tracked markets.
+        let value = json!({
+            "metricsByContract": {
+                "bin": [
+                    {"userId": "bot-1", "totalShares": {"YES": 1.0}, "invested": 1.0},
+                    {"userId": "bot-1", "answerId": "a", "totalShares": {"YES": 2.0}, "invested": 1.0},
+                    {"userId": "bot-1", "answerId": "b", "totalShares": {"NO": 3.0}, "invested": 1.0}
+                ],
+                "mc": [
+                    {"userId": "bot-1", "totalShares": {"YES": 4.0}, "invested": 2.0}
+                ],
+                "empty": []
+            }
+        });
+
+        assert_eq!(raw_metrics_entry_count(&value), 5, "server consumed 5 rows");
+
+        let by_contract = parse_metrics_by_contract(&value);
+        assert_eq!(by_contract.len(), 2, "the parser drops empty lists");
+        let parsed: usize = by_contract.values().map(Vec::len).sum();
+        assert_eq!(parsed, 4, "parsed rows are one below the raw count");
+    }
+
+    #[test]
+    fn raw_metrics_count_shapeless_values_and_payloads() {
+        // No usable key, or a key whose value is itself shapeless: such a
+        // value still consumed a row, so it counts as one. A missing key
+        // counts nothing.
+        assert_eq!(raw_metrics_entry_count(&json!({})), 0);
+        assert_eq!(
+            raw_metrics_entry_count(&json!({"metricsByContract": null})),
+            0
+        );
+        assert_eq!(
+            raw_metrics_entry_count(&json!({"metricsByContract": {"c": "no"}})),
+            1
+        );
+    }
+
+    #[test]
     fn terminal_patches_are_detected_across_both_shapes() {
         // Binary at 0 or 1: the resolution signature of the legacy isResolved
         // check, which a price patch cannot carry.
@@ -2522,6 +2821,30 @@ mod tests {
             }),
             "an empty patch has no observation, hence no verdict"
         );
+    }
+
+    // -- Terminal-mirror state ---------------------------------------------
+
+    #[test]
+    fn terminal_mirrors_block_evaluation_until_a_full_sync_clears_them() {
+        let mut mirrors = TerminalMirrors::default();
+        assert!(!mirrors.contains("m1"), "fresh state skips nothing");
+
+        // A terminal (resolution-signature) price patch marks the market.
+        mirrors.mark("m1");
+        assert!(mirrors.contains("m1"));
+
+        // The mark is idempotent and survives more observed prices: only a
+        // full sync_market refresh clears it.
+        mirrors.mark("m1");
+        assert!(mirrors.contains("m1"));
+
+        mirrors.clear("m1");
+        assert!(!mirrors.contains("m1"), "a full sync clears the skip");
+
+        // Clearing without a mark stays a no-op.
+        mirrors.clear("m1");
+        assert!(!mirrors.contains("m1"));
     }
 
     // -- Debounce -----------------------------------------------------------

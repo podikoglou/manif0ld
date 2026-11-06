@@ -470,8 +470,9 @@ For an answer entry the target is additionally capped at
 `MC_MAX_ANSWER_FRACTION × budget_mana`.
 
 **Binary decision (called after each belief update, on every debounced
-websocket price update, and — with `MANIFOLD_WS_ENABLED=0` — on the legacy 60s
-ticker per active market):**
+websocket price update, after every 5-minute reconcile pass over all
+active markets on the cached state, and — with `MANIFOLD_WS_ENABLED=0` —
+on the legacy 60s ticker per active market):**
 
 ```
 edge = p_internal − p_market
@@ -547,11 +548,29 @@ paginated portfolio snapshot
 that replaces the per-market `/positions` sync. Rows map through
 `Book::reconcile` with the same semantics. Every reconcile read spends a
 Reconcile-class token from `rate.rs` and yields below the housekeeping
-reserve. A shape disagreement (market kind, a never-recorded answer) or an
-incomplete snapshot falls back to the full per-market `evaluate_market`/`sync_market`
-REST path, which still owns kind refresh and answer discovery. A price patch
-pinned exactly at 0/1 skips evaluation — the price-patch stand-in for the
-snapshot's `isResolved` check.
+reserve. The pass runs on its own task with the summary returned over a
+channel, so the websocket-event arm never stops draining while it works.
+
+A market whose shape disagrees with a batched probability reading — a
+multiple-choice market read as a bare `prob`, a binary market read with
+`answerProbs`, or an answer ID that has never been recorded — does **not**
+get the trading evaluation: it gets the non-trading full per-market
+`sync_market` REST call for that one market, which owns kind refresh,
+answer discovery with texts, and the position re-sync. A market **absent**
+from the `market-probs` response map (unknown ID, closed, unrecognized
+shape) is silently skipped for that pass and left to the next pass or the
+websocket.
+
+An incomplete portfolio snapshot is not corrected by per-market REST
+calls either: whatever pages arrived are reconciled through
+`Book::reconcile`, markets absent from an incomplete snapshot keep their
+stored position (the pass logs that it is running on partial data), and
+pagination offset plus completeness are computed from the raw response
+rows, including ones the parser drops. A price patch
+pinned exactly at 0/1 mirrors one final clamped observation (0.99/0.01)
+and then takes the market out of evaluation — the price-patch stand-in
+for the snapshot's `isResolved` check — until a full `sync_market`
+refresh with a not-resolved snapshot clears the skip.
 
 **Ledger:** Every successful bet writes a row to `trade_ledger`, including
 `answer_id` for a multiple-choice market, and updates
