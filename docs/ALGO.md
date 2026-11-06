@@ -8,10 +8,10 @@ architecture.
 
 | Asset | Property |
 |---|---|
-| Bluesky Jetstream | Every post, free, unlimited. Zero cost to listen wider. |
+| Bluesky Jetstream | Every post, free, unlimited. **~55 posts/s observed.** |
 | Decision model | Typed answers (noul / choice / score) in a few ms. |
 | Manifold REST API | 500 requests/minute per IP. Shared across everything. |
-| Manifold websocket | `wss://api.manifold.markets/ws`. Free, no rate limit. |
+| Manifold websocket | `wss://api.manifold.markets/ws`. Free, no rate limit. **Measured ~2 msg/s total.** |
 
 The single most important finding from reading the full API: **the websocket
 makes almost all REST reads unnecessary.** The current 60 s per-market
@@ -321,9 +321,27 @@ config keyed by `strategy.name()`.
 
 ### 6.1 Channel topology
 
-Yes — channels, but at the rate boundaries, not everywhere. The system has
-two rates: the firehose (~10³ posts/s) and the tradeable (~1 intent/s).
-Channels sit exactly where the rate changes:
+Yes — channels, but at the rate boundaries, not everywhere. Measured scale
+(2026-11-06, 2-minute live probe of all five global topics, Fri evening EET;
+single sample — re-probe before sizing anything hard):
+
+| Stream | avg rate | peak 15 s | payload | notes |
+|---|---|---|---|---|
+| Bluesky posts | ~55/s | — | — | the dominant stream, ~25× everything else |
+| `global/new-bet` | 1.3 msg/s | ~3.1/s | ~1.8 KB/msg | **`data.bets` is an array** (batched); includes unfilled limit orders (`limitProb`, `orderAmount`, `expiresAt`) — this one stream can mirror the resting book globally |
+| `global/updated-contract` | 0.5 msg/s | ~1.7/s | ~3.3 KB/msg | carries the full contract incl. `answers[].prob` — price updates need no REST |
+| `global/new-contract` | 0 in 2 min | — | — | rare (hours scale) — every snipe is precious: never-drop is correct |
+| `global/new-comment` | 0 in 2 min | — | — | — |
+| `global/new-subsidy` | 0 in 2 min | — | — | — |
+
+Totals: ~1.8 msg/s average, ~5 msg/s peak, ~4 KiB/s. Trivial. One task can
+consume every topic we will ever subscribe to; channel caps of 256–1024 are
+generous everywhere. The real bottleneck of the whole system was never
+throughput — it is the decision-call count, and at 55 posts/s the Sieve
+prefilter keeps that at a trickle.
+
+The system has two rates: the post stream (~55/s) and everything else
+(~2 events/s, ~1 intent/s). Channels sit exactly where the rate changes:
 
 ```
 Jetstream ──► broadcast<Post>  (cap 1024, drop-oldest) ──┐
