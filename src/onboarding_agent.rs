@@ -28,7 +28,7 @@
 /// print [`root_cause`].
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use firecrawl::{
     Client, Document, Format, ScrapeOptions, SearchOptions, SearchResultOrDocument, SearchSource,
@@ -72,6 +72,9 @@ const DRY_RUN_EXCERPT_CHARS: usize = 160;
 /// agent run open with no log line and no error until the `/track` wall. A
 /// timeout turns that silence into a tool result the model can react to.
 const FIRECRAWL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Longest the research loop waits to hand one update to the UI task.
+const UPDATE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Instructions appended to [`SIEVE_SYSTEM_PROMPT`] for the agent run.
 pub const AGENT_INSTRUCTIONS: &str = r##"You are the onboarding research agent for a prediction-market trader.
@@ -200,15 +203,26 @@ pub async fn synthesize(
 
     let agent = build_agent(model, tools);
 
-    let _ = updates
-        .send(OnboardUpdate::Phase(
-            "Researching the market topic…".to_owned(),
-        ))
-        .await;
+    report(
+        updates,
+        OnboardUpdate::Phase("Researching the market topic…".to_owned()),
+    )
+    .await;
 
     // The response is intentionally discarded: the agent communicates only
     // through its tools, and the accepted program is read from the slot.
+    tracing::info!(
+        market = %market.id,
+        max_turns = MAX_AGENT_TURNS,
+        "onboarding research agent starting"
+    );
     let _ = agent.prompt(build_sieve_user_prompt(market)).await;
+    tracing::info!(
+        market = %market.id,
+        submitted = state.submitted().is_some(),
+        attempts = state.attempts.load(Ordering::SeqCst),
+        "onboarding research agent stopped"
+    );
 
     match state.take_submitted() {
         Some(script) => Ok(script),
@@ -286,6 +300,12 @@ fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -
                 }
 
                 let attempt = state.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                tracing::info!(
+                    tool = "submit_sieve",
+                    attempt,
+                    bytes = program.len(),
+                    "tool call started"
+                );
                 let source = program.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
                     sieve::compile(&source)
@@ -303,13 +323,15 @@ fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -
                 match outcome {
                     Ok(warnings) => {
                         state.record_submitted(&program);
-                        let _ = updates
-                            .send(OnboardUpdate::Sieve(SieveAttempt {
+                        report(
+                            &updates,
+                            OnboardUpdate::Sieve(SieveAttempt {
                                 attempt,
                                 script: program,
                                 error: None,
-                            }))
-                            .await;
+                            }),
+                        )
+                        .await;
                         let warnings_text = if warnings.is_empty() {
                             String::new()
                         } else {
@@ -324,13 +346,15 @@ fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -
                     }
                     Err(error) => {
                         state.record_error(&error);
-                        let _ = updates
-                            .send(OnboardUpdate::Sieve(SieveAttempt {
+                        report(
+                            &updates,
+                            OnboardUpdate::Sieve(SieveAttempt {
                                 attempt,
                                 script: program,
                                 error: Some(error.clone()),
-                            }))
-                            .await;
+                            }),
+                        )
+                        .await;
                         Ok(ToolOutput::text(format!(
                             "compile error:\n{error}\nFix the program and call submit_sieve again."
                         )))
@@ -403,12 +427,19 @@ fn dry_run_sieve_tool(updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
                     ));
                 }
 
-                let _ = updates
-                    .send(OnboardUpdate::Phase(format!(
+                tracing::info!(
+                    tool = "dry_run_sieve",
+                    posts = posts.len(),
+                    "tool call started"
+                );
+                report(
+                    &updates,
+                    OnboardUpdate::Phase(format!(
                         "Dry-running the rule against {} sample posts…",
                         posts.len()
-                    )))
-                    .await;
+                    )),
+                )
+                .await;
 
                 let outcome = tokio::task::spawn_blocking(move || {
                     sieve::compile(&program).map(|engine| {
@@ -438,13 +469,15 @@ fn dry_run_sieve_tool(updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
                     Ok((warnings, results)) => {
                         let total = results.len();
                         let matched = results.iter().filter(|(matched, _)| *matched).count();
-                        let _ = updates
-                            .send(OnboardUpdate::Activity(ResearchStep::DryRun {
+                        report(
+                            &updates,
+                            OnboardUpdate::Activity(ResearchStep::DryRun {
                                 matched,
                                 total,
                                 warnings: warnings.len(),
-                            }))
-                            .await;
+                            }),
+                        )
+                        .await;
                         let results: Vec<Value> = results
                             .into_iter()
                             .map(|(matched, text)| json!({ "matched": matched, "text": text }))
@@ -457,11 +490,13 @@ fn dry_run_sieve_tool(updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
                     }
                     Err(error) => {
                         let message = root_cause(&error);
-                        let _ = updates
-                            .send(OnboardUpdate::Activity(ResearchStep::DryRunFailed {
+                        report(
+                            &updates,
+                            OnboardUpdate::Activity(ResearchStep::DryRunFailed {
                                 error: message.clone(),
-                            }))
-                            .await;
+                            }),
+                        )
+                        .await;
                         Ok(ToolOutput::text(format!(
                             "compile error:\n{message}\nFix the program and call dry_run_sieve again."
                         )))
@@ -483,13 +518,45 @@ async fn tool_failure(
     tool: &str,
     message: String,
 ) -> ToolExecutionError {
-    let _ = updates
-        .send(OnboardUpdate::Activity(ResearchStep::Failed {
+    tracing::warn!(tool, error = %message, "tool call failed");
+    report(
+        updates,
+        OnboardUpdate::Activity(ResearchStep::Failed {
             tool: tool.to_owned(),
             error: message.clone(),
-        }))
-        .await;
+        }),
+    )
+    .await;
     ToolExecutionError::new(ToolErrorKind::Other, message)
+}
+
+/// Hands one progress update to the UI, giving up rather than blocking the run.
+///
+/// The UI task edits a Discord message behind a rate limiter, so the channel can
+/// stay full for seconds at a time. Progress is best effort: a dropped update
+/// costs one log line, while a blocking send would stall the research loop with
+/// no LLM call and no error.
+async fn report(updates: &mpsc::Sender<OnboardUpdate>, update: OnboardUpdate) {
+    match tokio::time::timeout(UPDATE_SEND_TIMEOUT, updates.send(update)).await {
+        // The receiver is gone because the run already ended.
+        Ok(Ok(()) | Err(_)) => {}
+        Err(_) => {
+            tracing::warn!("dropped an onboarding progress update: the UI task is not draining")
+        }
+    }
+}
+
+/// Logs how one tool call ended, so a stalled run names the call that hung.
+fn log_tool_finished(
+    tool: &'static str,
+    started: Instant,
+    outcome: &Result<ToolOutput, ToolExecutionError>,
+) {
+    let elapsed_ms = started.elapsed().as_millis();
+    match outcome {
+        Ok(_) => tracing::info!(tool, elapsed_ms, "tool call finished"),
+        Err(error) => tracing::warn!(tool, elapsed_ms, error = %error, "tool call failed"),
+    }
 }
 
 /// Builds the `web_search` tool.
@@ -511,82 +578,92 @@ fn web_search_tool(client: Arc<Client>, updates: mpsc::Sender<OnboardUpdate>) ->
             let client = Arc::clone(&client);
             let updates = updates.clone();
             Box::pin(async move {
-                let query = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|query| !query.is_empty())
-                    .ok_or_else(|| {
-                        ToolExecutionError::invalid_args(
-                            "web_search requires a non-empty string `query` argument",
-                        )
-                    })?
-                    .to_owned();
+                let started = Instant::now();
+                let outcome = async {
+                    let query = args
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|query| !query.is_empty())
+                        .ok_or_else(|| {
+                            ToolExecutionError::invalid_args(
+                                "web_search requires a non-empty string `query` argument",
+                            )
+                        })?
+                        .to_owned();
 
-                let limit = args
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .map(|limit| (limit as u32).clamp(1, MAX_SEARCH_RESULTS))
-                    .unwrap_or(MAX_SEARCH_RESULTS / 2);
+                    let limit = args
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .map(|limit| (limit as u32).clamp(1, MAX_SEARCH_RESULTS))
+                        .unwrap_or(MAX_SEARCH_RESULTS / 2);
 
-                let _ = updates
-                    .send(OnboardUpdate::Phase(format!(
-                        "Researching: web search `{query}`…"
-                    )))
+                    tracing::info!(tool = "web_search", query = %query, "tool call started");
+                    report(
+                        &updates,
+                        OnboardUpdate::Phase(format!("Researching: web search `{query}`…")),
+                    )
                     .await;
 
-                let searched = tokio::time::timeout(
-                    FIRECRAWL_TIMEOUT,
-                    client.search(
-                        &query,
-                        SearchOptions {
-                            limit: Some(limit),
-                            sources: Some(vec![SearchSource::Web, SearchSource::News]),
-                            ..Default::default()
-                        },
-                    ),
-                )
+                    let searched = tokio::time::timeout(
+                        FIRECRAWL_TIMEOUT,
+                        client.search(
+                            &query,
+                            SearchOptions {
+                                limit: Some(limit),
+                                sources: Some(vec![SearchSource::Web, SearchSource::News]),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await;
+                    let response = match searched {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => {
+                            return Err(tool_failure(
+                                &updates,
+                                "web_search",
+                                format!("web_search failed: {error}"),
+                            )
+                            .await)
+                        }
+                        Err(_) => {
+                            return Err(tool_failure(
+                                &updates,
+                                "web_search",
+                                format!(
+                                    "web_search timed out after {}s for query `{query}`; \
+                                     try a narrower query, or continue without it",
+                                    FIRECRAWL_TIMEOUT.as_secs()
+                                ),
+                            )
+                            .await)
+                        }
+                    };
+
+                    let results: Vec<Value> = response
+                        .data
+                        .web
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(map_search_result)
+                        .collect();
+
+                    report(
+                        &updates,
+                        OnboardUpdate::Activity(ResearchStep::Search {
+                            query: query.clone(),
+                            results: results.len(),
+                        }),
+                    )
+                    .await;
+
+                    Ok(ToolOutput::json(json!({ "results": results })))
+                }
                 .await;
-                let response = match searched {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(error)) => {
-                        return Err(tool_failure(
-                            &updates,
-                            "web_search",
-                            format!("web_search failed: {error}"),
-                        )
-                        .await)
-                    }
-                    Err(_) => {
-                        return Err(tool_failure(
-                            &updates,
-                            "web_search",
-                            format!(
-                                "web_search timed out after {}s for query `{query}`; \
-                                 try a narrower query, or continue without it",
-                                FIRECRAWL_TIMEOUT.as_secs()
-                            ),
-                        )
-                        .await)
-                    }
-                };
 
-                let results: Vec<Value> = response
-                    .data
-                    .web
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(map_search_result)
-                    .collect();
-
-                let _ = updates
-                    .send(OnboardUpdate::Activity(ResearchStep::Search {
-                        query: query.clone(),
-                        results: results.len(),
-                    }))
-                    .await;
-
-                Ok(ToolOutput::json(json!({ "results": results })))
+                log_tool_finished("web_search", started, &outcome);
+                outcome
             })
         },
     )
@@ -635,92 +712,102 @@ fn read_page_tool(client: Arc<Client>, updates: mpsc::Sender<OnboardUpdate>) -> 
             let client = Arc::clone(&client);
             let updates = updates.clone();
             Box::pin(async move {
-                let raw_url = args
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|url| !url.is_empty())
-                    .ok_or_else(|| {
-                        ToolExecutionError::invalid_args(
-                            "read_page requires a non-empty string `url` argument",
-                        )
-                    })?
-                    .to_owned();
+                let started = Instant::now();
+                let outcome = async {
+                    let raw_url = args
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .ok_or_else(|| {
+                            ToolExecutionError::invalid_args(
+                                "read_page requires a non-empty string `url` argument",
+                            )
+                        })?
+                        .to_owned();
 
-                let parsed = url::Url::parse(&raw_url).map_err(|error| {
-                    ToolExecutionError::invalid_args(format!(
-                        "read_page requires an absolute http or https URL: {error}"
-                    ))
-                })?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    return Err(ToolExecutionError::invalid_args(format!(
-                        "read_page only reads http and https URLs, got `{}`",
-                        parsed.scheme()
-                    )));
-                }
+                    let parsed = url::Url::parse(&raw_url).map_err(|error| {
+                        ToolExecutionError::invalid_args(format!(
+                            "read_page requires an absolute http or https URL: {error}"
+                        ))
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        return Err(ToolExecutionError::invalid_args(format!(
+                            "read_page only reads http and https URLs, got `{}`",
+                            parsed.scheme()
+                        )));
+                    }
 
-                let _ = updates
-                    .send(OnboardUpdate::Phase(format!(
-                        "Researching: reading `{raw_url}`…"
-                    )))
+                    tracing::info!(tool = "read_page", url = %raw_url, "tool call started");
+                    report(
+                        &updates,
+                        OnboardUpdate::Phase(format!("Researching: reading `{raw_url}`…")),
+                    )
                     .await;
 
-                let scraped = tokio::time::timeout(
-                    FIRECRAWL_TIMEOUT,
-                    client.scrape(
-                        &raw_url,
-                        ScrapeOptions {
-                            formats: Some(vec![Format::Markdown]),
-                            only_main_content: Some(true),
-                            ..Default::default()
-                        },
-                    ),
-                )
+                    let scraped = tokio::time::timeout(
+                        FIRECRAWL_TIMEOUT,
+                        client.scrape(
+                            &raw_url,
+                            ScrapeOptions {
+                                formats: Some(vec![Format::Markdown]),
+                                only_main_content: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await;
+                    let document = match scraped {
+                        Ok(Ok(document)) => document,
+                        Ok(Err(error)) => {
+                            return Err(tool_failure(
+                                &updates,
+                                "read_page",
+                                format!("read_page failed: {error}"),
+                            )
+                            .await)
+                        }
+                        Err(_) => {
+                            return Err(tool_failure(
+                                &updates,
+                                "read_page",
+                                format!(
+                                    "read_page timed out after {}s for `{raw_url}`; \
+                                     try another source, or continue without it",
+                                    FIRECRAWL_TIMEOUT.as_secs()
+                                ),
+                            )
+                            .await)
+                        }
+                    };
+
+                    let markdown = document.markdown.as_deref().unwrap_or_default();
+                    if markdown.trim().is_empty() {
+                        return Err(ToolExecutionError::new(
+                            ToolErrorKind::Other,
+                            "read_page returned no readable content for this URL",
+                        ));
+                    }
+
+                    report(
+                        &updates,
+                        OnboardUpdate::Activity(ResearchStep::Page {
+                            url: raw_url.clone(),
+                            chars: markdown.chars().count(),
+                        }),
+                    )
+                    .await;
+
+                    Ok(ToolOutput::json(json!({
+                        "url": raw_url,
+                        "title": document_title(&document),
+                        "markdown": truncate_chars(markdown, MAX_PAGE_CHARS),
+                    })))
+                }
                 .await;
-                let document = match scraped {
-                    Ok(Ok(document)) => document,
-                    Ok(Err(error)) => {
-                        return Err(tool_failure(
-                            &updates,
-                            "read_page",
-                            format!("read_page failed: {error}"),
-                        )
-                        .await)
-                    }
-                    Err(_) => {
-                        return Err(tool_failure(
-                            &updates,
-                            "read_page",
-                            format!(
-                                "read_page timed out after {}s for `{raw_url}`; \
-                                 try another source, or continue without it",
-                                FIRECRAWL_TIMEOUT.as_secs()
-                            ),
-                        )
-                        .await)
-                    }
-                };
 
-                let markdown = document.markdown.as_deref().unwrap_or_default();
-                if markdown.trim().is_empty() {
-                    return Err(ToolExecutionError::new(
-                        ToolErrorKind::Other,
-                        "read_page returned no readable content for this URL",
-                    ));
-                }
-
-                let _ = updates
-                    .send(OnboardUpdate::Activity(ResearchStep::Page {
-                        url: raw_url.clone(),
-                        chars: markdown.chars().count(),
-                    }))
-                    .await;
-
-                Ok(ToolOutput::json(json!({
-                    "url": raw_url,
-                    "title": document_title(&document),
-                    "markdown": truncate_chars(markdown, MAX_PAGE_CHARS),
-                })))
+                log_tool_finished("read_page", started, &outcome);
+                outcome
             })
         },
     )
