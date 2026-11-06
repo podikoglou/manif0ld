@@ -233,7 +233,93 @@ before every buy; Discord-only control plane; triage wording stays in
 Invariants changed (operator requested): autonomous discovery is now in
 scope (S2/S3/S4), and limit orders are now in scope (S1 ladder, S5).
 
-## 6. Rollout order
+## 6. Strategy abstraction (modularity)
+
+The five strategies are one pattern with five signal sources. Make that
+explicit: a `Strategy` trait, one event bus, one intent type, one shared
+executor. Strategies never touch Manifold, the rate limiter, the database,
+or Discord directly — they emit *intents*, and the shared core enforces
+every invariant.
+
+```rust
+/// One unified event stream: Jetstream + Manifold ws + timers.
+pub enum Event {
+    Post(Arc<ExtractedPost>),      // Jetstream
+    Bet(BetEvent),                 // global/new-bet
+    Contract(NewContractEvent),    // global/new-contract
+    Answers(UpdatedAnswersEvent),  // contract/{id}/updated-answers
+    Orders(OrdersEvent),           // resting-book delta
+    Price(PriceEvent),             // updated-contract probability
+    Tick(u64),                     // periodic timer
+}
+
+/// What a strategy asks the core to do.
+pub enum Intent {
+    /// "Answer X is worth p" → belief engine → edge check → ladder.
+    /// Multiple strategies' beliefs on one market COMPOSE in the
+    /// belief engine instead of competing for trades.
+    Belief {
+        market: MarketId,
+        answer: Option<AnswerId>,
+        p: f64,
+        weight: f64,           // e.g. trader score for S3
+        ttl: Duration,         // belief impulse half-life override
+    },
+    /// "Run this exact plan" (arb basket, rebalance) — executor
+    /// validates budgets and risk, then runs it atomically.
+    Action(ActionPlan),
+}
+
+#[async_trait]
+pub trait Strategy: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Event filter, so posts are not cloned into the arb module.
+    fn interest(&self) -> Interest; // bitflags over Event kinds
+    async fn on_event(&self, ev: &Event, ctx: &Ctx, out: &mut Vec<Intent>);
+}
+```
+
+The dispatcher fans events out by `interest()`. The **executor** is the
+only writer to Manifold:
+
+```
+events ──► dispatcher ──► strategies ──► intents ──► Executor
+                                       (provenance)   │ budget invariant
+                                                       │ kill switch / dry-run
+                                                       │ Kelly sizing
+                                                       │ rate-bucket priority
+                                                       │ execution ladder
+                                                       ▼
+                                                    Manifold
+```
+
+Design wins:
+
+1. **Invariants live in one place.** Budget caps, the kill switch, dry-run,
+   and the audit ledger cannot be bypassed by a buggy new strategy, because
+   no strategy can place a bet itself.
+2. **Beliefs compose.** S1 says 0.70 on a market, S3's copy signal implies
+   0.65 — the belief engine merges the impulses and *one* trade decision
+   comes out. Two strategies firing simultaneously on the same market can
+   never double-bet; the edge check runs on merged state.
+3. **Provenance is free PnL attribution.** Every intent carries
+   `{strategy, evidence}` (post URI / bet id / contract id). It flows into
+   `trade_ledger` and the Discord embed, so a per-strategy scoreboard —
+   "which strategy actually makes mana?" — is a query, not a project. That
+   scoreboard later feeds `weight` auto-tuning.
+4. **Priority is data.** Latency-critical intents (stale-limit pickoff,
+   arb) declare the highest rate-bucket class; housekeeping declares the
+   lowest. The bucket arbitrates.
+5. **Adding strategy N+1 = one file + one registration + one config flag.**
+   No changes to belief, sizing, execution, rate limiting, or Discord.
+
+Migration: today's `pipeline.rs` (extract → sieve → triage → belief)
+becomes `NewsStrategy` — Sieve is its internal prefilter, triage its
+judgment call, and it emits `Intent::Belief`. `pipeline.rs` shrinks to the
+dispatcher. Per-strategy risk caps (e.g. the snipe pool) are executor-side
+config keyed by `strategy.name()`.
+
+## 7. Rollout order
 
 1. **`mfd_ws` + `rate` + reconcile swap** — kill 60 s polling. Pure win, no
    strategy change.
