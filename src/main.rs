@@ -244,7 +244,7 @@ fn log_pipeline_event(event: &PipelineEvent) {
                 market_id = %market_id,
                 author_handle = %author_handle,
                 post_uri = %post_uri,
-                "post matched filter, sending to LLM triage"
+                "post matched filter, sending to triage"
             );
         }
         PipelineEvent::Signal {
