@@ -593,6 +593,11 @@ Triggered by `/track url:<url> budget:<mana>`:
    the run ends without a compiling rule, abort and post the last compiler
    error to the Discord channel. `/track` wraps the whole run in a 600-second
    timeout; research plus several agent turns regularly exceeds the old 120 s.
+   Each model turn also carries a 120-second total deadline. A read timeout
+   alone cannot end a stalled turn: OpenRouter holds a queued upstream request
+   open with `: OPENROUTER PROCESSING` comment lines, and each comment resets
+   the per-read timeout, so the turn fails on a deadline instead of running to
+   the `/track` wall.
 5. **Persist** market row (initial `p_internal_log_odds = logit(market.probability)`), register `CompiledSieve` in `EngineRegistry`, create Discord thread, post the `[ONBOARDED]` embed.
 
    **Live progress:** the ephemeral `/track` followup is edited as onboarding
