@@ -17,6 +17,7 @@ const DEFAULT_EXIT_EDGE_THRESHOLD: f64 = 0.01;
 const DEFAULT_MIN_TRADE_SIZE: f64 = 1.0;
 const DEFAULT_BELIEF_KAPPA: f64 = 1.1;
 const DEFAULT_BELIEF_HALFLIFE_HOURS: f64 = 4.0;
+const DEFAULT_TRIAGE_MIN_EVIDENCE: f64 = 0.7;
 
 /// Runtime configuration for the bot.
 ///
@@ -43,6 +44,8 @@ pub struct Config {
     pub min_trade_size: f64,
     pub belief_kappa: f64,
     pub belief_halflife_hours: f64,
+    /// Probability of evidence a post must reach before it moves belief.
+    pub triage_min_evidence: f64,
     pub db_path: PathBuf,
 }
 
@@ -71,11 +74,18 @@ impl Config {
         let (triage_provider, _) = parse_model_spec(&triage_model)?;
         let onboarding_model = required(&get, "ONBOARDING_MODEL")?;
         let (onboarding_provider, _) = parse_model_spec(&onboarding_model)?;
+        if onboarding_provider == ModelProvider::OpenRouterDecisions {
+            bail!(
+                "ONBOARDING_MODEL must be a chat model; '{onboarding_model}' uses the decisions API"
+            );
+        }
 
         let needs_cloudflare = triage_provider == ModelProvider::Cloudflare
             || onboarding_provider == ModelProvider::Cloudflare;
-        let needs_openrouter = triage_provider == ModelProvider::OpenRouter
-            || onboarding_provider == ModelProvider::OpenRouter;
+        let needs_openrouter = matches!(
+            triage_provider,
+            ModelProvider::OpenRouter | ModelProvider::OpenRouterDecisions
+        ) || onboarding_provider == ModelProvider::OpenRouter;
 
         let cloudflare_account_id = if needs_cloudflare {
             let account_id = required(&get, "CLOUDFLARE_ACCOUNT_ID")?;
@@ -111,6 +121,8 @@ impl Config {
         let belief_kappa = f64_or(&get, "BELIEF_KAPPA", DEFAULT_BELIEF_KAPPA)?;
         let belief_halflife_hours =
             f64_or(&get, "BELIEF_HALFLIFE_HOURS", DEFAULT_BELIEF_HALFLIFE_HOURS)?;
+        let triage_min_evidence =
+            f64_or(&get, "TRIAGE_MIN_EVIDENCE", DEFAULT_TRIAGE_MIN_EVIDENCE)?;
 
         let db_path = optional(&get, "DB_PATH")
             .map(PathBuf::from)
@@ -134,6 +146,7 @@ impl Config {
             min_trade_size,
             belief_kappa,
             belief_halflife_hours,
+            triage_min_evidence,
             db_path,
         };
 
@@ -146,6 +159,8 @@ impl Config {
 pub enum ModelProvider {
     Cloudflare,
     OpenRouter,
+    /// OpenRouter's decisions endpoint, which serves System One models.
+    OpenRouterDecisions,
 }
 
 impl ModelProvider {
@@ -153,8 +168,15 @@ impl ModelProvider {
         match self {
             Self::Cloudflare => "cloudflare",
             Self::OpenRouter => "openrouter",
+            Self::OpenRouterDecisions => "openrouter-decisions",
         }
     }
+}
+
+/// Matches an ASCII prefix without splitting a multi-byte character.
+fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
 }
 
 /// Parses a model name prefix to determine the provider and underlying model name.
@@ -162,6 +184,7 @@ impl ModelProvider {
 /// Supported prefixes:
 /// - `cloudflare/` -> Cloudflare AI Gateway
 /// - `openrouter/` -> OpenRouter
+/// - `openrouter-decisions/` -> OpenRouter's decisions endpoint
 ///
 /// Models without a recognized provider prefix are rejected.
 pub fn parse_model_spec(model: &str) -> AppResult<(ModelProvider, &str)> {
@@ -169,33 +192,25 @@ pub fn parse_model_spec(model: &str) -> AppResult<(ModelProvider, &str)> {
     if trimmed.is_empty() {
         bail!("model name cannot be empty");
     }
-    if let Some(rest) = trimmed.strip_prefix("openrouter/").or_else(|| {
-        if trimmed.len() >= 11 && trimmed[..11].eq_ignore_ascii_case("openrouter/") {
-            Some(&trimmed[11..])
-        } else {
-            None
+
+    for (prefix, provider) in [
+        ("openrouter-decisions/", ModelProvider::OpenRouterDecisions),
+        ("openrouter/", ModelProvider::OpenRouter),
+        ("cloudflare/", ModelProvider::Cloudflare),
+    ] {
+        if let Some(rest) = strip_prefix_ci(trimmed, prefix) {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                bail!("model name after '{prefix}' prefix cannot be empty");
+            }
+            return Ok((provider, rest));
         }
-    }) {
-        let rest = rest.trim();
-        if rest.is_empty() {
-            bail!("model name after 'openrouter/' prefix cannot be empty");
-        }
-        Ok((ModelProvider::OpenRouter, rest))
-    } else if let Some(rest) = trimmed.strip_prefix("cloudflare/").or_else(|| {
-        if trimmed.len() >= 11 && trimmed[..11].eq_ignore_ascii_case("cloudflare/") {
-            Some(&trimmed[11..])
-        } else {
-            None
-        }
-    }) {
-        let rest = rest.trim();
-        if rest.is_empty() {
-            bail!("model name after 'cloudflare/' prefix cannot be empty");
-        }
-        Ok((ModelProvider::Cloudflare, rest))
-    } else {
-        bail!("model '{trimmed}' must begin with 'cloudflare/' or 'openrouter/' prefix");
     }
+
+    bail!(
+        "model '{trimmed}' must begin with 'cloudflare/', 'openrouter/', or \
+         'openrouter-decisions/' prefix"
+    )
 }
 
 /// Rejects an account id no URL can carry.
@@ -294,6 +309,7 @@ mod tests {
         assert_eq!(config.min_trade_size, 1.0);
         assert_eq!(config.belief_kappa, 1.1);
         assert_eq!(config.belief_halflife_hours, 4.0);
+        assert_eq!(config.triage_min_evidence, 0.7);
         assert_eq!(config.db_path, PathBuf::from("./data/arb.db"));
     }
 
@@ -427,12 +443,49 @@ mod tests {
         assert_eq!(p, ModelProvider::Cloudflare);
         assert_eq!(m, "@cf/meta/llama");
 
+        let (p, m) = parse_model_spec("openrouter-decisions/baseten/joey-1").unwrap();
+        assert_eq!(p, ModelProvider::OpenRouterDecisions);
+        assert_eq!(m, "baseten/joey-1");
+
         // Models without a prefix must error
         assert!(parse_model_spec("@cf/meta/llama").is_err());
         assert!(parse_model_spec("gpt-4o").is_err());
         assert!(parse_model_spec("openrouter/").is_err());
         assert!(parse_model_spec("cloudflare/").is_err());
+        assert!(parse_model_spec("openrouter-decisions/").is_err());
         assert!(parse_model_spec("").is_err());
+    }
+
+    #[test]
+    fn parses_decisions_triage_configuration() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| *name != "TRIAGE_MODEL");
+        vars.push(("TRIAGE_MODEL", "openrouter-decisions/baseten/joey-1"));
+        vars.push(("OPENROUTER_API_KEY", "sk-or-test-key"));
+
+        let config = config_from(&vars).expect("decisions triage config should load");
+        assert_eq!(config.triage_model, "openrouter-decisions/baseten/joey-1");
+    }
+
+    #[test]
+    fn rejects_decisions_onboarding_model() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| *name != "ONBOARDING_MODEL");
+        vars.push(("ONBOARDING_MODEL", "openrouter-decisions/baseten/joey-1"));
+        vars.push(("OPENROUTER_API_KEY", "sk-or-test-key"));
+
+        let error = config_from(&vars).expect_err("decisions onboarding should fail");
+        assert!(error.to_string().contains("ONBOARDING_MODEL"), "{error}");
+    }
+
+    #[test]
+    fn rejects_missing_openrouter_key_for_decisions_triage() {
+        let mut vars = required_vars();
+        vars.retain(|(name, _)| *name != "TRIAGE_MODEL");
+        vars.push(("TRIAGE_MODEL", "openrouter-decisions/baseten/joey-1"));
+
+        let error = config_from(&vars).expect_err("missing OPENROUTER_API_KEY should fail");
+        assert!(error.to_string().contains("OPENROUTER_API_KEY"), "{error}");
     }
 
     #[test]

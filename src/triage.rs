@@ -123,6 +123,9 @@ impl LlmClient {
                 })?
                 .completion(model)
                 .into(),
+            ModelProvider::OpenRouterDecisions => bail!(
+                "model '{raw_model}' uses the OpenRouter decisions endpoint and cannot drive an agent"
+            ),
         };
         Ok(model)
     }
@@ -158,6 +161,10 @@ impl LlmClient {
                 })?;
                 (client, "OpenRouter")
             }
+            ModelProvider::OpenRouterDecisions => bail!(
+                "model '{raw_model}' uses the OpenRouter decisions endpoint; \
+                 call it through the decisions client, not a chat completion"
+            ),
         };
 
         let response = client
