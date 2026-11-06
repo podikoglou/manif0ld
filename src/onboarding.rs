@@ -193,9 +193,34 @@ pub struct SieveAttempt {
 pub enum OnboardUpdate {
     /// A coarse phase message shown while a slow step runs.
     Phase(String),
+    /// A completed research step, with the counts the operator wants to see
+    /// (how many results a search returned, how large a page was, how many
+    /// samples a dry run matched).
+    Activity(ResearchStep),
     /// One completed Sieve submission: the program and, on failure, its
     /// compiler error.
     Sieve(SieveAttempt),
+}
+
+/// One completed onboarding research step.
+///
+/// Unlike [`OnboardUpdate::Phase`], which is a transient "this is running"
+/// line, a step is history: the caller appends it to the rolling log so the
+/// operator can see what the agent already did and what it found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResearchStep {
+    /// A Firecrawl web search returned `results` items.
+    Search { query: String, results: usize },
+    /// A Firecrawl page read returned `chars` characters of Markdown.
+    Page { url: String, chars: usize },
+    /// A dry run compiled and matched `matched` of `total` sample posts.
+    DryRun {
+        matched: usize,
+        total: usize,
+        warnings: usize,
+    },
+    /// A dry run did not compile; the root cause is shown as history.
+    DryRunFailed { error: String },
 }
 
 /// A fully resolved market that has not been persisted yet.
