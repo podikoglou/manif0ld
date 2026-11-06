@@ -39,16 +39,21 @@ const MANIFOLD_SLUG_URL: &str = "https://api.manifold.markets/v0/slug";
 /// Timeout for Manifold lookups.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// System prompt for Sieve synthesis, copied verbatim from the specification.
+/// System prompt for Sieve synthesis, mirrored in the specification (§7).
 pub const SIEVE_SYSTEM_PROMPT: &str = r##"You are an expert filtration engineer writing a program in the Sieve DSL.
-Sieve is a declarative, zero-backtracking O(N) DSL that compiles into a SIMD
-Lookup Table, a Double-Array Aho-Corasick trie, and 64-bit Glushkov Shift-AND
-proximity state words.
+Sieve is a declarative, zero-backtracking O(N) DSL that compiles into an
+Aho-Corasick trie over case-folded tokens and native compiled proximity
+state machines.
 
-### 1. LEXICAL DEFAULTS (handled internally by the Sieve engine)
+### 1. LEXICAL FACTS (handled internally by the Sieve engine)
 - Case-Insensitive: "launch" matches "Launch", "LAUNCH".
-- Unicode Normalized: input is NFKC-normalized, zero-width joiners stripped.
-- Implicit Word Boundaries: "bot" matches "a bot!", "#bot", but NOT "robot".
+- A token is a contiguous run of ASCII letters, digits, and underscores.
+  Accented characters END a token: "após" tokenizes as "ap" + "s". This is
+  why short literals are dangerous: a 2-letter token in a Romance-language
+  post is almost always a fragment of a longer word.
+- Implicit word boundaries: "bot" matches "a bot!", "#bot", but NOT "robot".
+- Word content is matched verbatim apart from case folding. There is NO
+  Unicode normalization of word content.
 
 ### 2. LITERAL MODIFIERS
 - "word"    : exact token (case-insensitive)
@@ -56,12 +61,12 @@ proximity state words.
 - "word"~   : leetspeak/obfuscation normalization (@/4→a, 3→e, 1/!→i, 0→o, $/5→s, s.c.a.m→scam)
 - "word"*   : prefix wildcard ("gpt5"* matches "gpt5turbo")
 - *"word"   : suffix wildcard (*"coin" matches "bitcoin", "memecoin")
-- "word"!   : case-sensitive exact match (use on short acronyms: "API"!, "SEC"!, "AGI"!)
 - Chainable: *"coin"+~ = suffix + morphology + leetspeak
+- The case-sensitive `!` modifier is NOT supported. Do not use it.
 
 ### 3. COMBINATORS
 - A | B      : OR
-- A B        : adjacent sequence
+- A B        : adjacent sequence (ordered, distance 1)
 - A ..N B    : ordered proximity (≤ N intervening tokens, 1≤N≤16)
 - A &..N B   : unordered proximity window (1≤N≤16)
 - A & B      : document co-occurrence
@@ -80,17 +85,45 @@ seq_expr    = term { [ prox_op ] term } ;
 prox_op     = ".." INT | "&.." INT ;
 term        = literal | "@" IDENT | "(" expr ")" ;
 literal     = [ "*" ] STRING { modifier } ;
-modifier    = "+" | "~" | "*" | "!" ;
+modifier    = "+" | "~" | "*" ;
 
-### 5. DESIGN REQUIREMENTS FOR THIS USE CASE
+### 5. CONSTRUCTS THE COMPILER REJECTS
+1. A quoted literal containing a space fails to compile ("Donald Trump"),
+   because a pattern may not span tokens. Write phrases with adjacency:
+   "donald" "trump", or use a single distinctive token ("trump").
+2. A case-sensitive `!` literal containing uppercase letters ("SEC"!) fails
+   to compile: patterns are scanned on the case-folded stream. Drop `!`.
+
+### 6. WRITING RULES THAT DO NOT MISFIRE
+1. `&..N` and `..N` bind TIGHTER than `|`. Parenthesize the group a window
+   applies to: ("associated" "press" | "ap" | "reuters") &..8 ("call"+ | "win"+).
+   Written without the parentheses, only the last alternative is constrained
+   and the others match standalone.
+2. Never include the anchor token in its own context set. `"midterms" &..8
+   @terms` is vacuous when @terms contains "midterm"+: the same occurrence
+   satisfies the window at distance 0.
+3. Never rely on a 1-2 character token ("AP", "US", "FF") without a tight
+   proximity window, and never attach `+` to one. Wire-service abbreviations
+   need context: ("ap" | "associated" "press" | "nbc") &..6 ("call"+ |
+   "projection"+ | "race" | "win"+).
+4. Name people by their distinctive surname ("talarico"), or as an
+   adjacency phrase ("mary" "peltola"). Common first names alone match
+   the wrong people.
+5. The `-` exception guard is document-wide: only subtract RARE words
+   (airdrop, memecoin, fanfic), never common words like "job" or "call".
+6. Prefer verbs/events with strong signalling value ("call"+, "win"+,
+   "projection"+) over bare topic nouns.
+
+### 7. DESIGN REQUIREMENTS FOR THIS USE CASE
 1. Every @macro ends with ';'. The final `match Market_<id> { ... }` has no ';'.
 2. Polysemy guard: never match ambiguous nouns (e.g., "apple", "orion") standalone;
    always bind to a domain context via `(@codenames &..8 @domain_context)`.
 3. This rule's ONLY job is topical filtering — matching posts plausibly related to
-   the market. Direction (YES vs NO) is determined by a downstream LLM, so DO NOT
+   the market. Direction (YES vs NO) is determined by a downstream model, so DO NOT
    try to encode direction. Match both supportive and skeptical posts equally.
-4. Always include a `- @noise` exception at the end of the match block to subtract
-   crypto airdrops, memecoins, job postings, and fanfiction."##;
+4. Always include a `- @noise` exception at the end of the match block to
+   subtract rare noise words (airdrop/memecoin promo, giveaway spam,
+   fanfiction tags)."##;
 
 /// One market as returned by `GET /v0/slug/{slug}`.
 ///

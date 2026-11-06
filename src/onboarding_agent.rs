@@ -1,12 +1,15 @@
 //! The onboarding research agent: research a market, then submit a Sieve rule.
 //!
 //! Onboarding is a `rig` agent, not a fixed prompt loop. The agent is given
-//! three tools:
+//! four tools:
 //!
 //! - `web_search` (Firecrawl) finds current sources for the market topic.
 //! - `read_page` (Firecrawl) reads the most useful sources in full.
-//! - `submit_sieve` compiles a candidate Sieve program and reports the compiler
-//!   error back to the model.
+//! - `dry_run_sieve` compiles a candidate program and reports which sample
+//!   posts it matches, plus authoring warnings, so the agent can tighten the
+//!   rule against look-alike posts before it goes live.
+//! - `submit_sieve` compiles a candidate program and reports the compiler
+//!   error (or warnings) back to the model.
 //!
 //! The agent keeps retrying `submit_sieve` until the program compiles; there is
 //! no attempt limit. [`MAX_AGENT_TURNS`] is only a runaway guard. The accepted
@@ -17,6 +20,12 @@
 //! later periodic research agent, but for now research feeds only the Sieve
 //! script.
 
+/// Tool-calling surface of the onboarding agent.
+///
+/// Compile errors are surfaced as text for the model to read and retry. The
+/// raw error is an `anyhow` chain whose top context is only "invalid Sieve
+/// source: <program>"; the useful message sits at the root cause, so tools
+/// print [`root_cause`].
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +53,15 @@ const MAX_SEARCH_RESULTS: u32 = 8;
 /// Longest page or document excerpt returned to the model, in characters.
 const MAX_PAGE_CHARS: usize = 20_000;
 
+/// Maximum posts one `dry_run_sieve` call may test.
+const MAX_DRY_RUN_POSTS: usize = 20;
+
+/// Longest post text one `dry_run_sieve` call accepts, in characters.
+const MAX_DRY_RUN_POST_CHARS: usize = 2_000;
+
+/// Longest post excerpt echoed back in a dry-run result.
+const DRY_RUN_EXCERPT_CHARS: usize = 160;
+
 /// Instructions appended to [`SIEVE_SYSTEM_PROMPT`] for the agent run.
 pub const AGENT_INSTRUCTIONS: &str = r##"You are the onboarding research agent for a prediction-market trader.
 
@@ -55,12 +73,21 @@ pub const AGENT_INSTRUCTIONS: &str = r##"You are the onboarding research agent f
    - Use at most 8 searches and 5 page reads.
    - Prefer primary sources, official announcements, and recent news.
 
-2. Write and submit one Sieve program.
+2. Test one candidate rule with `dry_run_sieve` before submitting it.
+   - Write 6-10 short sample Bluesky posts: several on-topic posts that the
+     market genuinely cares about, and several look-alike posts that must NOT
+     match (other languages, weather or traffic bots, deal spam, posts using
+     one of your keywords in an unrelated sense, airport style "AP"), plus a
+     couple of clearly unrelated posts.
+   - Call `dry_run_sieve` with the candidate program and those samples.
+   - If an off-topic sample matched, narrow the matching arm (add context,
+     tighten the window, drop the arm) and call `dry_run_sieve` again.
+   - Address the warnings the tool returns; they mark fragile constructs.
+
+3. Submit the final program with `submit_sieve`.
    - The program must start with `match Market_<id> { ... }`.
-   - Call `submit_sieve` with the complete program.
-   - `submit_sieve` returns `ok` when the program compiles, or the compiler error.
-   - If it returns an error, fix the program and call `submit_sieve` again.
-     There is no attempt limit.
+   - `submit_sieve` returns `ok` when the program compiles, or the compiler
+     error. Fix and resubmit on error; there is no attempt limit.
    - When `submit_sieve` returns `ok`, stop. Do not write a summary, an
      explanation, or any other final text. Your final message is ignored.
 
@@ -125,6 +152,7 @@ pub async fn synthesize(
 
     let tools = vec![
         submit_sieve_tool(state.clone(), updates.clone()),
+        dry_run_sieve_tool(updates.clone()),
         web_search_tool(Arc::clone(&firecrawl), updates.clone()),
         read_page_tool(Arc::clone(&firecrawl), updates.clone()),
     ];
@@ -155,6 +183,21 @@ pub async fn synthesize(
             None => bail!("onboarding agent stopped without submitting a Sieve rule"),
         },
     }
+}
+
+/// Flattens an `anyhow` chain to the message text of its deepest cause.
+///
+/// `error.to_string()` prints only the outermost context ("invalid Sieve
+/// source: <program>"), which hides the actual compiler message from the
+/// model. The deepest cause is the parser or engine message it needs.
+fn root_cause(error: &anyhow::Error) -> String {
+    let mut message = error.to_string();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+    while let Some(cause) = current.and_then(std::error::Error::source) {
+        message = cause.to_string();
+        current = Some(cause);
+    }
+    message
 }
 
 /// Builds the `submit_sieve` tool.
@@ -209,8 +252,8 @@ fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -
                 let source = program.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
                     sieve::compile(&source)
-                        .map(|_compiled| ())
-                        .map_err(|error| error.to_string())
+                        .map(|compiled| compiled.warnings().to_vec())
+                        .map_err(|error| root_cause(&error))
                 })
                 .await
                 .map_err(|error| {
@@ -221,7 +264,7 @@ fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -
                 })?;
 
                 match outcome {
-                    Ok(()) => {
+                    Ok(warnings) => {
                         state.record_submitted(&program);
                         let _ = updates
                             .send(OnboardUpdate::Sieve(SieveAttempt {
@@ -230,9 +273,17 @@ fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -
                                 error: None,
                             }))
                             .await;
-                        Ok(ToolOutput::text(
-                            "ok: the program compiled. Stop calling tools.",
-                        ))
+                        let warnings_text = if warnings.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                ". Warnings collected below; fix them if you can:\n{}",
+                                warnings.join("\n")
+                            )
+                        };
+                        Ok(ToolOutput::text(format!(
+                            "ok: the program compiled{warnings_text}. Stop calling tools."
+                        )))
                     }
                     Err(error) => {
                         state.record_error(&error);
@@ -247,6 +298,121 @@ fn submit_sieve_tool(state: SubmitState, updates: mpsc::Sender<OnboardUpdate>) -
                             "compile error:\n{error}\nFix the program and call submit_sieve again."
                         )))
                     }
+                }
+            })
+        },
+    )
+}
+
+/// Builds the `dry_run_sieve` tool.
+///
+/// Like `submit_sieve`, compilation runs on a blocking thread because
+/// [`sieve::CompiledSieve`] holds JIT mappings and is `!Send`. The tool never
+/// records a submission; it exists so the agent can observe matching behavior
+/// on sample posts before anything goes live.
+fn dry_run_sieve_tool(updates: mpsc::Sender<OnboardUpdate>) -> DynamicTool {
+    let parameters = json!({
+        "type": "object",
+        "properties": {
+            "sieve_program": {
+                "type": "string",
+                "description": "The complete candidate Sieve program."
+            },
+            "test_posts": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1,
+                "maxItems": MAX_DRY_RUN_POSTS,
+                "description": "Short Bluesky-style sample posts to test the program against."
+            }
+        },
+        "required": ["sieve_program", "test_posts"]
+    });
+
+    DynamicTool::new(
+        tool_name("dry_run_sieve"),
+        "Compile a candidate Sieve program and report which sample posts it matches, plus \
+         authoring warnings. Use it to tighten the rule before submitting it.",
+        parameters,
+        move |args| {
+            let updates = updates.clone();
+            Box::pin(async move {
+                let program = args
+                    .get("sieve_program")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ToolExecutionError::invalid_args(
+                            "dry_run_sieve requires a string `sieve_program` argument",
+                        )
+                    })?
+                    .to_owned();
+
+                let posts = args
+                    .get("test_posts")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .take(MAX_DRY_RUN_POSTS)
+                            .map(|text| truncate_chars(text.trim(), MAX_DRY_RUN_POST_CHARS))
+                            .filter(|text| !text.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if posts.is_empty() {
+                    return Err(ToolExecutionError::invalid_args(
+                        "dry_run_sieve requires at least one non-empty `test_posts` entry",
+                    ));
+                }
+
+                let _ = updates
+                    .send(OnboardUpdate::Phase(format!(
+                        "Dry-running the rule against {} sample posts…",
+                        posts.len()
+                    )))
+                    .await;
+
+                let outcome = tokio::task::spawn_blocking(move || {
+                    sieve::compile(&program).map(|engine| {
+                        (
+                            engine.warnings().to_vec(),
+                            posts
+                                .iter()
+                                .map(|text| {
+                                    (
+                                        !engine.matches(text).is_empty(),
+                                        truncate_chars(text, DRY_RUN_EXCERPT_CHARS),
+                                    )
+                                })
+                                .collect::<Vec<(bool, String)>>(),
+                        )
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    ToolExecutionError::new(
+                        ToolErrorKind::Other,
+                        format!("dry-run task failed: {error}"),
+                    )
+                })?;
+
+                match outcome {
+                    Ok((warnings, results)) => {
+                        let results: Vec<Value> = results
+                            .into_iter()
+                            .map(|(matched, text)| json!({ "matched": matched, "text": text }))
+                            .collect();
+                        Ok(ToolOutput::json(json!({
+                            "warnings": warnings,
+                            "results": results,
+                            "next": "narrow any rule arm that matched an off-topic post"
+                        })))
+                    }
+                    Err(error) => Ok(ToolOutput::text(format!(
+                        "compile error:\n{}\nFix the program and call dry_run_sieve again.",
+                        root_cause(&error)
+                    ))),
                 }
             })
         },
@@ -547,6 +713,64 @@ mod tests {
             .contains("already submitted"));
         assert_eq!(state.submitted().as_deref(), Some(GOOD_SIEVE));
         assert_eq!(state.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_tool_reports_matches_and_warnings() {
+        let (tx, _keep) = mpsc::channel(16);
+        let dry = dry_run_sieve_tool(tx);
+
+        // `("talarico" | "ff")` exercises the short-literal warning too.
+        let output = dry
+            .run(json!({
+                "sieve_program": r#"match Market_test { ("talarico" | "ff") &..4 "senate" }"#,
+                "test_posts": ["talarico speaks at the senate hearing", "weather is nice today"]
+            }))
+            .await
+            .expect("valid dry-run should succeed");
+
+        let value = output.as_json().cloned().expect("dry-run returns JSON");
+        let results = value["results"].as_array().expect("results array");
+        assert!(results.iter().any(|r| r["matched"] == json!(true)), "{value}");
+        assert!(results.iter().any(|r| r["matched"] == json!(false)), "{value}");
+        let warnings = value["warnings"].as_array().expect("warnings array");
+        assert!(warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("under 3 characters")));
+    }
+
+    #[tokio::test]
+    async fn dry_run_tool_returns_compile_errors_as_tool_text() {
+        let (tx, _keep) = mpsc::channel(16);
+        let dry = dry_run_sieve_tool(tx);
+
+        let output = dry
+            .run(json!({
+                "sieve_program": r#"match Market_test { "Donald Trump" }"#,
+                "test_posts": ["Donald Trump spoke"]
+            }))
+            .await
+            .expect("compile errors come back as tool text, not failures");
+
+        let text = output.as_text().unwrap_or_default();
+        assert!(text.starts_with("compile error:"), "{text}");
+        assert!(text.contains("spans several tokens"), "{text}");
+        assert!(!text.contains("invalid Sieve source"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_tool_rejects_missing_args() {
+        let (tx, _keep) = mpsc::channel(16);
+        let dry = dry_run_sieve_tool(tx);
+
+        let error = dry.run(json!({})).await.expect_err("no args must fail");
+        assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
+
+        let error = dry
+            .run(json!({ "sieve_program": "match M { \"x\" }" }))
+            .await
+            .expect_err("no test posts must fail");
+        assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
     }
 
     #[tokio::test]
