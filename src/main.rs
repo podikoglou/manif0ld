@@ -19,6 +19,7 @@
 mod belief;
 mod book;
 mod config;
+mod control;
 mod db;
 mod discord;
 mod error;
