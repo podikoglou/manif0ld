@@ -8,9 +8,9 @@
 //!
 //! `tokio::sync::broadcast` keeps no history: a receiver created after a sender
 //! has published does not see that event. Every subscription must therefore exist
-//! before the first task starts. `App::spawn` is the only function in the crate
-//! that subscribes to a channel, and it does so in one block before its first
-//! spawn. A new channel adds its sender and its receiver in that same block.
+//! before the first task starts. `App::spawn` is the only production code that
+//! subscribes to a broadcast channel, and it does so in one block before its
+//! first spawn. A new channel adds its sender and its receiver in that same block.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
