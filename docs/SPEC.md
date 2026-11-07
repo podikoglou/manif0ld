@@ -1380,6 +1380,33 @@ executor and the reconcile pass treat them like every other active row:
 prices mirror, maker fills apply, exits fire, and `/panic` sweeps them. A
 `news` row the operator owns is never copied onto and never re-owned.
 
+### 6.12 S4 sum-to-one arbitrage — evaluated, not implemented
+
+**Decision: no-go.** The S4 design in `docs/ALGO.md` §S4 was probed against the
+live API on 2026-11-07 and is not feasible as written. Details, citations and
+the sizing math are in
+`docs/research/2026-11-07-sum-to-one-arb-probe.md` (a research artifact, not a
+spec). No S4 module, watcher, or ledger exists.
+
+- **The deficit never appears.** `Σp = 1` to within `4e-14` on all 926 open
+  sum-to-one markets (two snapshots 90 s apart). Every bet, answer creation and
+  liquidity change re-arbs `Σ` back to 1 inside the same transaction, and
+  `cpmm-multi-2` rejects any trade that would break it.
+- **A basket is blocked on 81% of the set.** `POST /v0/multi-bet` over more
+  than one answer is hard-rejected on `cpmm-multi-2` (752 of 926 markets). Only
+  174 small markets are even eligible.
+- **The bound is negligible.** Profit scales as `δ² × depth`; a median market
+  (8 answers, ~1000 liquidity) at a hypothetical 1% deficit is worth ≈0.1 mana
+  per window, and a 1% deficit was never observed.
+- **`rebalance` does not help.** It is real, free and accurate, but it only
+  collapses an existing YES/NO basket. The S1 rebalance action therefore
+  remains unused: with no S4 basket there is nothing to collapse, and S1 is
+  YES-only on sum-to-one markets.
+
+Reopen S4 only if a live deficit is ever measured; use
+`contract/{id}/new-bet` as the trigger (not `updated-answers`), and size with
+equal YES **shares** per answer (see the research note §6).
+
 ## 7. Sieve DSL Reference (for onboarding LLM)
 Embed the following verbatim in `onboarding.rs` as `SIEVE_SYSTEM_PROMPT`; `onboarding_agent.rs` appends its agent instructions to it at run time. Word content is matched verbatim apart from ASCII case folding; the engine's tokenizer, normalization, and word-boundary behavior are all described in the prompt itself, and must stay in sync with the engine.
 
