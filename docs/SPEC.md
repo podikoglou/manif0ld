@@ -7,7 +7,11 @@
 1. **Filter-first.** Sieve + one decision-model call per surviving post is the product. If the filter works, the bot works.
 2. **Auto-trading is in scope, but simple.** Fair-capped limit buys (§6.6) whose unfilled remainder rests with an expiry. Enter once per market per direction on strong edge, exit once on edge decay. No partial scaling, no stop-loss regimes, no client-placed standing orders.
 3. **Per-market isolated budgets.** Each market has `budget_mana`. Never invest more than `budget_mana` net in a market. Realized profits cycle back into that market's available budget only.
-4. **No autonomous market discovery.** Markets only enter via operator `/track`.
+4. **No autonomous *news* market discovery.** Operator markets enter only via
+   `/track` (or onboarding). The `snipe` and `copy` strategies may create
+   `tracked_markets` rows autonomously, but each row is strategy-tagged and
+   drawn from its own isolated pool (`SNIPE_POOL_MANA`, `COPY_POOL_MANA`), and
+   both flags (`SNIPE_ENABLED`, `COPY_ENABLED`) default to `false`.
 5. **No calibration, no self-healing.** The onboarding LLM writes one Sieve rule. If it compiles, it's live. If the operator doesn't like it, they `/untrack` and `/track` again with a fresh prompt.
 6. **Discord is the only control plane.**
 7. **Text extraction ≠ text normalization.** Our pipeline extracts the searchable text from a Jetstream event (post body + image alt-texts + quoted text). It does **not** lowercase, strip punctuation, expand leetspeak, or apply word-boundary logic. All lexical normalization (case folding, NFKC, zero-width stripping, leetspeak, morphological expansion, implicit word boundaries) is performed by the Sieve engine internally, per the DSL spec in §7. We pass raw extracted text into Sieve and let the engine handle the rest.
@@ -114,7 +118,7 @@ DISCORD_OPERATOR_USER_ID=...
 
 # Trading (defaults, overridable per market via /track)
 DEFAULT_MARKET_BUDGET=100
-KELLY_FRACTION=0.25
+KELLY_FRACTION=0.25        # effective fraction is clamped to 0.5 by the planner
 ENTRY_EDGE_THRESHOLD=0.05
 EXIT_EDGE_THRESHOLD=0.01
 MIN_TRADE_SIZE=1.0
@@ -129,8 +133,8 @@ SNIPE_POOL_MANA=100        # dedicated global pool, separate from per-market bud
 SNIPE_MAX_MANA=10          # per-snipe cap (clamped to the pool remaining at use time)
 SNIPE_MIN_LIQ=100          # minimum totalLiquidity
 SNIPE_MIN_GAP=0.10         # minimum |p_model - p_initial|
-SNIPE_KELLY_FRACTION=0.25
-SNIPE_TTL_SECS=3600        # eligibility window from contract creation
+SNIPE_KELLY_FRACTION=0.25  # effective fraction is clamped to 0.5
+SNIPE_TTL_SECS=3600        # eligibility window from contract creation, [1, 604800]
 SNIPE_DECISION_TIMEOUT_SECS=2
 
 # S3 smart-money leaderboard (read-only; copy execution has its own flag)
@@ -138,14 +142,14 @@ TRADERS_ENABLED=true
 TRADER_WATCH_SIZE=200      # [10, 1000]
 TRADER_MIN_BETS=25         # activity gate
 TRADER_REFRESH_MIN=60      # [5, 1440]
-TRADER_REQUEST_BUDGET=120  # hard cap per refresh; 3 + 2 per enriched trader
+TRADER_REQUEST_BUDGET=120  # hard cap per refresh; 2 + ceil(N/100) + 2 per enriched trader
 
 # S3b copy-trading execution (off by default)
 COPY_ENABLED=false
 COPY_MIN_SIZE=5            # minimum source-bet size in mana
 COPY_MIN_INFORMED=0.60     # is_informed_bet gate, (0, 1)
 COPY_MIN_EDGE=0.05         # residual edge after their move, (0, 1)
-COPY_KELLY_FRACTION=0.125  # half-Kelly, (0, 0.5]
+COPY_KELLY_FRACTION=0.125  # (0, 1]; effective fraction is clamped to 0.5
 COPY_MAX_MANA=10           # per-copy cap
 COPY_POOL_MANA=100         # global pool for open copy positions
 COPY_DAILY_MANA=30         # rolling 24 h cap on executed copy buys
@@ -228,6 +232,7 @@ CREATE TABLE trade_ledger (
   p_internal      REAL NOT NULL,
   p_market        REAL NOT NULL,
   trigger_post_uri TEXT,
+  limit_prob      REAL,                   -- migration 009: wire limitProb of a buy
   manifold_bet_id TEXT,
   created_at      INTEGER NOT NULL
 );
@@ -559,7 +564,11 @@ winner (`cpmm-multi-1`) or are independent binaries (`cpmm-multi-2`).
 Both kinds run through one planner (`book::Book::plan`): the binary/multiple-
 choice differences — the entry price band, the per-answer budget fraction, and
 the sum-to-one projection — are `TradeLimits` data selected by the market shape,
-not separate code paths.
+not separate code paths. The planner opens entries only on operator `news`
+rows. A `snipe` or `copy` row is **exits only**: its entries are owned by the
+strategy, sized against the isolated pool, and executed through
+`TradeExecutor::execute_planned`, so a refused or unfilled strategy order can
+never be re-entered by the periodic evaluation as a news trade.
 
 **Sizing** (fractional Kelly, λ = `KELLY_FRACTION`, capped at 50% of the
 relevant budget):
@@ -976,7 +985,7 @@ and the reason; free gates run before any REST spend):
 | 6 | Discovery-class rate token, then one `GET /v0/market/{id}` | — | `rate_limited` |
 | 7 | Snapshot not resolved; snapshot type/mechanism supported | — | `resolved`, `unsupported_*` |
 | 8 | Multiple choice has at least one answer | — | `no_answers`, `no_probability` |
-| 9 | `SNIPE_POOL_MANA − SUM(invested − realized_pnl)` ≥ `MIN_TRADE_SIZE` | pool 100 | `pool_exhausted` |
+| 9 | `SNIPE_POOL_MANA − SUM(invested − realized_pnl) − resting ≥ MIN_TRADE_SIZE` | pool 100 | `pool_exhausted` |
 | 10 | `totalLiquidity` ≥ `SNIPE_MIN_LIQ` | 100 | `low_liquidity`, `liquidity_unknown` |
 | 11 | One `fair_prob` call with the snipe deadline | 2 s | `decision_failed: …` |
 | 12 | Multiple choice: model names a tracked answer and its price exists | — | `no_answer_selected`, `answer_not_in_market`, `answer_price_missing` |
@@ -985,7 +994,8 @@ and the reason; free gates run before any REST spend):
 | 15 | Kelly target ≥ `MIN_TRADE_SIZE` | 1.0 | `below_min_size` |
 | 16 | Insert row + answers, resolve the book leg, return the order | — | — |
 
-**Fair value.** One `TriageClient::fair_prob` call (decile rubric; §6.4). It
+**Fair value.** One `TriageClient::fair_prob` call (decile rubric; §6.4, an
+ALGO §4 deviation because the vendored `Score` has at most 10 levels). It
 carries `{question, resolution_criteria, close_time, initial_prob,
 creator_id?}` and, on a multiple-choice market, the answer texts. The market
 object has one `initialProb`, not one per answer, so the multiple-choice state
@@ -996,42 +1006,76 @@ always computed against the **chosen answer's actual price**.
 `probability` (falling back to `initialProb`); at creation it is the price. On
 a multiple-choice market the model picks an answer (the abstain alternative
 returns `answer: None` and is skipped), and `p_initial` is that answer's
-`answers[].probability`. `gap = p_model − p_initial`; a positive gap buys YES,
-a negative one buys NO (independent `cpmm-multi-2` markets only — a `cpmm-multi-1`
-NO leg is a basket and the regular planner never opens one).
+`answers[].probability`. Every price is clamped to `[0.01, 0.99]` exactly as
+`strategy_market.rs` clamps the row and answer columns, so the ledger, the gap,
+and the book always agree. `gap = p_model − p_initial`; a positive gap buys
+YES, a negative one buys NO. A NO leg is opened only on an **independent**
+answer set (`shouldAnswersSumToOne = false`, i.e. `cpmm-multi-2`): on a
+`shouldAnswersSumToOne = true` field a NO leg is a basket over the whole field
+and the guard skips it regardless of mechanism name.
+
+**Multiple-choice belief write.** `insert_market_row` anchors every answer
+belief at its own price. Before returning the order, the snipe writes the
+model's value onto the chosen answer
+(`db.update_answer_belief(market, answer_id, logit(p_model), p_initial, now)`),
+so after the fill the leg reads a real edge instead of `price − price = 0`
+(which would make the planner exit the position immediately). On a sum-to-one
+field the planner projects `q_i = p_i / Σ p_j`; the other answer beliefs are
+therefore rescaled to sum to exactly `1 − p_model`, which makes the projection
+return `p_model` on the chosen leg. Binary markets need no extra write: their
+single leg already reads the root row's `p_internal`.
 
 **Sizing.** The shared fractional-Kelly formula (`book::kelly_target_mana`), on
 one budget value:
 
 ```
-cap      = min(SNIPE_MAX_MANA, SNIPE_POOL_MANA − snipe_pool_invested())
+cap      = min(SNIPE_MAX_MANA,
+               SNIPE_POOL_MANA − snipe_pool_invested() − resting_snipe)
 size     = min(cap, kelly_target_mana(gap, p_initial, cap,
                                        λ = SNIPE_KELLY_FRACTION,
                                        entry_edge_threshold = SNIPE_MIN_GAP))
 skip if  size < MIN_TRADE_SIZE
 ```
 
+`SNIPE_KELLY_FRACTION` is passed straight through, but
+`kelly_target_mana` clamps the effective fraction to `0.5`, so a configured
+`1.0` still risks at most half of `cap`. `resting_snipe` is the unfilled mana
+of own resting orders on `strategy = 'snipe'` rows.
+
 **Per-market budget and the pool.** The inserted row's `budget_mana` is `cap`,
 not `size`, so the existing
 `available = budget + realized_pnl − invested` invariant holds unchanged for
 the row. The pool is the sum over `strategy = 'snipe'`, `status = 'ACTIVE'`,
 `deleted_at IS NULL` rows of `invested − realized_pnl`; realized profit returns
-to the pool automatically. The pool sum does not count money resting in an
-unfilled snipe order; that commitment is bounded by the same per-market
-`cap` ceiling.
+to the pool automatically. Unfilled own resting orders on snipe rows are also
+subtracted from the pool (`resting_snipe`): the mana is committed to the same
+pool before it fills, and a maker fill converts it to invested mana without
+changing the total commitment. A maker fill on a snipe row stays
+`trade_ledger`-only; its pool effect arrives through the invested column, and
+the unfilled remainder is already counted through `resting_snipe`.
 
 **Execution.** `SnipeStrategy` returns a `PlannedTrade` plus provenance; the
 executor's `execute_planned` takes the execution lock, loads the book, reads the
 kill switch, and calls the existing `execute` — budget invariant, Trade-class
 token, fair-capped whole-percent limit, expiring rest, own-order tracking,
 `trade_ledger`, position persistence, and the Discord event. No second trade
-path exists. `trade_ledger.trigger_post_uri` carries the contract ID.
+path exists. `trade_ledger.trigger_post_uri` carries the contract ID, and the
+sent `limit_prob` is written to `trade_ledger.limit_prob` (migration 009).
+
+The pre-execution pool number is only an early filter: the market fetch and the
+decision call take seconds. After taking `execution_lock` and loading the row,
+the executor re-reads `snipe_pool_invested()` and the resting layer and clamps
+the buy to the remainder (or refuses it with a `snipe_cap: …` ledger reason when
+the remainder is below `MIN_TRADE_SIZE`). That under-lock check is
+authoritative, so two snipes that passed their pre-checks against the same
+remainder cannot both spend it.
 
 A row that passes every gate is inserted before execution, so an execution
-refusal (kill switch, rate floor, dry run, zero fill) leaves a tracked snipe
-row with no position; the snipe row simply waits for the next price or
+refusal (kill switch, rate floor, dry run, cap, zero fill) leaves a tracked
+snipe row with no position; the snipe row simply waits for the next price or
 reconcile evaluation like any other active row. Only the ledger distinguishes
-the refusal.
+the refusal. The regular planner may only exit such a row, never enter it
+(§6.6).
 
 On a sum-to-one multiple-choice market the fair cap is built from the planner's
 normalized leg belief (§6.6), while sizing uses the raw `gap`; the fill
@@ -1039,24 +1083,27 @@ therefore never exceeds the normalized fair value even when the raw gap is
 larger.
 
 **Why it cannot double-bet.** Our own bet produces an `updated-contract`, so
-the regular cached evaluation may run moments later. `Book::plan` only opens a
-leg with no shares; the snipe fill created one, and belief never moves on our
-own trade, so the regular path can only produce an exit. A zero-share fill
-leaves the leg flat, but the snipe order is not retried; the next normal entry
-is bounded by the row's `cap`.
+the regular cached evaluation may run moments later. Non-`news` rows are
+planned exits-only (§6.6), so the regular path can produce an exit but never an
+entry; the snipe order is not retried there. A zero-share fill leaves the leg
+flat, and only a new strategy evaluation (never the planner) may enter it, with
+the same pool and per-market cap.
 
 **Ledger.** Every gate writes a `SKIP` row with whatever `p_initial`,
 `p_model`, and `gap` were already known. The buy row is written **after**
-execution with the real `mana_amount` and `manifold_bet_id` from `trade_ledger`
-(the wire limit lives in `trade_ledger`, not here); a refusal or a zero-share
-fill writes `SKIP` with reason `unfilled: …`. `cost_usd` is the decision-call
-cost when OpenRouter reports it.
+execution with the real `mana_amount` and `manifold_bet_id` from `trade_ledger`;
+the wire limit is the `trade_ledger.limit_prob` column written by `execute`
+(migration 009). A refusal or a zero-share fill writes `SKIP` with the
+executor's reason (`unfilled: snipe_cap: …`, `dry_run`, …). `cost_usd` is the
+decision-call cost when OpenRouter reports it.
 
 **TTL.** `SNIPE_TTL_SECS` gates eligibility only: a contract whose `createdTime`
 is older than the TTL when the broadcast is evaluated is skipped
 (`ttl_expired`). It does not expire the tracked row, cap the holding period, or
 cancel later orders. It can be reached after a long executor stall or a
 replayed event; with a healthy socket a new-market event is milliseconds old.
+The config validates it into `[1, 604800]` seconds (one week), and the strategy
+converts it with a checked conversion.
 
 **Provenance.** Snipe rows have no Discord thread, so the trade lands in the
 control channel through the normal `channel_for_market` fallback. The `[TRADE]`
@@ -1133,20 +1180,21 @@ produce the same score. The bet count gates instead of blending because the
 activity probe is capped at `TRADER_MIN_BETS` to stay cheap, so every passing
 trader reports the same full sample; one lucky bet never buys a slot.
 
-**Refresh cost and cadence.** One pass costs three universe requests (two
-leaderboard pages plus one bulk name lookup per 100 candidates) and **two per
-enriched trader** (history for the profit windows, a bounded bets call for the
-gate). `TRADER_REQUEST_BUDGET` (default 120) is a hard cap, so a default pass
-fully enriches 58 traders. Candidates are visited stalest-first (never-seen
-first, then oldest `updated_at`), so the whole list rotates across passes and
-everyone keeps their last score meanwhile; raise the budget to
-`3 + 2 × TRADER_WATCH_SIZE` (403 at the defaults) to refresh the full list in
-one pass. Every request spends a `Priority::Discovery` token from the shared
-500/min bucket; a refusal ends the pass early instead of erroring. A full
-200-trader pass is 403 requests and ~30 MB of history payload (~175 KB per
+**Refresh cost and cadence.** One pass costs `2 + ceil(N/100)` universe
+requests: two leaderboard pages plus one bulk name lookup per 100 candidates
+(`N = TRADER_WATCH_SIZE`; four at the default 200) and **two per enriched
+trader** (history for the profit windows, a bounded bets call for the gate).
+`TRADER_REQUEST_BUDGET` (default 120) is a hard cap, so a default pass fully
+enriches 58 traders. Candidates are visited stalest-first (never-seen first,
+then oldest `updated_at`), so the whole list rotates across passes and everyone
+keeps their last score meanwhile; raise the budget to
+`2 + ceil(N/100) + 2 × TRADER_WATCH_SIZE` (404 at the defaults) to refresh the
+full list in one pass. Every request spends a `Priority::Discovery` token from
+the shared 500/min bucket; a refusal ends the pass early instead of erroring. A
+full 200-trader pass is 404 requests and ~30 MB of history payload (~175 KB per
 trader), still inside one minute of the bucket; at the default budget it is
-~120 requests. `TRADER_REFRESH_MIN` (default 60) sets the cadence and the first
-pass runs immediately at startup.
+~120 requests. `TRADER_REFRESH_MIN` (default 60) sets the cadence and the
+first pass runs immediately at startup.
 
 **Persistence and sharing.** `trader_scores` is rewritten by one replace-all
 transaction per pass and is the row truth. `TraderBoard` is the read cache in
@@ -1190,6 +1238,7 @@ database, or write rows.
 | c | `TraderBoard::lookup(user_id)` hits | — | silent `None` (high-volume path; one short read lock) |
 | d | Bet ID not seen in the bounded 4096-entry ring | — | silent `None` (duplicate delivery of one bet) |
 | e | `now − created_time ≤ COPY_MAX_AGE_SECS` | 30 s | `stale_bet` |
+| e′ | The same age re-checked immediately before execution | 30 s | `stale_bet` |
 | f | `is_filled` and `amount ≥ COPY_MIN_SIZE` | 5 | `unfilled_bet`, `below_min_size` |
 | g | Row ownership: no `news` row, no `snipe` row, not soft-deleted, `ACTIVE` | — | `news_tracked`, `snipe_tracked`, `market_untracked`, `market_closed` |
 | g | Same-direction position already held on the row | — | `already_positioned` |
@@ -1226,19 +1275,23 @@ direction-flipped edge) is what Kelly sees, with `p_current` as the YES price:
 that is exactly the planner's convention, where a negative edge selects the NO
 formula `λ·|edge| / p_market` and a positive one `λ·edge / (1 − p_market)`.
 
-**Sizing and caps.** One per-market ceiling is computed from three caps:
+**Sizing and caps.** One per-market ceiling is computed from three caps and the
+resting layer:
 
 ```
 cap  = min(COPY_MAX_MANA,
-           COPY_POOL_MANA  − Db::copy_pool_invested(),
-           COPY_DAILY_MANA − Db::copy_spent_last_24h(now))
+           COPY_POOL_MANA  − Db::copy_pool_invested() − resting_copy,
+           COPY_DAILY_MANA − Db::copy_spent_last_24h(now) − resting_copy)
 size = min(cap, kelly_target_mana(residual_yes, p_current, cap, λ))
 skip when size < MIN_TRADE_SIZE
 ```
 
-`COPY_KELLY_FRACTION` defaults to `0.125`, half the news default: the source
-move is already in the price, so the remaining edge is smaller and less certain
-than a fresh news edge.
+`resting_copy` is the unfilled mana of own resting orders on
+`strategy = 'copy'` rows. `COPY_KELLY_FRACTION` defaults to `0.125`, half the
+news default: the source move is already in the price, so the remaining edge is
+smaller and less certain than a fresh news edge. `kelly_target_mana` clamps the
+effective fraction to `0.5`, so values above that (including a configured
+`COPY_KELLY_FRACTION` of 1) never risk more than half of `cap`.
 
 - **Pool accounting.** `copy_pool_invested()` is
   `SUM(invested_mana − realized_pnl_mana)` over `strategy = 'copy'`,
@@ -1249,13 +1302,31 @@ than a fresh news edge.
   over `copy_ledger` rows whose `action` is an executed buy (`BUY_YES` or
   `BUY_NO`) and whose `created_at ≥ now − 86 400`. Refused copies and exit
   signals never consume it, and closing a position does **not** refund it:
-  the point of a daily cap is to bound new deployment per day.
-- **Concurrency.** The strategy runs inline in the single executor loop, so
-  two copies cannot both read the same pool remainder and both spend it.
+  the point of a daily cap is to bound new deployment per day. A maker fill of
+  a resting copy remainder writes the same `BUY_*` row (`trader_id =
+  'resting_fill'`, the order's bet id in `manifold_bet_id`), so it consumes the
+  day's budget just like a taker fill.
+- **Resting remainders.** An unfilled remainder is committed to the pool and
+  to the day's deployment before it fills, so both remainders subtract
+  `resting_copy` (unfilled own-order mana on copy rows). The maker fill
+  converts that commitment: `invested_mana` rises and a `copy_ledger` buy row
+  appears, while the order's outstanding falls; the total commitment is
+  unchanged.
+- **Concurrency and the authoritative check.** The strategy pre-check runs
+  before the market fetch and the two decision calls, so another copy can
+  consume the same remainder during those awaits. After taking
+  `execution_lock`, `execute_planned_with_provenance` re-reads
+  `copy_pool_invested()`, `copy_spent_last_24h(now)`, and the resting layer,
+  clamps the order to the remainder, or refuses it with a `copy_cap: …` ledger
+  reason when the remainder is below `MIN_TRADE_SIZE`. That check is
+  authoritative; the pre-check is an early filter. The regular planner never
+  enters a copy row (§6.6).
 
 The inserted row's `budget_mana` is `cap`, not `size`, so the ordinary
 `budget + realized_pnl − invested` invariant holds. An existing copy row keeps
-its original ceiling: the budget is a per-market cap, not a per-copy one.
+its original ceiling: the budget is a per-market cap, not a per-copy one, and
+the strategy clamps a new copy's size to that frozen `budget_mana` even when
+the global pool has recovered.
 
 **Ledger.** `copy_ledger` records one row per evaluation: `p_before`/`p_after`
 from the source bet, `p_informed` and `fair_prob` from the two decision calls,
@@ -1263,7 +1334,10 @@ from the source bet, `p_informed` and `fair_prob` from the two decision calls,
 provenance. A filled copy uses the ordinary action names (`BUY_YES`,
 `BUY_NO`) with the real `mana_amount` and `manifold_bet_id` from
 `trade_ledger`; a control-plane refusal or zero fill writes `SKIP` with reason
-`unfilled: …`.
+`unfilled: …`, and a source bet that ages out after the decision calls writes
+`SKIP` with the bare `stale_bet`. A maker fill of a resting copy remainder
+writes a `BUY_*` row too (`trader_id = 'resting_fill'`, bet id in
+`manifold_bet_id`, share count in `reason`) so the rolling daily cap sees it.
 
 **Deviations from ALGO §S3, and why.**
 
@@ -1289,7 +1363,10 @@ provenance. A filled copy uses the ordinary action names (`BUY_YES`,
    provenance to be meaningful).
 
 **TTL, duplicates.** The age gate is a trigger filter only: it never expires a
-row, caps a holding period, or cancels an order. The duplicate filter is an
+row, caps a holding period, or cancels an order. It is checked twice: before
+the market fetch (the cheap filter) and again immediately before execution,
+because the fetch (HTTP timeout) and both decision calls take real time and a
+copy must not execute ~54 s after the source bet. The duplicate filter is an
 in-memory 4096-entry ring (about an hour of platform bets), because replayed
 events after a restart are already stopped by the age gate; the first
 evaluation is the ledger record, so a duplicate writes nothing.

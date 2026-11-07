@@ -55,6 +55,9 @@ const DEFAULT_SNIPE_MIN_GAP: f64 = 0.10;
 const DEFAULT_SNIPE_KELLY_FRACTION: f64 = 0.25;
 /// How long a new market stays eligible for a snipe.
 const DEFAULT_SNIPE_TTL_SECS: usize = 3600;
+/// Upper bound on the snipe eligibility window: one week. A longer TTL would
+/// silently turn the "new market" strategy into a stale-price scanner.
+pub const MAX_SNIPE_TTL_SECS: usize = 86_400 * 7;
 /// Deadline for one fair-probability decision call; snipe speed is the edge.
 const DEFAULT_SNIPE_DECISION_TIMEOUT_SECS: usize = 2;
 /// The S3 leaderboard is read-only, so it can run without a canary phase;
@@ -364,8 +367,11 @@ impl Config {
             bail!("SNIPE_KELLY_FRACTION must be within (0, 1], got {snipe_kelly_fraction}");
         }
         let snipe_ttl_secs = usize_or(&get, "SNIPE_TTL_SECS", DEFAULT_SNIPE_TTL_SECS)?;
-        if snipe_ttl_secs == 0 {
-            bail!("SNIPE_TTL_SECS must be at least 1 second");
+        if !(1..=MAX_SNIPE_TTL_SECS).contains(&snipe_ttl_secs) {
+            bail!(
+                "SNIPE_TTL_SECS must be within [1, {MAX_SNIPE_TTL_SECS}] seconds, got \
+                 {snipe_ttl_secs}"
+            );
         }
         let snipe_decision_timeout_secs = usize_or(
             &get,
@@ -1018,6 +1024,22 @@ mod tests {
 
         let error = config_from(&vars).expect_err("zero TTL should fail");
         assert!(error.to_string().contains("SNIPE_TTL_SECS"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_snipe_ttl_above_one_week() {
+        let mut vars = required_vars();
+        vars.push(("SNIPE_TTL_SECS", "604801"));
+
+        let error = config_from(&vars).expect_err("a week plus a second should fail");
+        assert!(error.to_string().contains("SNIPE_TTL_SECS"), "{error}");
+
+        vars.pop();
+        vars.push(("SNIPE_TTL_SECS", "604800"));
+        assert_eq!(
+            config_from(&vars).expect("one week is the ceiling").snipe_ttl_secs,
+            604800
+        );
     }
 
     #[test]

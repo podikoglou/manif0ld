@@ -31,7 +31,7 @@ const SIGNAL_COLUMNS: &str = "id, market_id, answer_id, post_uri, author_handle,
      direction, strength, impulse, p_after, created_at, p_evidence, p_target, strength_real, p_priced";
 
 const TRADE_COLUMNS: &str = "id, market_id, answer_id, action, mana_amount, shares_delta, p_internal, \
-     p_market, trigger_post_uri, manifold_bet_id, created_at";
+     p_market, trigger_post_uri, limit_prob, manifold_bet_id, created_at";
 
 const SNIPE_COLUMNS: &str = "id, contract_id, question, p_initial, p_model, gap, answer, action, \
      reason, mana_amount, limit_prob, manifold_bet_id, cost_usd, created_at";
@@ -140,6 +140,12 @@ impl Db {
             conn.execute_batch(include_str!("../migrations/008_traders.sql"))
                 .context("applying database migration 008 (trader scores and copy ledger)")?;
         }
+        // 009: the wire buy cap on every `trade_ledger` fill, so the fill's
+        // price limit is auditable against the belief that produced it.
+        if !table_has_column(conn, "trade_ledger", "limit_prob")? {
+            conn.execute_batch(include_str!("../migrations/009_trade_limit.sql"))
+                .context("applying database migration 009 (trade limit probability)")?;
+        }
         Ok(())
     }
 
@@ -227,8 +233,8 @@ impl Db {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO trade_ledger (market_id, answer_id, action, mana_amount, shares_delta, p_internal, \
-             p_market, trigger_post_uri, manifold_bet_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             p_market, trigger_post_uri, limit_prob, manifold_bet_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 record.market_id,
                 record.answer_id,
@@ -238,6 +244,7 @@ impl Db {
                 record.p_internal,
                 record.p_market,
                 record.trigger_post_uri,
+                record.limit_prob,
                 record.manifold_bet_id,
                 record.created_at,
             ],
@@ -758,8 +765,9 @@ fn trade_from_row(row: &Row<'_>) -> rusqlite::Result<TradeRecord> {
         p_internal: row.get(6)?,
         p_market: row.get(7)?,
         trigger_post_uri: row.get(8)?,
-        manifold_bet_id: row.get(9)?,
-        created_at: row.get(10)?,
+        limit_prob: row.get(9)?,
+        manifold_bet_id: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -855,6 +863,7 @@ mod tests {
             p_internal: 0.65,
             p_market: 0.55,
             trigger_post_uri: Some("at://post/1".to_owned()),
+            limit_prob: Some(0.61),
             manifold_bet_id: Some("bet-1".to_owned()),
             created_at,
         }
@@ -961,6 +970,34 @@ mod tests {
 
         // Applying again is a no-op.
         Db::apply_migrations(&conn).expect("migration 007 is idempotent");
+    }
+
+    #[test]
+    fn trade_limit_migration_adds_the_column_and_is_idempotent() {
+        // A database created before migration 009 has no `limit_prob`.
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch(include_str!("../migrations/001_init.sql"))
+            .expect("base schema applies");
+        assert!(!table_has_column(&conn, "trade_ledger", "limit_prob").expect("pre-009 check"));
+
+        Db::apply_migrations(&conn).expect("migration 009 applies");
+        assert!(table_has_column(&conn, "trade_ledger", "limit_prob").expect("has column"));
+
+        conn.execute(
+            "INSERT INTO trade_ledger \
+             (market_id, action, mana_amount, shares_delta, p_internal, p_market, created_at) \
+             VALUES ('m1', 'BUY_YES', 10.0, 20.0, 0.6, 0.5, 1)",
+            [],
+        )
+        .expect("trade row without a limit inserts");
+        let limit: Option<f64> = conn
+            .query_row("SELECT limit_prob FROM trade_ledger WHERE market_id = 'm1'", [], |row| {
+                row.get(0)
+            })
+            .expect("trade row reads");
+        assert_eq!(limit, None, "pre-009 rows carry no wire cap");
+
+        Db::apply_migrations(&conn).expect("migration 009 is idempotent");
     }
 
     #[test]
@@ -1267,6 +1304,7 @@ mod tests {
         let mut sell = sample_trade("m1", 200);
         sell.action = TradeAction::SellYes;
         sell.trigger_post_uri = None;
+        sell.limit_prob = None;
         sell.manifold_bet_id = None;
         let second_id = db.insert_trade(&sell).expect("insert sell");
         db.insert_trade(&sample_trade("other", 300))
@@ -1286,6 +1324,8 @@ mod tests {
         assert_eq!(recent[1].shares_delta, 20.0);
         assert_eq!(recent[1].p_internal, 0.65);
         assert_eq!(recent[1].p_market, 0.55);
+        assert_eq!(recent[1].limit_prob, Some(0.61));
+        assert_eq!(recent[0].limit_prob, None);
 
         assert_eq!(db.recent_trades("m1", 1).expect("limited").len(), 1);
         assert!(db.recent_trades("none", 10).expect("empty").is_empty());

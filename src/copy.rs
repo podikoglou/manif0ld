@@ -276,6 +276,7 @@ impl CopyStrategy {
         bet: &BetEvent,
         rate: &RateLimiter,
         now: i64,
+        resting_mana: f64,
     ) -> AppResult<Option<CopyOrder>> {
         // (a) Disabled: not one allocation, lock, REST call, or ledger row.
         if !self.enabled {
@@ -516,12 +517,18 @@ impl CopyStrategy {
         // signed residual (not the direction-flipped `edge`) with the YES price
         // is exactly the planner's convention: a negative edge selects the NO
         // formula `λ·|edge|/p_current`, which is Kelly for a NO contract.
-        let pool_remaining = self.pool_mana - self.db.copy_pool_invested()?;
+        //
+        // `resting_mana` is unfilled mana of own resting orders on copy rows.
+        // It is already committed to this pool and to today's deployment, so
+        // both remainders subtract it. The authoritative check under the
+        // execution lock repeats this with a fresh read (see
+        // `TradeExecutor::execute_planned_with_provenance`).
+        let pool_remaining = self.pool_mana - self.db.copy_pool_invested()? - resting_mana;
         if pool_remaining < self.min_trade_size {
             return self.skip(&draft, "pool_exhausted");
         }
         let spent = self.db.copy_spent_last_24h(now)?;
-        let daily_remaining = self.daily_mana - spent;
+        let daily_remaining = self.daily_mana - spent - resting_mana;
         if daily_remaining < self.min_trade_size {
             return self.skip(&draft, "daily_cap");
         }
@@ -540,7 +547,12 @@ impl CopyStrategy {
             exit_edge_threshold: self.exit_edge_threshold,
             min_trade_size: self.min_trade_size,
         };
-        let size = kelly_target_mana(residual, p_current, cap, params).min(cap);
+        let mut size = kelly_target_mana(residual, p_current, cap, params).min(cap);
+        // An existing copy row keeps its original ceiling; a recovered pool
+        // must not size a new copy above that row's frozen `budget_mana`.
+        if let Some(row) = &existing {
+            size = size.min(row.budget_mana);
+        }
         if size < self.min_trade_size {
             return self.skip(&draft, "below_min_size");
         }
@@ -628,6 +640,55 @@ impl CopyStrategy {
             reason: Some(order.reason.clone()),
             mana_amount: trade.mana_amount,
             manifold_bet_id: trade.manifold_bet_id.clone(),
+            created_at: order.created_at,
+        })?;
+        Ok(())
+    }
+
+    /// Whether a source bet has aged past `COPY_MAX_AGE_SECS` at `now`.
+    ///
+    /// The executor calls this immediately before executing a planned copy:
+    /// the decision calls and the market fetch take real time, so the early
+    /// gate alone would let a copy execute up to ~54 s after the source bet.
+    pub(crate) fn is_stale(&self, bet: &BetEvent, now: i64) -> bool {
+        now.saturating_sub(millis_to_seconds(bet.created_time)) > self.max_age_secs
+    }
+
+    /// The copy caps recomputed from the database and the resting layer.
+    ///
+    /// This is the authoritative check the executor runs while holding
+    /// `execution_lock`, so two copies that passed their pre-checks against
+    /// the same remainder cannot both spend it. `resting_mana` is unfilled
+    /// mana of own resting orders on copy rows: it is committed to the pool
+    /// and to today's deployment even before it fills, and the maker-fill path
+    /// converts it to an invested position (and a `copy_ledger` buy row)
+    /// without changing the total commitment.
+    pub(crate) fn remaining_cap(&self, now: i64, resting_mana: f64) -> AppResult<f64> {
+        let resting = resting_mana.max(0.0);
+        let pool = self.pool_mana - self.db.copy_pool_invested()? - resting;
+        let daily = self.daily_mana - self.db.copy_spent_last_24h(now)? - resting;
+        Ok(self.max_mana.min(pool).min(daily).max(0.0))
+    }
+
+    /// Records a copy rejected because the source bet aged out while the
+    /// decision calls ran, using the bare `stale_bet` reason of the early gate.
+    pub fn record_stale(&self, order: &CopyOrder) -> AppResult<()> {
+        self.db.insert_copy(&CopyRecord {
+            id: 0,
+            trader_id: order.trader_id.clone(),
+            contract_id: order.market_id.clone(),
+            question: order.question.clone(),
+            bet_id: Some(order.trigger.clone()),
+            bet_amount: Some(order.bet_amount),
+            p_before: order.p_before,
+            p_after: order.p_after,
+            p_informed: Some(order.p_informed),
+            fair_prob: Some(order.p_fair),
+            gap: Some(order.p_fair - order.p_current),
+            action: COPY_ACTION_SKIP.to_owned(),
+            reason: Some("stale_bet".to_owned()),
+            mana_amount: 0.0,
+            manifold_bet_id: None,
             created_at: order.created_at,
         })?;
         Ok(())
@@ -1068,7 +1129,7 @@ mod tests {
 
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1095,7 +1156,7 @@ mod tests {
 
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1125,7 +1186,7 @@ mod tests {
 
         let own = bet("b1", "bot-1", 50.0, now);
         assert!(strategy
-            .on_bet(&own, &limiter(), now)
+            .on_bet(&own, &limiter(), now, 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1133,7 +1194,7 @@ mod tests {
         let mut redemption = bet("b2", WATCHED, 50.0, now);
         redemption.is_redemption = true;
         assert!(strategy
-            .on_bet(&redemption, &limiter(), now)
+            .on_bet(&redemption, &limiter(), now, 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1141,7 +1202,7 @@ mod tests {
         let mut cancelled = bet("b3", WATCHED, 50.0, now);
         cancelled.is_cancelled = true;
         assert!(strategy
-            .on_bet(&cancelled, &limiter(), now)
+            .on_bet(&cancelled, &limiter(), now, 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1169,7 +1230,7 @@ mod tests {
 
         for _ in 0..3 {
             assert!(strategy
-                .on_bet(&tiny, &limiter(), now)
+                .on_bet(&tiny, &limiter(), now, 0.0)
                 .await
                 .expect("evaluation")
                 .is_none());
@@ -1212,13 +1273,13 @@ mod tests {
 
         // 31 s old against COPY_MAX_AGE_SECS=30.
         let stale = bet("stale", WATCHED, 50.0, now - 31);
-        assert!(strategy.on_bet(&stale, &limiter(), now).await.expect("eval").is_none());
+        assert!(strategy.on_bet(&stale, &limiter(), now, 0.0).await.expect("eval").is_none());
         assert_reason(&db, "stale_bet");
 
         let mut unfilled = bet("unfilled", WATCHED, 50.0, now);
         unfilled.is_filled = false;
         assert!(strategy
-            .on_bet(&unfilled, &limiter(), now)
+            .on_bet(&unfilled, &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1229,7 +1290,7 @@ mod tests {
             .any(|row| row.reason.as_deref() == Some("unfilled_bet")));
 
         let small = bet("small", WATCHED, 4.99, now);
-        assert!(strategy.on_bet(&small, &limiter(), now).await.expect("eval").is_none());
+        assert!(strategy.on_bet(&small, &limiter(), now, 0.0).await.expect("eval").is_none());
         assert!(db
             .recent_copies(10)
             .expect("ledger")
@@ -1255,7 +1316,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         let order = strategy
-            .on_bet(&bet("edge-age", WATCHED, 50.0, now - 30), &limiter(), now)
+            .on_bet(&bet("edge-age", WATCHED, 50.0, now - 30), &limiter(), now, 0.0)
             .await
             .expect("eval");
         assert!(order.is_none());
@@ -1287,7 +1348,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1308,7 +1369,7 @@ mod tests {
             Arc::new(ScriptedInformed::new(0.95)),
         );
         assert!(strategy
-            .on_bet(&bet("b2", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("b2", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1335,7 +1396,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("held", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("held", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1346,7 +1407,7 @@ mod tests {
         let mut no_bet = bet("open-no", WATCHED, 50.0, now);
         no_bet.outcome = "NO".to_owned();
         assert!(strategy
-            .on_bet(&no_bet, &limiter(), now)
+            .on_bet(&no_bet, &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_some());
@@ -1367,7 +1428,7 @@ mod tests {
             Arc::new(ScriptedInformed::new(0.95)),
         );
         assert!(strategy
-            .on_bet(&bet("closed", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("closed", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1402,7 +1463,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("mcq", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("mcq", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1428,7 +1489,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("dpm", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("dpm", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1449,7 +1510,7 @@ mod tests {
             Arc::new(ScriptedInformed::new(0.95)),
         );
         assert!(strategy
-            .on_bet(&bet("resolved", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("resolved", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1477,7 +1538,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1505,7 +1566,7 @@ mod tests {
         let now = 1_700_000_000;
         // residual = 0.60 - 0.58 = 0.02 < COPY_MIN_EDGE (0.05).
         assert!(strategy
-            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("b1", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1531,7 +1592,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         let order = strategy
-            .on_bet(&bet("yes", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("yes", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .expect("a copy");
@@ -1563,7 +1624,7 @@ mod tests {
         let mut sell_pressure = bet("no", WATCHED, 50.0, now);
         sell_pressure.outcome = "NO".to_owned();
         let order = strategy
-            .on_bet(&sell_pressure, &limiter(), now)
+            .on_bet(&sell_pressure, &limiter(), now, 0.0)
             .await
             .expect("eval")
             .expect("a copy");
@@ -1596,7 +1657,7 @@ mod tests {
         no_bet.outcome = "NO".to_owned();
         // Their NO bet has no edge if the model says YES is worth 0.60.
         assert!(strategy
-            .on_bet(&no_bet, &limiter(), now)
+            .on_bet(&no_bet, &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1621,7 +1682,7 @@ mod tests {
         let mut weird = bet("weird", WATCHED, 50.0, now);
         weird.outcome = "MAYBE".to_owned();
         assert!(strategy
-            .on_bet(&weird, &limiter(), now)
+            .on_bet(&weird, &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1662,7 +1723,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         let order = strategy
-            .on_bet(&bet("capped", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("capped", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .expect("a copy");
@@ -1673,6 +1734,64 @@ mod tests {
         );
         let row = store.load(MARKET).expect("load").expect("row");
         assert!((row.budget_mana - 4.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn resting_copy_orders_count_against_the_pool_and_the_daily_cap() {
+        let manifold = fake_manifold(0.10).await;
+        let (db, store) = in_memory();
+        let board = board_with(&db, &[WATCHED]);
+        let strategy = build(
+            &strong_signal_config(),
+            &db,
+            &store,
+            board,
+            &manifold.base_url,
+            Arc::new(ScriptedFairValue::ok(0.95, None)),
+            Arc::new(ScriptedInformed::new(0.9)),
+        );
+        let now = 1_700_000_000;
+
+        // Unfilled own resting orders on copy rows are committed mana: 99.5
+        // of the 100 mana pool leaves less than MIN_TRADE_SIZE.
+        assert!(strategy
+            .on_bet(&bet("resting", WATCHED, 50.0, now), &limiter(), now, 99.5)
+            .await
+            .expect("eval")
+            .is_none());
+        assert_reason(&db, "pool_exhausted");
+    }
+
+    #[tokio::test]
+    async fn an_existing_row_budget_bounds_a_recovered_pool() {
+        let manifold = fake_manifold(0.50).await;
+        let (db, store) = in_memory();
+        let board = board_with(&db, &[WATCHED]);
+        let mut existing = copy_row(MARKET, 0.0, 0.0, STRATEGY_COPY, MarketStatus::Active);
+        existing.budget_mana = 1.0;
+        store.insert(&existing).expect("existing copy row");
+        let strategy = build(
+            &config(),
+            &db,
+            &store,
+            board,
+            &manifold.base_url,
+            Arc::new(ScriptedFairValue::ok(0.60, None)),
+            Arc::new(ScriptedInformed::new(0.9)),
+        );
+        let now = 1_700_000_000;
+
+        // The Kelly target is 2.0 mana against the global caps, but the row's
+        // frozen 1.0 mana budget is the per-market ceiling.
+        let order = strategy
+            .on_bet(&bet("row-budget", WATCHED, 50.0, now), &limiter(), now, 0.0)
+            .await
+            .expect("eval")
+            .expect("a copy");
+        assert!(
+            (order.planned.decision.amount_mana - 1.0).abs() < 1e-9,
+            "{order:?}"
+        );
     }
 
     #[tokio::test]
@@ -1695,7 +1814,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("pool", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("pool", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1778,7 +1897,7 @@ mod tests {
             Arc::new(ScriptedInformed::new(0.9)),
         );
         assert!(strategy
-            .on_bet(&bet("daily", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("daily", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1805,7 +1924,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("tiny", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("tiny", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_none());
@@ -1855,7 +1974,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         assert!(strategy
-            .on_bet(&bet("timeout", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("timeout", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .is_some());
@@ -1886,7 +2005,7 @@ mod tests {
         );
         let now = 1_700_000_000;
         let order = strategy
-            .on_bet(&bet("filled", WATCHED, 50.0, now), &limiter(), now)
+            .on_bet(&bet("filled", WATCHED, 50.0, now), &limiter(), now, 0.0)
             .await
             .expect("eval")
             .expect("a copy");
@@ -1904,6 +2023,7 @@ mod tests {
                     p_internal: 0.60,
                     p_market: 0.50,
                     trigger_post_uri: Some(order.trigger.clone()),
+                    limit_prob: Some(0.61),
                     manifold_bet_id: Some("copy-fill".to_owned()),
                     created_at: order.created_at,
                 },

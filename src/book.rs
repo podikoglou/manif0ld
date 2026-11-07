@@ -410,6 +410,13 @@ fn answer_edges(views: &[LegView], sum_to_one: bool) -> Vec<f64> {
 /// Sum-to-one markets are YES-only: a NO leg there is a basket over the field,
 /// and Manifold may add internal arbitrage legs of its own. Independent
 /// (`cpmm-multi-2`) markets allow both sides.
+///
+/// `allow_entries` is false for rows owned by a strategy (`snipe`, `copy`):
+/// those strategies own their entries and size them against their isolated
+/// pool, so the planner may only manage their exits. A refused or unfilled
+/// strategy execution leaves a flat row with a real edge; without this gate
+/// the regular evaluation would enter it as a news trade, bypassing the
+/// strategy caps.
 fn plan_views(
     views: &[LegView],
     sum_to_one: bool,
@@ -417,6 +424,7 @@ fn plan_views(
     budget_mana: f64,
     params: TradeParams,
     limits: TradeLimits,
+    allow_entries: bool,
 ) -> Vec<PlannedTrade> {
     let edges = answer_edges(views, sum_to_one);
     let mut planned = Vec::new();
@@ -433,6 +441,10 @@ fn plan_views(
         if view.no_shares > 0.0 && !sum_to_one && *edge > -params.exit_edge_threshold {
             planned.push(planned_exit(leg, view, TradeAction::SellNo, view.no_shares));
         }
+    }
+
+    if !allow_entries {
+        return planned;
     }
 
     let open_positions = views
@@ -565,6 +577,12 @@ impl Book {
 
     pub fn legs(&self) -> &[Leg] {
         &self.legs
+    }
+
+    /// The owning strategy of this row ([`crate::types::STRATEGY_NEWS`],
+    /// [`crate::types::STRATEGY_SNIPE`], or [`crate::types::STRATEGY_COPY`]).
+    pub fn strategy(&self) -> &str {
+        &self.market.strategy
     }
 
     pub fn leg(&self, index: usize) -> &Leg {
@@ -929,6 +947,12 @@ impl Book {
 
     /// One decision cycle: exits first, then ranked entries, capped by the
     /// limits that belong to this shape. Returns every action to execute.
+    ///
+    /// Only operator-owned (`news`) rows may open entries here. A `snipe` or
+    /// `copy` row is planned **exits only**: its entries are sized by the
+    /// strategy against the isolated pool and executed through
+    /// `TradeExecutor::execute_planned`, so letting the planner add one would
+    /// bypass the strategy caps and the copy daily cap.
     pub fn plan(&self, now: i64, halflife_hours: f64, policy: &TradePolicy) -> Vec<PlannedTrade> {
         let views: Vec<LegView> = self
             .legs
@@ -950,6 +974,7 @@ impl Book {
             self.market.budget_mana,
             policy.params,
             limits,
+            self.market.is_news(),
         )
     }
 
@@ -1537,6 +1562,35 @@ mod tests {
     }
 
     #[test]
+    fn a_strategy_row_never_opens_an_entry_but_still_exits_a_held_leg() {
+        // A refused or unfilled strategy execution leaves a flat row with a
+        // real edge. The planner must not enter it as a news trade.
+        let mut flat = market_with(0.5, 0.8, 0.0, 0.0, 0.0);
+        flat.strategy = crate::types::STRATEGY_COPY.to_owned();
+        let (db, store) = store_with(&[flat]);
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        assert!(
+            book.plan(NOW, 4.0, &multiple_choice_policy(0.25))
+                .is_empty(),
+            "a flat copy row must not open a planner entry"
+        );
+
+        // A held leg still exits on edge decay: exits are unchanged.
+        let mut held = market_with(0.5, 0.505, 10.0, 20.0, 0.0);
+        held.strategy = crate::types::STRATEGY_COPY.to_owned();
+        let (db, store) = store_with(&[held]);
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        let planned = book.plan(NOW, 4.0, &multiple_choice_policy(0.25));
+        assert_eq!(planned.len(), 1, "{planned:?}");
+        assert_eq!(planned[0].decision.action, TradeAction::SellYes);
+        assert_eq!(planned[0].decision.shares, Some(20.0));
+    }
+
+    #[test]
     fn plan_reports_the_leg_index_and_the_decayed_probabilities() {
         let (db, store) = answers_store("m1", &["a", "b"]);
         let mut book = Book::load(&store, &db, "m1")
@@ -1703,7 +1757,7 @@ mod tests {
     }
 
     fn actions_for(views: &[LegView], sum_to_one: bool, limits: TradeLimits) -> Vec<TradeDecision> {
-        plan_views(views, sum_to_one, 100.0, 100.0, params(), limits)
+        plan_views(views, sum_to_one, 100.0, 100.0, params(), limits, true)
             .into_iter()
             .map(|planned| planned.decision)
             .collect()
@@ -1723,6 +1777,7 @@ mod tests {
             available_budget,
             params(),
             TradeLimits::binary(),
+            true,
         )
         .into_iter()
         .map(|planned| planned.decision)

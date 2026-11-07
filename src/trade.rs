@@ -151,7 +151,7 @@ use crate::rate::{Priority, RateLimiter, SystemClock, WRITE_COST_TOKENS};
 use crate::snipe::SnipeStrategy;
 use crate::traders::TraderBoard;
 use crate::types::{
-    MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision, TradeRecord,
+    CopyRecord, MarketId, MarketStatus, TrackedMarket, TradeAction, TradeDecision, TradeRecord,
     available_budget,
 };
 
@@ -1294,6 +1294,24 @@ impl OwnRestingOrders {
             })
             .unwrap_or(0.0)
     }
+
+    /// Total unfilled mana of every own order whose market `matches` accepts.
+    ///
+    /// The strategy pools need this because a resting remainder is committed
+    /// to the pool before it fills, and a maker fill converts it to invested
+    /// mana without changing the total commitment.
+    fn outstanding_where(&self, mut matches: impl FnMut(&str) -> bool) -> f64 {
+        self.0
+            .iter()
+            .filter(|(market_id, _)| matches(market_id))
+            .map(|(_, orders)| {
+                orders
+                    .values()
+                    .map(|order| (order.order_amount - order.filled_amount).max(0.0))
+                    .sum::<f64>()
+            })
+            .sum()
+    }
 }
 
 /// Whether a resting order's cap is now past the day's fair-capped cap by
@@ -1576,6 +1594,32 @@ struct Fill<'a> {
     shares_delta: f64,
     /// The response the fill came from.
     result: &'a BetResult,
+    /// The wire `limitProb` sent with a buy, `None` for a sell. Recorded in
+    /// `trade_ledger` so every fill's price cap is auditable.
+    limit_prob: Option<f64>,
+}
+
+/// What one external plan did.
+///
+/// [`TradeExecutor::execute_planned_with_provenance`] needs to tell the
+/// strategy *why* nothing filled, because the strategy ledger records the
+/// reason. An `Option<TradeRecord>` cannot carry it.
+pub(crate) enum PlannedOutcome {
+    /// The wire filled shares; the row is persisted.
+    Filled(TradeRecord),
+    /// A control-plane check refused the order before any wire call.
+    Refused(String),
+    /// Dry run, or a buy that filled nothing (its remainder may rest).
+    NoFill,
+}
+
+/// The verdict of the authoritative strategy-cap check.
+enum CapVerdict {
+    /// The order may run, at this mana amount (possibly clamped down).
+    Allowed(f64),
+    /// The strategy pool or daily cap refuses the order; the string is the
+    /// ledger reason.
+    Refused(String),
 }
 
 /// Executes trades and keeps local state in step with Manifold.
@@ -1714,6 +1758,22 @@ impl TradeExecutor {
         self.own_orders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Unfilled mana of own resting orders on rows owned by `strategy`.
+    ///
+    /// The strategy pools treat this as spent: the money is committed to the
+    /// same pool before it fills, and a maker fill converts it to invested
+    /// mana (snipe) or to a `copy_ledger` buy row (copy) without changing the
+    /// total commitment. The pre-check reads it before a decision, and
+    /// [`TradeExecutor::execute_planned_with_provenance`] re-reads it under
+    /// the execution lock.
+    fn resting_for_strategy(&self, strategy: &str) -> f64 {
+        self.own_orders().outstanding_where(|market_id| {
+            self.store
+                .cached(market_id)
+                .is_some_and(|market| market.strategy == strategy)
+        })
     }
 
     /// Seeds the own resting-order map with one boot snapshot.
@@ -1986,8 +2046,21 @@ impl TradeExecutor {
         trigger_post_uri: Option<&str>,
         now: i64,
     ) -> AppResult<Option<TradeRecord>> {
-        self.execute_planned_with_provenance(market_id, planned, trigger_post_uri, now, None)
-            .await
+        match self
+            .execute_planned_with_provenance(market_id, planned, trigger_post_uri, now, None)
+            .await?
+        {
+            PlannedOutcome::Filled(record) => Ok(Some(record)),
+            PlannedOutcome::Refused(reason) => {
+                tracing::warn!(
+                    market_id = %market_id,
+                    reason = %reason,
+                    "planned trade refused by the authoritative strategy cap"
+                );
+                Ok(None)
+            }
+            PlannedOutcome::NoFill => Ok(None),
+        }
     }
 
     /// [`TradeExecutor::execute_planned`] with S3b provenance.
@@ -1997,6 +2070,18 @@ impl TradeExecutor {
     /// `🤝 COPY · informed 0.72 · edge +0.08` from the same numbers the
     /// decision used, without a second lookup and without a second event
     /// variant.
+    ///
+    /// # Authoritative strategy caps
+    ///
+    /// The strategies compute their pool/daily remainder before the market
+    /// fetch and the decision calls. Those awaits take seconds, so another
+    /// copy or snipe can consume the same remainder in the meantime. This
+    /// method therefore re-reads `snipe_pool_invested()` /
+    /// `copy_pool_invested()` / `copy_spent_last_24h()` **while holding
+    /// `execution_lock`**, after subtracting the unfilled own resting orders
+    /// on the same strategy's rows, and clamps or refuses the buy. It is the
+    /// authoritative check; the strategy pre-check is only an early filter.
+    /// News rows are unaffected.
     pub(crate) async fn execute_planned_with_provenance(
         &self,
         market_id: &str,
@@ -2004,12 +2089,12 @@ impl TradeExecutor {
         trigger_post_uri: Option<&str>,
         now: i64,
         p_informed: Option<f64>,
-    ) -> AppResult<Option<TradeRecord>> {
+    ) -> AppResult<PlannedOutcome> {
         let _guard = self.execution_lock.lock().await;
 
         let mut book = self.load_book(market_id)?;
         if book.status() != MarketStatus::Active {
-            return Ok(None);
+            return Ok(PlannedOutcome::NoFill);
         }
 
         let kill_switch = self.kill_switch_on()?;
@@ -2019,14 +2104,39 @@ impl TradeExecutor {
                 action = %planned.decision.action,
                 "global kill switch is on; refusing a planned buy"
             );
-            return Ok(None);
+            return Ok(PlannedOutcome::NoFill);
+        }
+
+        let mut effective = planned.clone();
+        match self.strategy_cap_verdict(&book, planned, now)? {
+            CapVerdict::Allowed(amount) => {
+                if (amount - planned.decision.amount_mana).abs() > BUDGET_EPSILON {
+                    tracing::info!(
+                        market_id = %market_id,
+                        strategy = book.strategy(),
+                        requested = planned.decision.amount_mana,
+                        clamped = amount,
+                        "planned buy clamped to the remaining strategy cap"
+                    );
+                }
+                effective.decision.amount_mana = amount;
+            }
+            CapVerdict::Refused(reason) => {
+                tracing::warn!(
+                    market_id = %market_id,
+                    strategy = book.strategy(),
+                    reason = %reason,
+                    "planned buy refused by the authoritative strategy cap"
+                );
+                return Ok(PlannedOutcome::Refused(reason));
+            }
         }
 
         let Some(record) = self
-            .execute(&mut book, planned, trigger_post_uri, now, self.dry_run)
+            .execute(&mut book, &effective, trigger_post_uri, now, self.dry_run)
             .await?
         else {
-            return Ok(None);
+            return Ok(PlannedOutcome::NoFill);
         };
 
         book.persist(&self.store, &self.db)?;
@@ -2047,7 +2157,50 @@ impl TradeExecutor {
             }
         }
 
-        Ok(Some(record))
+        Ok(PlannedOutcome::Filled(record))
+    }
+
+    /// Re-checks a planned buy against the strategy that owns its market row.
+    ///
+    /// Runs only while `execution_lock` is held, after the book (and therefore
+    /// the row's strategy) is loaded. Sells and news rows pass through
+    /// unchanged. A strategy row whose strategy is not configured in this
+    /// process refuses the buy: nothing may enter it without that strategy's
+    /// caps and ledger.
+    fn strategy_cap_verdict(
+        &self,
+        book: &Book,
+        planned: &PlannedTrade,
+        now: i64,
+    ) -> AppResult<CapVerdict> {
+        if !is_buy(planned.decision.action) {
+            return Ok(CapVerdict::Allowed(planned.decision.amount_mana));
+        }
+
+        let strategy = book.strategy();
+        let resting = self.resting_for_strategy(strategy);
+        let remaining = match strategy {
+            crate::types::STRATEGY_COPY => match self.copy.as_ref() {
+                Some(copy) => copy.remaining_cap(now, resting)?,
+                None => return Ok(CapVerdict::Refused("copy_disabled".to_owned())),
+            },
+            crate::types::STRATEGY_SNIPE => match self.snipe.as_ref() {
+                Some(snipe) => snipe.remaining_pool(resting)?,
+                None => return Ok(CapVerdict::Refused("snipe_disabled".to_owned())),
+            },
+            // Operator-owned rows keep the per-market budget invariant.
+            _ => return Ok(CapVerdict::Allowed(planned.decision.amount_mana)),
+        };
+
+        let minimum = self.policy.params.min_trade_size;
+        if remaining < minimum {
+            return Ok(CapVerdict::Refused(format!(
+                "{strategy}_cap: remaining {remaining:.2} mana < minimum {minimum:.2}"
+            )));
+        }
+        Ok(CapVerdict::Allowed(
+            planned.decision.amount_mana.min(remaining),
+        ))
     }
 
     /// Evaluates and executes one `global/new-contract` broadcast (S2).
@@ -2063,13 +2216,11 @@ impl TradeExecutor {
     ///
     /// Our own bet produces an `updated-contract` broadcast, so
     /// [`TradeExecutor::evaluate_cached`] may run on this market moments later.
-    /// It cannot open a second position: `Book::plan` only considers entries
-    /// for a leg with **no** shares, and the snipe fill created one. Belief is
-    /// never moved by our own trade, so the only plan the regular path can
-    /// produce is an exit. A fill that was entirely rested (zero shares) leaves
-    /// the leg flat; the next normal entry is then bounded by the same
-    /// per-market ceiling (`budget_mana = min(SNIPE_MAX_MANA, pool)`), because
-    /// the snipe order is not retried here.
+    /// It cannot open a second position: `Book::plan` is exits-only on
+    /// strategy-owned rows, so the regular path can only produce an exit. A
+    /// fill that was entirely rested (zero shares) leaves the leg flat; only a
+    /// new strategy evaluation may enter it, with the same pool and per-market
+    /// ceiling (`budget_mana = min(SNIPE_MAX_MANA, pool)`).
     async fn handle_new_contract(&self, contract: &ContractStub, now: i64) -> AppResult<()> {
         let Some(snipe) = self.snipe.as_ref() else {
             tracing::debug!(
@@ -2079,25 +2230,28 @@ impl TradeExecutor {
             return Ok(());
         };
 
-        let Some(order) = snipe.evaluate(contract, now, &self.rate).await? else {
+        let resting = self.resting_for_strategy(crate::types::STRATEGY_SNIPE);
+        let Some(order) = snipe.evaluate(contract, now, &self.rate, resting).await? else {
             return Ok(());
         };
 
         match self
-            .execute_planned(
+            .execute_planned_with_provenance(
                 &order.market_id,
                 &order.planned,
                 Some(&order.trigger),
                 now,
+                None,
             )
             .await
         {
-            Ok(Some(record)) => snipe.record_filled(&order, &record)?,
-            Ok(None) => {
+            Ok(PlannedOutcome::Filled(record)) => snipe.record_filled(&order, &record)?,
+            Ok(PlannedOutcome::Refused(reason)) => snipe.record_unfilled(&order, &reason)?,
+            Ok(PlannedOutcome::NoFill) => {
                 let reason = if self.dry_run {
                     "dry_run"
                 } else {
-                    "execution refused or nothing filled"
+                    "nothing filled"
                 };
                 snipe.record_unfilled(&order, reason)?;
             }
@@ -2150,9 +2304,23 @@ impl TradeExecutor {
             return Ok(());
         }
 
-        let Some(order) = copy.on_bet(bet, &self.rate, now).await? else {
+        let resting = self.resting_for_strategy(crate::types::STRATEGY_COPY);
+        let Some(order) = copy.on_bet(bet, &self.rate, now, resting).await? else {
             return Ok(());
         };
+
+        // The age gate must run again here: the market fetch (HTTP timeout) and
+        // the two decision calls happen between the early gate and this point,
+        // so a copy can otherwise execute ~54 s after the source bet.
+        if copy.is_stale(bet, Utc::now().timestamp()) {
+            tracing::info!(
+                contract_id = %bet.contract_id,
+                bet_id = %bet.id,
+                "source bet aged out while the copy decision ran; not executing"
+            );
+            copy.record_stale(&order)?;
+            return Ok(());
+        }
 
         match self
             .execute_planned_with_provenance(
@@ -2164,12 +2332,13 @@ impl TradeExecutor {
             )
             .await
         {
-            Ok(Some(record)) => copy.record_filled(&order, &record)?,
-            Ok(None) => {
+            Ok(PlannedOutcome::Filled(record)) => copy.record_filled(&order, &record)?,
+            Ok(PlannedOutcome::Refused(reason)) => copy.record_unfilled(&order, &reason)?,
+            Ok(PlannedOutcome::NoFill) => {
                 let reason = if self.dry_run {
                     "dry_run"
                 } else {
-                    "execution refused or nothing filled"
+                    "nothing filled"
                 };
                 copy.record_unfilled(&order, reason)?;
             }
@@ -3129,10 +3298,44 @@ impl TradeExecutor {
             p_internal: view.p_internal,
             p_market: view.p_market,
             trigger_post_uri: Some(format!("maker_fill:{}", bet.id)),
+            limit_prob: Some(order.limit_prob),
             manifold_bet_id: Some(bet.id.clone()),
             created_at: now,
         };
         self.db.insert_trade(&record)?;
+
+        // A resting remainder on a `copy` row is still a copy deployment. The
+        // daily cap sums executed buys from `copy_ledger`, so without this row
+        // a maker fill would escape it; the pool already counts the unfilled
+        // remainder through the own-order outstanding, and this row converts
+        // that commitment into spend without changing the total. There is no
+        // single source bet for a resting remainder, so `bet_id` stays NULL
+        // and `manifold_bet_id` carries the order's own bet id.
+        let market = book.market();
+        if market.is_copy() {
+            self.db.insert_copy(&CopyRecord {
+                id: 0,
+                trader_id: "resting_fill".to_owned(),
+                contract_id: bet.contract_id.clone(),
+                question: market.question.clone(),
+                bet_id: None,
+                bet_amount: None,
+                p_before: None,
+                p_after: None,
+                p_informed: None,
+                fair_prob: None,
+                gap: None,
+                action: action.as_str().to_owned(),
+                reason: Some(format!(
+                    "maker_fill: {fill_shares:.4} shares at limit {:.4}",
+                    order.limit_prob
+                )),
+                mana_amount: fill_mana,
+                manifold_bet_id: Some(bet.id.clone()),
+                created_at: now,
+            })?;
+        }
+
         tracing::info!(
             market_id = %bet.contract_id,
             bet_id = %bet.id,
@@ -3520,6 +3723,7 @@ impl TradeExecutor {
                     mana_amount: cost,
                     shares_delta: result.shares,
                     result: &result,
+                    limit_prob: Some(limit_prob),
                 },
             );
         }
@@ -3571,6 +3775,7 @@ impl TradeExecutor {
                 mana_amount: proceeds,
                 shares_delta: -settlement.sold,
                 result: &result,
+                limit_prob: None,
             },
         )
     }
@@ -3594,6 +3799,7 @@ impl TradeExecutor {
             p_internal: planned.p_internal,
             p_market: planned.p_market,
             trigger_post_uri: trigger_post_uri.map(str::to_owned),
+            limit_prob: fill.limit_prob,
             manifold_bet_id: optional_id(fill.result.bet_id()),
             created_at: now,
         };
@@ -5761,6 +5967,195 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Review blockers: strategy rows are exits-only, caps are authoritative
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_cached_evaluation_never_enters_a_flat_copy_row_but_still_exits() {
+        let harness = copy_harness(0.60, 0.90, 0.50).await;
+        let CopyHarness {
+            executor,
+            db,
+            store,
+            manifold,
+        } = harness;
+        let now = Utc::now().timestamp();
+
+        // A flat copy row with a strong, fresh edge: a refused or unfilled
+        // strategy execution leaves exactly this shape.
+        let mut flat = crate::copy::copy_market_row("Market_copy", 0.0, 0.0);
+        flat.p_market_last = 0.5;
+        flat.p_internal_log_odds = belief::logit(0.85);
+        flat.belief_updated_at = now;
+        flat.budget_mana = 10.0;
+        store.insert(&flat).expect("flat copy row");
+
+        executor
+            .evaluate_cached("Market_copy", None)
+            .await
+            .expect("cached evaluation");
+        assert!(
+            db.recent_trades("Market_copy", 10)
+                .expect("trades")
+                .is_empty(),
+            "the planner must never enter a strategy row"
+        );
+        assert!(
+            manifold.requests() == 0,
+            "a flat copy row must not even reach the wire"
+        );
+
+        // The same shape with a held, decayed leg still exits: S1 exit paths
+        // and the reconcile sweep are unchanged.
+        let mut held = crate::copy::copy_market_row("Market_copy2", 10.0, 0.0);
+        held.p_market_last = 0.5;
+        held.p_internal_log_odds = belief::logit(0.505);
+        held.belief_updated_at = now;
+        held.budget_mana = 10.0;
+        held.invested_mana = 5.0;
+        store.insert(&held).expect("held copy row");
+
+        executor
+            .evaluate_cached("Market_copy2", None)
+            .await
+            .expect("cached evaluation");
+        let trades = db.recent_trades("Market_copy2", 10).expect("trades");
+        assert_eq!(trades.len(), 1, "one exit: {trades:?}");
+        assert_eq!(trades[0].action, TradeAction::SellYes);
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_loses_the_pool_race_is_refused_under_the_execution_lock() {
+        let harness = copy_harness(0.60, 0.90, 0.50).await;
+        let CopyHarness {
+            executor,
+            db,
+            store,
+            ..
+        } = harness;
+        let now = Utc::now().timestamp();
+
+        // `on_bet` is the strategy pre-check: it passes against an empty pool.
+        let bet = source_bet("race", 50.0, now);
+        let order = executor
+            .copy
+            .as_ref()
+            .expect("copy strategy")
+            .on_bet(&bet, &executor.rate, now, 0.0)
+            .await
+            .expect("evaluation")
+            .expect("a copy order");
+
+        // Interleave another copy's spend between the pre-check and execution.
+        let mut competitor = crate::copy::copy_market_row("Market_other", 0.0, 0.0);
+        competitor.budget_mana = 100.0;
+        competitor.invested_mana = 99.5;
+        store.insert(&competitor).expect("competitor row");
+
+        let outcome = executor
+            .execute_planned_with_provenance(
+                &order.market_id,
+                &order.planned,
+                Some(&order.trigger),
+                now,
+                Some(order.p_informed),
+            )
+            .await
+            .expect("execution");
+        match outcome {
+            PlannedOutcome::Refused(reason) => {
+                assert!(reason.contains("copy_cap"), "{reason}");
+            }
+            other => panic!(
+                "the under-lock check must refuse the order, got {:?}",
+                planned_outcome_label(&other)
+            ),
+        }
+        assert!(
+            db.recent_trades("Market_copy", 10)
+                .expect("trades")
+                .is_empty(),
+            "no wire call may happen after the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_ages_out_during_the_decision_calls_is_not_executed() {
+        let harness = copy_harness(0.60, 0.90, 0.50).await;
+        let CopyHarness {
+            executor,
+            db,
+            manifold,
+            ..
+        } = harness;
+
+        // 29 s old at the early gate (COPY_MAX_AGE_SECS = 30). The decision
+        // calls then take real time; the re-check must catch the 30 s crossing.
+        let now = Utc::now().timestamp();
+        let bet = source_bet("slow", 50.0, now - 29);
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+
+        executor.handle_bet(&bet, now).await.expect("copy evaluation");
+
+        let copies = db.recent_copies(10).expect("copies");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies[0].action, crate::types::COPY_ACTION_SKIP);
+        assert_eq!(copies[0].reason.as_deref(), Some("stale_bet"));
+        assert!(db.recent_trades("Market_copy", 10).expect("trades").is_empty());
+        assert_eq!(
+            manifold.requests(),
+            1,
+            "only the market fetch ran; no buy was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_maker_fill_on_a_copy_row_writes_the_daily_cap_ledger_row() {
+        let mut market = crate::copy::copy_market_row("Market_copy", 0.0, 0.0);
+        market.budget_mana = 100.0;
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("copy row");
+        let executor = offline_executor(&db, &store);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let mut order = live_resting_order(now_ms);
+        order.market_id = "Market_copy".to_owned();
+        executor.own_orders().upsert(order);
+
+        let mut bet = own_bet_event("rest-1", 30.0, 60.0);
+        bet.contract_id = "Market_copy".to_owned();
+        bet.expires_at = Some(now_ms + 40_000);
+        executor.on_own_bet_event(&bet).await.expect("fill applies");
+
+        // A resting remainder that fills is a copy deployment: the daily cap
+        // query reads `copy_ledger`, so the row must exist.
+        let copies = db.recent_copies(10).expect("copies");
+        assert_eq!(copies.len(), 1, "one maker-fill row: {copies:?}");
+        assert_eq!(copies[0].action, "BUY_YES");
+        assert!((copies[0].mana_amount - 20.0).abs() < 1e-9);
+        assert_eq!(copies[0].manifold_bet_id.as_deref(), Some("rest-1"));
+        assert!(copies[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("maker_fill"));
+        let now = Utc::now().timestamp();
+        assert!(
+            (db.copy_spent_last_24h(now).expect("spend") - 20.0).abs() < 1e-9,
+            "the daily cap must see the maker fill"
+        );
+    }
+
+    fn planned_outcome_label(outcome: &PlannedOutcome) -> &'static str {
+        match outcome {
+            PlannedOutcome::Filled(_) => "filled",
+            PlannedOutcome::Refused(_) => "refused",
+            PlannedOutcome::NoFill => "no fill",
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Live calls. Run with `cargo test -- --ignored --nocapture`
     // -------------------------------------------------------------------
 
@@ -5995,6 +6390,7 @@ mod tests {
             p_internal: 0.55,
             p_market: 0.5,
             trigger_post_uri: None,
+            limit_prob: None,
             manifold_bet_id: Some("bet-9".to_owned()),
             created_at: 1_700_000_000,
         };

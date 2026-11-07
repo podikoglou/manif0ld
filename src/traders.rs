@@ -573,6 +573,9 @@ pub async fn run(
     let period = Duration::from_secs((config.trader_refresh_min as u64).saturating_mul(60));
     let mut ticker = tokio::time::interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval`'s first tick is immediate. Consume it before the loop so the
+    // loop body is the only first pass, then one pass per period.
+    ticker.tick().await;
 
     loop {
         match refresh(&client, &db, &config, &board, &rate).await {

@@ -341,6 +341,9 @@ pub struct TradeRecord {
     pub p_internal: f64,
     pub p_market: f64,
     pub trigger_post_uri: Option<String>,
+    /// Wire `limitProb` sent with a buy (YES scale, whole-percent quantized).
+    /// `None` for a sell or a row written before migration 009.
+    pub limit_prob: Option<f64>,
     pub manifold_bet_id: Option<String>,
     pub created_at: i64,
 }

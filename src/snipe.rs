@@ -41,14 +41,15 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::book::{kelly_target_mana, Book, PlannedTrade, TradeParams};
-use crate::config::Config;
+use crate::belief;
+use crate::config::{Config, MAX_SNIPE_TTL_SECS};
 use crate::db::Db;
 use crate::error::{anyhow, AppResult, Context};
 use crate::manifold_ws::ContractStub;
 use crate::market_store::MarketStore;
 use crate::rate::{Priority, RateLimiter, WRITE_COST_TOKENS};
 use crate::strategy_market::{insert_market_row, resolution_criteria, MarketRow};
-use crate::trade::{millis_to_seconds, ManifoldClient};
+use crate::trade::{millis_to_seconds, ManifoldClient, MarketSnapshot};
 use crate::triage::{FairProb, FairProbInput, TriageClient};
 use crate::types::{
     MarketId, SnipeRecord, TradeAction, TradeDecision, TradeRecord, STRATEGY_SNIPE,
@@ -175,7 +176,7 @@ impl SnipeStrategy {
             min_liq: config.snipe_min_liq,
             min_gap: config.snipe_min_gap,
             kelly_fraction: config.snipe_kelly_fraction,
-            ttl_secs: config.snipe_ttl_secs as i64,
+            ttl_secs: i64::try_from(config.snipe_ttl_secs).unwrap_or(MAX_SNIPE_TTL_SECS as i64),
             decision_timeout: Duration::from_secs(config.snipe_decision_timeout_secs as u64),
             min_trade_size: config.min_trade_size,
             exit_edge_threshold: config.exit_edge_threshold,
@@ -215,6 +216,7 @@ impl SnipeStrategy {
         contract: &ContractStub,
         now: i64,
         rate: &RateLimiter,
+        resting_mana: f64,
     ) -> AppResult<Option<SnipeOrder>> {
         let mut draft = SnipeDraft {
             contract_id: contract.id.clone(),
@@ -305,11 +307,14 @@ impl SnipeStrategy {
         // The market-level opening probability: `probability` on a binary
         // market, `initialProb` otherwise. On a multiple-choice market this is
         // only a fallback input for the fair-value state; the gap uses the
-        // chosen answer's own price (below).
+        // chosen answer's own price (below). Clamped exactly like the row
+        // builder clamps the price, so the ledger's `p_initial`, the gap, and
+        // `tracked_markets.p_market_last` can never disagree.
         let market_initial = snapshot
             .probability
             .or(snapshot.initial_prob)
-            .or(contract.initial_prob);
+            .or(contract.initial_prob)
+            .map(|p| p.clamp(0.01, 0.99));
         draft.p_initial = market_initial;
         if !is_multiple_choice && market_initial.is_none() {
             return self.skip(&draft, "no_probability");
@@ -317,8 +322,12 @@ impl SnipeStrategy {
 
         // (d) Pool gate. `snipe_pool_invested` is the sum over active snipe
         // rows of `invested − realized_pnl`, so profits flow back into the
-        // pool automatically.
-        let pool_remaining = self.pool_mana - self.db.snipe_pool_invested()?;
+        // pool automatically. `resting_mana` is unfilled mana of own resting
+        // orders on snipe rows: it is committed to the same pool even before
+        // it fills, and the maker-fill path converts it to invested mana
+        // without changing the total. The execution lock re-checks this with
+        // a fresh read before the POST.
+        let pool_remaining = self.pool_mana - self.db.snipe_pool_invested()? - resting_mana.max(0.0);
         if pool_remaining < self.min_trade_size {
             return self.skip(&draft, "pool_exhausted");
         }
@@ -376,6 +385,8 @@ impl SnipeStrategy {
             let Some(price) = answer.probability else {
                 return self.skip(&draft, "answer_price_missing");
             };
+            // Same clamp the row builder applies to this answer's price.
+            let price = price.clamp(0.01, 0.99);
             draft.answer = Some(answer.text.clone());
             draft.p_initial = Some(price);
             (Some(answer.id.clone()), Some(answer.text.clone()), price)
@@ -434,6 +445,19 @@ impl SnipeStrategy {
                 strategy: STRATEGY_SNIPE,
                 now,
             },
+        )?;
+
+        // The row builder anchors every answer belief at its price. On a
+        // multiple-choice market that leaves the chosen leg at edge zero, so
+        // the post-fill planner would exit the position at once. Write the
+        // model's probability onto the chosen answer before the order runs.
+        write_chosen_answer_belief(
+            &self.db,
+            &snapshot,
+            answer_id.as_deref(),
+            fair.p,
+            p_initial,
+            now,
         )?;
 
         let book = Book::load(&self.store, &self.db, &snapshot.id)?
@@ -531,6 +555,15 @@ impl SnipeStrategy {
         Ok(())
     }
 
+    /// The snipe pool as the executor must re-check it under the lock.
+    ///
+    /// `resting_mana` is unfilled mana of own resting orders on snipe rows;
+    /// see [`SnipeStrategy::evaluate`]. The row's frozen `budget_mana` still
+    /// bounds the per-market side inside `execute`.
+    pub(crate) fn remaining_pool(&self, resting_mana: f64) -> AppResult<f64> {
+        Ok((self.pool_mana - self.db.snipe_pool_invested()? - resting_mana.max(0.0)).max(0.0))
+    }
+
     /// Records one skip (with whatever model output is already known).
     fn skip(&self, draft: &SnipeDraft, reason: &str) -> AppResult<Option<SnipeOrder>> {
         self.db.insert_snipe(&SnipeRecord {
@@ -559,6 +592,74 @@ impl SnipeStrategy {
         );
         Ok(None)
     }
+}
+
+/// Writes the model's fair value onto the chosen multiple-choice answer leg.
+///
+/// [`insert_market_row`] anchors every answer belief at its own price. After a
+/// multiple-choice fill that would leave the chosen leg at `edge = p_model −
+/// p_initial` only on the root row, which the answer-shaped book never reads;
+/// the leg would then see `edge = price − price = 0` and the planner would
+/// exit the position on the very next evaluation. Binary markets need no
+/// write: their single leg reads the root row, which already carries
+/// `p_internal`.
+///
+/// # Sum-to-one projection
+///
+/// [`Book::plan`] projects a sum-to-one field as `q_i = p_i / Σ p_j` before
+/// computing edges (`answer_edges` in `book.rs`). Writing `p_model` alone
+/// would leave `q_chosen < p_model` whenever the other prices sum above
+/// `1 − p_model`. The other answer beliefs are therefore rescaled to sum
+/// exactly `1 − p_model`, which makes the projection return `p_model` on the
+/// chosen leg (subject to the belief engine's 0.01 probability floor on
+/// extreme long shots). Independent (`should_answers_sum_to_one = false`)
+/// markets project nothing, so their other legs keep their own prices.
+fn write_chosen_answer_belief(
+    db: &Db,
+    snapshot: &MarketSnapshot,
+    chosen: Option<&str>,
+    p_model: f64,
+    chosen_price: f64,
+    now: i64,
+) -> AppResult<()> {
+    let Some(chosen) = chosen else {
+        return Ok(());
+    };
+    let p_model = p_model.clamp(0.01, 0.99);
+    db.update_answer_belief(
+        &snapshot.id,
+        chosen,
+        belief::logit(p_model),
+        chosen_price,
+        now,
+    )?;
+
+    if !snapshot.should_answers_sum_to_one {
+        return Ok(());
+    }
+
+    let answers = db.list_answers(&snapshot.id)?;
+    let other_total: f64 = answers
+        .iter()
+        .filter(|answer| answer.id != chosen)
+        .map(|answer| answer.p_market_last.clamp(0.0, 1.0))
+        .sum();
+    if !other_total.is_finite() || other_total <= 0.0 {
+        return Ok(());
+    }
+
+    let scale = (1.0 - p_model).max(0.0) / other_total;
+    for answer in answers.iter().filter(|answer| answer.id != chosen) {
+        let projected = (answer.p_market_last.clamp(0.0, 1.0) * scale).clamp(0.0, 1.0);
+        db.update_answer_belief(
+            &snapshot.id,
+            &answer.id,
+            belief::logit(projected),
+            answer.p_market_last,
+            now,
+        )?;
+    }
+    Ok(())
 }
 
 /// Mutable evaluation context, so each gate records what it already knows.
@@ -667,7 +768,9 @@ pub(crate) async fn spawn_fake_manifold(
             tokio::spawn(async move {
                 let request = read_request(&mut stream).await;
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = if request.starts_with("POST /v0/bet") {
+                let body = if request.starts_with("POST /v0/bet")
+                    || request.starts_with("POST /v0/market/")
+                {
                     bet.to_string()
                 } else if request.starts_with("GET /v0/market/") {
                     market.to_string()
@@ -879,7 +982,7 @@ mod tests {
         let strategy = build_strategy(&config, &db, &store, &manifold.base_url, fair.clone());
 
         let order = strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation");
 
@@ -905,7 +1008,7 @@ mod tests {
         let mut poll = contract_stub("c1");
         poll.outcome_type = Some("POLL".to_owned());
         assert!(strategy
-            .evaluate(&poll, Utc::now().timestamp(), &limiter())
+            .evaluate(&poll, Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -917,7 +1020,7 @@ mod tests {
         let mut dpm = contract_stub("c2");
         dpm.mechanism = Some("dpm-2".to_owned());
         assert!(strategy
-            .evaluate(&dpm, Utc::now().timestamp(), &limiter())
+            .evaluate(&dpm, Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -946,7 +1049,7 @@ mod tests {
         let mut contract = contract_stub("c1");
         contract.created_time = Some(Utc::now().timestamp_millis() - 120_000);
         assert!(strategy
-            .evaluate(&contract, Utc::now().timestamp(), &limiter())
+            .evaluate(&contract, Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -993,7 +1096,7 @@ mod tests {
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
 
         assert!(strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1019,7 +1122,7 @@ mod tests {
         );
 
         assert!(strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1050,7 +1153,7 @@ mod tests {
         );
 
         assert!(strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1060,6 +1163,30 @@ mod tests {
         assert!((row.p_initial.expect("p_initial") - 0.48).abs() < 1e-9);
         assert!((row.p_model.expect("p_model") - 0.52).abs() < 1e-9);
         assert!((row.gap.expect("gap") - 0.04).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn the_snipe_probability_is_clamped_exactly_like_the_row_price() {
+        // A creator can publish an out-of-band opening probability. The ledger
+        // and the book must agree on the clamped value, not differ by 0.01.
+        let manifold = spawn_fake_manifold(
+            binary_market_json("c1", 0.0, Some(500.0)),
+            serde_json::json!({}),
+        )
+        .await;
+        let (db, store) = in_memory();
+        let fair = Arc::new(ScriptedFairValue::ok(0.8, None));
+        let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
+
+        let order = strategy
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
+            .await
+            .expect("evaluation")
+            .expect("a buy");
+        assert!((order.p_initial - 0.01).abs() < 1e-9, "{order:?}");
+        assert!((order.gap - 0.79).abs() < 1e-9, "{order:?}");
+        let row = store.load("c1").expect("load").expect("row");
+        assert!((row.p_market_last - order.p_initial).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -1077,7 +1204,7 @@ mod tests {
         let strategy = build_strategy(&config, &db, &store, &manifold.base_url, fair);
 
         let order = strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .expect("a buy");
@@ -1106,7 +1233,7 @@ mod tests {
         let strategy = build_strategy(&config, &db, &store, &manifold.base_url, fair);
 
         let order = strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .expect("a buy");
@@ -1120,6 +1247,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_exhausted_pool_skips_before_the_decision_call() {
+        let manifold = spawn_fake_manifold(
+            binary_market_json("c1", 0.1, Some(500.0)),
+            serde_json::json!({}),
+        )
+        .await;
+        let (db, store) = in_memory();
+        // 99.5 mana already invested in another snipe leaves 0.5 < MIN_TRADE_SIZE.
+        store
+            .insert(&TrackedMarket {
+                id: "snipe-old".to_owned(),
+                slug: "snipe-old".to_owned(),
+                market_url: String::new(),
+                question: "Old snipe".to_owned(),
+                description: String::new(),
+                resolution_criteria: String::new(),
+                close_time: None,
+                status: MarketStatus::Active,
+                budget_mana: 100.0,
+                invested_mana: 99.5,
+                realized_pnl_mana: 0.0,
+                yes_shares: 0.0,
+                no_shares: 0.0,
+                p_internal_log_odds: 0.0,
+                p_market_last: 0.5,
+                belief_updated_at: 0,
+                sieve_source: String::new(),
+                discord_thread_id: String::new(),
+                created_at: 0,
+                deleted_at: None,
+                outcome_type: "BINARY".to_owned(),
+                should_answers_sum_to_one: false,
+                strategy: STRATEGY_SNIPE.to_owned(),
+            })
+            .expect("occupied snipe row");
+        let fair = Arc::new(ScriptedFairValue::ok(0.95, None));
+        let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair.clone());
+
+        assert!(strategy
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
+            .await
+            .expect("evaluation")
+            .is_none());
+        assert_eq!(only_snipe(&db).reason.as_deref(), Some("pool_exhausted"));
+        assert_eq!(fair.calls(), 0, "the pool gate precedes the decision");
+        assert_eq!(manifold.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn resting_snipe_orders_count_against_the_pool() {
+        let manifold = spawn_fake_manifold(
+            binary_market_json("c1", 0.1, Some(500.0)),
+            serde_json::json!({}),
+        )
+        .await;
+        let (db, store) = in_memory();
+        let fair = Arc::new(ScriptedFairValue::ok(0.95, None));
+        let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair.clone());
+
+        // Unfilled own resting orders are committed mana from the same pool.
+        assert!(strategy
+            .evaluate(
+                &contract_stub("c1"),
+                Utc::now().timestamp(),
+                &limiter(),
+                99.5,
+            )
+            .await
+            .expect("evaluation")
+            .is_none());
+        assert_eq!(only_snipe(&db).reason.as_deref(), Some("pool_exhausted"));
+        assert_eq!(fair.calls(), 0);
+    }
+
+    #[tokio::test]
     async fn gap_sign_selects_yes_or_no() {
         let (db, store) = in_memory();
         let manifold = spawn_fake_manifold(
@@ -1130,7 +1332,7 @@ mod tests {
         let fair = Arc::new(ScriptedFairValue::ok(0.8, None));
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
         let order = strategy
-            .evaluate(&contract_stub("yes1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("yes1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .expect("a buy");
@@ -1145,7 +1347,7 @@ mod tests {
         let fair = Arc::new(ScriptedFairValue::ok(0.4, None));
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
         let order = strategy
-            .evaluate(&contract_stub("no1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("no1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .expect("a buy");
@@ -1178,7 +1380,7 @@ mod tests {
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
 
         let order = strategy
-            .evaluate(&contract_stub("mc1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("mc1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .expect("a buy");
@@ -1193,6 +1395,71 @@ mod tests {
         assert!(row.is_snipe());
         assert_eq!(row.outcome_type, "MULTIPLE_CHOICE");
         assert_eq!(db.list_answers("mc1").expect("answers").len(), 2);
+
+        // The chosen answer carries the model belief, and the field is
+        // renormalized to sum to one so the planner's projection returns it.
+        let answers = db.list_answers("mc1").expect("answers");
+        let bob = answers.iter().find(|a| a.id == "b").expect("bob");
+        let alice = answers.iter().find(|a| a.id == "a").expect("alice");
+        assert!((belief::sigmoid(bob.p_internal_log_odds) - 0.85).abs() < 1e-9);
+        assert!((belief::sigmoid(alice.p_internal_log_odds) - 0.15).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_filled_multiple_choice_snipe_is_not_exited_by_the_planner() {
+        let market = serde_json::json!({
+            "id": "mc1",
+            "slug": "who-wins",
+            "url": "https://manifold.markets/Alice/who-wins",
+            "question": "Who wins?",
+            "textDescription": "A race.",
+            "resolutionCriteria": "Resolves to the winner.",
+            "mechanism": "cpmm-multi-1",
+            "initialProb": 0.5,
+            "outcomeType": "MULTIPLE_CHOICE",
+            "shouldAnswersSumToOne": true,
+            "isResolved": false,
+            "totalLiquidity": 500.0,
+            "answers": [
+                {"id": "a", "text": "Alice", "probability": 0.3},
+                {"id": "b", "text": "Bob", "probability": 0.7}
+            ]
+        });
+        let manifold = spawn_fake_manifold(market, serde_json::json!({})).await;
+        let (db, store) = in_memory();
+        let fair = Arc::new(ScriptedFairValue::ok(0.85, Some("Bob")));
+        let config = test_config();
+        let strategy = build_strategy(&config, &db, &store, &manifold.base_url, fair);
+
+        let now = Utc::now().timestamp();
+        let order = strategy
+            .evaluate(&contract_stub("mc1"), now, &limiter(), 0.0)
+            .await
+            .expect("evaluation")
+            .expect("a buy");
+
+        // Simulate the live fill of the chosen leg through the same book call
+        // the executor uses.
+        let mut book = Book::load(&store, &db, "mc1")
+            .expect("load book")
+            .expect("tracked");
+        book.apply_buy(
+            order.planned.leg,
+            order.planned.decision.action,
+            order.planned.decision.amount_mana,
+            4.0,
+        )
+        .expect("apply the fill");
+
+        let policy = crate::book::TradePolicy::from_config(&config);
+        let planned = book.plan(now, 4.0, &policy);
+        assert!(
+            !planned.iter().any(|trade| matches!(
+                trade.decision.action,
+                TradeAction::SellYes | TradeAction::SellNo
+            )),
+            "a fresh MCQ snipe must not exit itself: {planned:?}"
+        );
     }
 
     #[tokio::test]
@@ -1216,7 +1483,7 @@ mod tests {
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
 
         assert!(strategy
-            .evaluate(&contract_stub("mc1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("mc1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1251,7 +1518,7 @@ mod tests {
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
 
         assert!(strategy
-            .evaluate(&contract_stub("mc1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("mc1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1270,7 +1537,7 @@ mod tests {
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
 
         assert!(strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .is_none());
@@ -1296,7 +1563,7 @@ mod tests {
         let fair = Arc::new(ScriptedFairValue::ok(0.8, None));
         let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
         let order = strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation")
             .expect("a buy");
@@ -1314,6 +1581,7 @@ mod tests {
                     p_internal: 0.8,
                     p_market: 0.4,
                     trigger_post_uri: Some("c1".to_owned()),
+                    limit_prob: Some(0.81),
                     manifold_bet_id: Some("bet-1".to_owned()),
                     created_at: order.created_at,
                 },
@@ -1350,7 +1618,7 @@ mod tests {
         config.snipe_decision_timeout_secs = 3;
         let strategy = build_strategy(&config, &db, &store, &manifold.base_url, fair.clone());
         let _ = strategy
-            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter())
+            .evaluate(&contract_stub("c1"), Utc::now().timestamp(), &limiter(), 0.0)
             .await
             .expect("evaluation");
         assert_eq!(

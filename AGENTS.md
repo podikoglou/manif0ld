@@ -27,8 +27,10 @@ and API contracts.
   programs through a tool. Do not reintroduce a fixed attempt loop.
 - **Per-market isolated budgets.** `available_budget = budget + realized_pnl
   − invested`; never exceed `budget_mana` net.
-- **No autonomous market discovery.** Markets enter only via the operator
-  `/track` command.
+- **No autonomous news-market discovery.** Operator markets enter only via
+  `/track`. S2 sniping and S3b copying autonomously create *strategy-tagged*
+  rows (`strategy = 'snipe'` / `'copy'`) with isolated pools and caps; both
+  flags default to `false`.
 - **Cloudflare LLM calls use `/ai/run`** through the vendored `rig`
   Cloudflare provider with `cf-aig-gateway-id` and `CLOUDFLARE_API_TOKEN`,
   not the legacy gateway/compat route (see `docs/SPEC.md` §4 and §6.4). Never
