@@ -20,7 +20,7 @@
 //! |---|---|---|
 //! | `GET /v0/leaderboard?kind=profit&limit=100` | 1 | `[{"userId","score"}]`, highest all-time profit first |
 //! | `GET /v0/leaderboard?kind=creator&limit=100` | 1 | same shape, ranked by creator earnings |
-//! | `GET /v0/users/by-id?ids=a&ids=b…` | 1 per 100 ids | `[{"id","name","username","isBot","avatarUrl"}]`; unknown ids are absent |
+//! | `GET /v0/users/by-id?ids[]=a&ids[]=b…` | 1 per 100 ids | `[{"id","name","username","isBot","avatarUrl"}]`; unknown ids are absent |
 //! | `GET /v0/get-user-portfolio-history?userId=…&period=weekly` | 1 | ~585 hourly points `{"timestamp","profit",…}` spanning ~168 h |
 //! | `GET /v0/bets?userId=…&limit=N` | 1 | bare array of the newest N bet rows |
 //!

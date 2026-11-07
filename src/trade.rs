@@ -303,6 +303,34 @@ pub struct PortfolioHistoryPoint {
     pub profit: Option<f64>,
 }
 
+/// Encodes a batch of IDs as the `ids` query string both batch read routes
+/// accept.
+///
+/// `GET /v0/market-probs` and `GET /v0/users/by-id` validate `ids` as
+/// `z.array(z.string())` (`manifold/common/src/api/schema.ts:907` and `:2041`).
+/// The backend is Express 4.18.1 (`manifold/backend/api/package.json:48`), whose
+/// default `qs` query parser leaves a bare repeated key as a *string* when it
+/// occurs once and only folds repeats into an array — so `ids=<one>` fails with
+/// `Expected array, received string` while `ids[]=<one>` is an array of one.
+/// `typedEndpoint` spreads `req.query` straight into the schema
+/// (`manifold/backend/api/src/helpers/endpoint.ts:194`), so the bracket form is
+/// the only encoding that is valid for every batch length.
+///
+/// Verified live against the public API on 2026-11-07:
+/// `?ids[]=dsIQRys9qq` → 200 `{"dsIQRys9qq":{"prob":0.47…}}`,
+/// `?ids=dsIQRys9qq` → 400 `Expected array, received string`,
+/// `?ids[]=a&ids[]=b` → 200 with both markets, and 101 IDs → 400 (`max(100)`).
+///
+/// The returned string is already percent-encoded (`ids%5B%5D=a&ids%5B%5D=b`),
+/// which is exactly the wire form `qs` decodes back into `ids: ["a", "b"]`.
+fn ids_query(ids: &[String]) -> String {
+    let mut encoder = url::form_urlencoded::Serializer::new(String::new());
+    for id in ids {
+        encoder.append_pair("ids[]", id);
+    }
+    encoder.finish()
+}
+
 impl ManifoldClient {
     /// Builds a client and resolves the bot's user ID from `GET /v0/me`.
     ///
@@ -374,11 +402,17 @@ impl ManifoldClient {
     }
 
     /// Fetches probabilities for a batch of markets in one request
-    /// (`GET /v0/market-probs?ids=a&ids=b…`).
+    /// (`GET /v0/market-probs?ids[]=a&ids[]=b…`).
     ///
-    /// The caller keeps each batch at [`PROB_CHUNK_SIZE`] IDs, the documented
-    /// per-request maximum. The endpoint has a cache of up to 1 s, so even the
-    /// largest call is one token of the batch budget.
+    /// The caller keeps each batch within [`PROB_CHUNK_SIZE`], the schema's
+    /// `max(100)`. The endpoint has a cache of up to 1 s, so even the largest
+    /// call is one token of the batch budget.
+    ///
+    /// The `ids[]` array encoding is required, not cosmetic: the route's schema
+    /// is `ids: z.array(z.string())` and Express 4's default query parser turns
+    /// a single bare `ids=<id>` into a string, which the server rejects with
+    /// HTTP 400. [`ids_query`] always emits the bracket form, so a one-market
+    /// batch is a valid array of one and never needs the caller's error path.
     ///
     /// Markets missing from the map (unknown ID, closed, or a shape the parser
     /// does not recognize) are simply absent: the caller refreshes what it
@@ -387,8 +421,11 @@ impl ManifoldClient {
         &self,
         market_ids: &[String],
     ) -> AppResult<HashMap<MarketId, MarketProbs>> {
-        let ids: Vec<(&str, &str)> = market_ids.iter().map(|id| ("ids", id.as_str())).collect();
-        let request = self.http.get(self.url("/v0/market-probs")).query(&ids);
+        if market_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let path = format!("/v0/market-probs?{}", ids_query(market_ids));
+        let request = self.http.get(self.url(&path));
         let value: Value = self.send(request, "GET /v0/market-probs").await?;
         Ok(parse_market_probs(&value))
     }
@@ -444,19 +481,23 @@ impl ManifoldClient {
     }
 
     /// Resolves many user IDs to LiteUsers in one request
-    /// (`GET /v0/users/by-id?ids=a&ids=b…`).
+    /// (`GET /v0/users/by-id?ids[]=a&ids[]=b…`).
     ///
     /// This is the only batch identity lookup the public API offers; the
-    /// single-user route takes a *username*, not an ID. Verified live
-    /// 2026-11-06 with 200 IDs (~6.6 KB of query string). IDs the server does
+    /// single-user route takes a *username*, not an ID. The schema is
+    /// `ids: z.array(z.string())` (`manifold/common/src/api/schema.ts:2041`), so
+    /// this shares [`ids_query`] with [`ManifoldClient::market_probs`]: a bare
+    /// single `ids=<id>` is a string to Express's query parser and returns
+    /// HTTP 400 (verified live 2026-11-07). Verified live 2026-11-06 with 200
+    /// IDs (~6.6 KB of query string) in the bracket form. IDs the server does
     /// not know (deleted or banned accounts) are simply absent from the reply,
     /// so callers must tolerate a short list.
     pub async fn users_by_id(&self, ids: &[String]) -> AppResult<Vec<LiteUserRow>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let query: Vec<(&str, &str)> = ids.iter().map(|id| ("ids", id.as_str())).collect();
-        let request = self.http.get(self.url("/v0/users/by-id")).query(&query);
+        let path = format!("/v0/users/by-id?{}", ids_query(ids));
+        let request = self.http.get(self.url(&path));
         self.send(request, "GET /v0/users/by-id").await
     }
 
@@ -4529,6 +4570,120 @@ mod tests {
         assert_eq!(probs.get("null-prob"), None);
         assert!(parse_market_probs(&json!([1, 2, 3])).is_empty());
         assert!(parse_market_probs(&json!("nope")).is_empty());
+    }
+
+    // -- Wire encoding of the batch `ids` parameter -------------------------
+
+    #[test]
+    fn ids_query_encodes_one_id_as_a_single_element_array() {
+        let one = ids_query(&["abc123".to_owned()]);
+
+        // What `qs` (Express 4's default parser) needs to produce `["abc123"]`.
+        assert_eq!(one, "ids%5B%5D=abc123");
+        // The form that produced the production 400: Manifold's schema saw a
+        // string, not an array (`Expected array, received string`).
+        assert_ne!(one, "ids=abc123");
+    }
+
+    #[test]
+    fn ids_query_repeats_the_bracket_key_for_every_id() {
+        let many = ids_query(&["abc".to_owned(), "def".to_owned(), "ghi".to_owned()]);
+
+        assert_eq!(many, "ids%5B%5D=abc&ids%5B%5D=def&ids%5B%5D=ghi");
+        assert!(!many.contains("ids=abc"), "no bare single-value key");
+    }
+
+    #[test]
+    fn ids_query_is_empty_without_ids() {
+        assert_eq!(ids_query(&[]), "");
+    }
+
+    /// Serves exactly one batch `ids` read and records its request line.
+    ///
+    /// The replies mirror the live server: the array form answers the batch,
+    /// the bare single-value form answers the `ids` validation 400. A one-id
+    /// call that still used the old encoding would therefore fail here and the
+    /// caller would have to fall back (reconcile to per-market syncs, trader
+    /// naming to nothing).
+    async fn fake_ids_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the fake ids listener");
+        let address = listener.local_addr().expect("local address");
+        let (line_tx, line_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept a request");
+            let mut raw = [0u8; 4096];
+            let read = stream.read(&mut raw).await.expect("read the request");
+            let request = String::from_utf8_lossy(&raw[..read]).to_string();
+            let line = request.lines().next().unwrap_or_default().to_owned();
+            let _ = line_tx.send(line.clone());
+
+            let (status, body) = if line.contains("GET /v0/market-probs?ids%5B%5D=one ") {
+                ("200 OK", r#"{"one":{"prob":0.42}}"#)
+            } else if line.contains("GET /v0/users/by-id?ids%5B%5D=u1 ") {
+                ("200 OK", r#"[{"id":"u1","username":"alice"}]"#)
+            } else {
+                (
+                    "400 Bad Request",
+                    r#"{"message":"Error validating request.","details":[{"field":"ids","error":"Expected array, received string"}]}"#,
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+
+        (format!("http://{address}"), line_rx)
+    }
+
+    #[tokio::test]
+    async fn market_probs_single_id_is_valid_on_the_wire_without_a_fallback() {
+        let (base_url, line_rx) = fake_ids_server().await;
+        let client = ManifoldClient::for_test(base_url);
+
+        let probs = client
+            .market_probs(&["one".to_owned()])
+            .await
+            .expect("one id must be a valid array of one, not a server error");
+
+        assert_eq!(probs.get("one"), Some(&MarketProbs::Binary { prob: 0.42 }));
+        let line = line_rx.await.expect("request line");
+        assert!(
+            line.starts_with("GET /v0/market-probs?ids%5B%5D=one "),
+            "unexpected request line: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn users_by_id_single_id_is_valid_on_the_wire_without_a_fallback() {
+        let (base_url, line_rx) = fake_ids_server().await;
+        let client = ManifoldClient::for_test(base_url);
+
+        let users = client
+            .users_by_id(&["u1".to_owned()])
+            .await
+            .expect("one id must be a valid array of one, not a server error");
+
+        assert_eq!(
+            users,
+            vec![LiteUserRow {
+                id: "u1".to_owned(),
+                username: Some("alice".to_owned()),
+            }]
+        );
+        let line = line_rx.await.expect("request line");
+        assert!(
+            line.starts_with("GET /v0/users/by-id?ids%5B%5D=u1 "),
+            "unexpected request line: {line}"
+        );
     }
 
     #[test]
