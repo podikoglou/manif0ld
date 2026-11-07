@@ -149,7 +149,7 @@ COPY_ENABLED=false
 COPY_MIN_SIZE=5            # minimum source-bet size in mana
 COPY_MIN_INFORMED=0.60     # is_informed_bet gate, (0, 1)
 COPY_MIN_EDGE=0.05         # residual edge after their move, (0, 1)
-COPY_KELLY_FRACTION=0.125  # (0, 1]; effective fraction is clamped to 0.5
+COPY_KELLY_FRACTION=0.125  # (0, 0.5]
 COPY_MAX_MANA=10           # per-copy cap
 COPY_POOL_MANA=100         # global pool for open copy positions
 COPY_DAILY_MANA=30         # rolling 24 h cap on executed copy buys
@@ -991,8 +991,9 @@ and the reason; free gates run before any REST spend):
 | 12 | Multiple choice: model names a tracked answer and its price exists | — | `no_answer_selected`, `answer_not_in_market`, `answer_price_missing` |
 | 13 | `\|p_model − p_initial\|` ≥ `SNIPE_MIN_GAP` | 0.10 | `small_gap` |
 | 14 | A sum-to-one market is never a NO leg | — | `sum_to_one_no_leg` |
-| 15 | Kelly target ≥ `MIN_TRADE_SIZE` | 1.0 | `below_min_size` |
-| 16 | Insert row + answers, resolve the book leg, return the order | — | — |
+| 15 | The sum-to-one projection can still clear `SNIPE_MIN_GAP` after the 0.01 belief floor on `n − 1` answers | — | `answer_field_too_wide` |
+| 16 | Kelly target ≥ `MIN_TRADE_SIZE` | 1.0 | `below_min_size` |
+| 17 | Insert row + answers, resolve the book leg, return the order | — | — |
 
 **Fair value.** One `TriageClient::fair_prob` call (decile rubric; §6.4, an
 ALGO §4 deviation because the vendored `Score` has at most 10 levels). It
@@ -1072,10 +1073,11 @@ remainder cannot both spend it.
 
 A row that passes every gate is inserted before execution, so an execution
 refusal (kill switch, rate floor, dry run, cap, zero fill) leaves a tracked
-snipe row with no position; the snipe row simply waits for the next price or
-reconcile evaluation like any other active row. Only the ledger distinguishes
-the refusal. The regular planner may only exit such a row, never enter it
-(§6.6).
+snipe row with no position. That market is permanently unsnipoable in this
+process: strategy rows are planned exits-only and the `already_tracked` guard
+rejects a second snipe. Soft-deleting the row after a flat refusal is the future
+retry mechanism, not built. Only the ledger distinguishes the refusal. The
+regular planner may only exit such a row, never enter it (§6.6).
 
 On a sum-to-one multiple-choice market the fair cap is built from the planner's
 normalized leg belief (§6.6), while sizing uses the raw `gap`; the fill
@@ -1289,9 +1291,8 @@ skip when size < MIN_TRADE_SIZE
 `resting_copy` is the unfilled mana of own resting orders on
 `strategy = 'copy'` rows. `COPY_KELLY_FRACTION` defaults to `0.125`, half the
 news default: the source move is already in the price, so the remaining edge is
-smaller and less certain than a fresh news edge. `kelly_target_mana` clamps the
-effective fraction to `0.5`, so values above that (including a configured
-`COPY_KELLY_FRACTION` of 1) never risk more than half of `cap`.
+smaller and less certain than a fresh news edge. Configuration validates it to
+`(0, 0.5]`, and `kelly_target_mana` also clamps the effective fraction to `0.5`.
 
 - **Pool accounting.** `copy_pool_invested()` is
   `SUM(invested_mana − realized_pnl_mana)` over `strategy = 'copy'`,

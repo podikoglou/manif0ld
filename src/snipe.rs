@@ -416,6 +416,29 @@ impl SnipeStrategy {
             return self.skip(&draft, "sum_to_one_no_leg");
         }
 
+        // (g2) A wide sum-to-one field cannot project the model belief. Every
+        // non-chosen answer is written through `belief::logit`, which floors
+        // it at `PROB_CLAMP` (0.01), so the projected denominator is at least
+        // `p_model + max(1 − p_model, 0.01 × others)` and the chosen leg
+        // projects to at most
+        //
+        //     q_chosen = p_model / (p_model + max(1 − p_model, floor_mass)).
+        //
+        // If that best-case projection is not a full entry gap above the
+        // price, a fill would sit at or below `EXIT_EDGE_THRESHOLD` and the
+        // planner would exit it on the next evaluation. Refuse before any
+        // belief write, so the row is never inserted with an unachievable
+        // projection.
+        if is_multiple_choice && snapshot.should_answers_sum_to_one {
+            let others = snapshot_answers.len().saturating_sub(1);
+            let floor_mass = belief::PROB_CLAMP * others as f64;
+            let p_model = fair.p.clamp(belief::PROB_CLAMP, 1.0 - belief::PROB_CLAMP);
+            let achievable = p_model / (p_model + (1.0 - p_model).max(floor_mass));
+            if achievable - p_initial < self.min_gap {
+                return self.skip(&draft, "answer_field_too_wide");
+            }
+        }
+
         // (h) Fractional Kelly, on the same formula and cap as the planner. The
         // pool remaining and SNIPE_MAX_MANA bound the *budget* the formula sees,
         // so the per-market invariant holds after the row is inserted.
@@ -614,6 +637,12 @@ impl SnipeStrategy {
 /// chosen leg (subject to the belief engine's 0.01 probability floor on
 /// extreme long shots). Independent (`should_answers_sum_to_one = false`)
 /// markets project nothing, so their other legs keep their own prices.
+///
+/// The floor is why the snipe gate refuses wide fields before this function
+/// runs: with `n − 1` other answers the projected total can be as large as
+/// `0.01 × (n − 1)` even when the rescaled prices sum to `1 − p_model`. The
+/// `answer_field_too_wide` gate in [`SnipeStrategy::evaluate`] proves the
+/// chosen leg can still clear the entry gap before any belief is written.
 fn write_chosen_answer_belief(
     db: &Db,
     snapshot: &MarketSnapshot,
@@ -1459,6 +1488,121 @@ mod tests {
                 TradeAction::SellYes | TradeAction::SellNo
             )),
             "a fresh MCQ snipe must not exit itself: {planned:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wide_sum_to_one_field_is_refused_before_any_belief_write() {
+        // 30 answers: the 0.01 floor on each of the 29 others pins at least
+        // 0.29 of projected mass, so the chosen leg can project at most
+        // 0.85 / (0.85 + 0.29) ≈ 0.746. Against a 0.70 entry price that is
+        // only a 0.046 edge — below the 0.10 entry gap, so a fill would be
+        // exited on the very next evaluation.
+        let mut answers = vec![serde_json::json!({
+            "id": "chosen",
+            "text": "Bob",
+            "probability": 0.70
+        })];
+        for index in 0..29 {
+            answers.push(serde_json::json!({
+                "id": format!("other-{index}"),
+                "text": format!("Other {index}"),
+                "probability": 0.30 / 29.0
+            }));
+        }
+        let market = serde_json::json!({
+            "id": "mc-wide",
+            "question": "Who wins a 30-person race?",
+            "outcomeType": "MULTIPLE_CHOICE",
+            "mechanism": "cpmm-multi-1",
+            "shouldAnswersSumToOne": true,
+            "isResolved": false,
+            "totalLiquidity": 500.0,
+            "answers": answers
+        });
+        let manifold = spawn_fake_manifold(market, serde_json::json!({})).await;
+        let (db, store) = in_memory();
+        let fair = Arc::new(ScriptedFairValue::ok(0.85, Some("Bob")));
+        let strategy = build_strategy(&test_config(), &db, &store, &manifold.base_url, fair);
+
+        assert!(strategy
+            .evaluate(
+                &contract_stub("mc-wide"),
+                Utc::now().timestamp(),
+                &limiter(),
+                0.0
+            )
+            .await
+            .expect("evaluation")
+            .is_none());
+        let row = only_snipe(&db);
+        assert_eq!(row.action, "SKIP");
+        assert_eq!(row.reason.as_deref(), Some("answer_field_too_wide"));
+        assert!(
+            store.load("mc-wide").expect("load").is_none(),
+            "the refusal happens before the row and its beliefs are written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_narrow_sum_to_one_field_still_fills_without_an_exit() {
+        // Four answers keep the floor mass at 0.03, below 1 − 0.85, so the
+        // projection returns the model belief exactly and the post-fill edge
+        // stays far above the exit threshold.
+        let market = serde_json::json!({
+            "id": "mc-narrow",
+            "question": "Who wins a four-person race?",
+            "outcomeType": "MULTIPLE_CHOICE",
+            "mechanism": "cpmm-multi-1",
+            "shouldAnswersSumToOne": true,
+            "isResolved": false,
+            "totalLiquidity": 500.0,
+            "answers": [
+                {"id": "a", "text": "Alice", "probability": 0.10},
+                {"id": "b", "text": "Bob", "probability": 0.70},
+                {"id": "c", "text": "Carol", "probability": 0.10},
+                {"id": "d", "text": "Dave", "probability": 0.10}
+            ]
+        });
+        let manifold = spawn_fake_manifold(market, serde_json::json!({})).await;
+        let (db, store) = in_memory();
+        let fair = Arc::new(ScriptedFairValue::ok(0.85, Some("Bob")));
+        let config = test_config();
+        let strategy = build_strategy(&config, &db, &store, &manifold.base_url, fair);
+
+        let now = Utc::now().timestamp();
+        let order = strategy
+            .evaluate(&contract_stub("mc-narrow"), now, &limiter(), 0.0)
+            .await
+            .expect("evaluation")
+            .expect("the feasible field must fill");
+
+        let answers = db.list_answers("mc-narrow").expect("answers");
+        let bob = answers.iter().find(|answer| answer.id == "b").expect("bob");
+        assert!(
+            (belief::sigmoid(bob.p_internal_log_odds) - 0.85).abs() < 1e-9,
+            "the renormalized field must project 0.85 on the chosen leg"
+        );
+
+        let mut book = Book::load(&store, &db, "mc-narrow")
+            .expect("load book")
+            .expect("tracked");
+        book.apply_buy(
+            order.planned.leg,
+            order.planned.decision.action,
+            order.planned.decision.amount_mana,
+            4.0,
+        )
+        .expect("apply the fill");
+
+        let policy = crate::book::TradePolicy::from_config(&config);
+        let planned = book.plan(now, 4.0, &policy);
+        assert!(
+            !planned.iter().any(|trade| matches!(
+                trade.decision.action,
+                TradeAction::SellYes | TradeAction::SellNo
+            )),
+            "a feasible MCQ snipe must not exit after its fill: {planned:?}"
         );
     }
 

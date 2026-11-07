@@ -199,6 +199,14 @@ const FALLBACK_LIMIT_EXPIRY_SECS: i64 = 60;
 /// 100 IDs per request.
 const PROB_CHUNK_SIZE: usize = 100;
 
+/// Maximum IDs the batch read routes accept in one request.
+///
+/// `GET /v0/market-probs` and `GET /v0/users/by-id` both validate `ids` as a
+/// `max(100)` array; 101 IDs are rejected with HTTP 400 (verified live
+/// 2026-11-07). The client refuses the over-long batch itself instead of
+/// sending a request that cannot succeed.
+const BATCH_IDS_MAX: usize = 100;
+
 /// Largest `limit` the public leaderboard route accepts (verified live
 /// 2026-11-06: 101 is rejected, 100 is served).
 pub(crate) const LEADERBOARD_MAX_LIMIT: usize = 100;
@@ -405,8 +413,10 @@ impl ManifoldClient {
     /// (`GET /v0/market-probs?ids[]=a&ids[]=b…`).
     ///
     /// The caller keeps each batch within [`PROB_CHUNK_SIZE`], the schema's
-    /// `max(100)`. The endpoint has a cache of up to 1 s, so even the largest
-    /// call is one token of the batch budget.
+    /// `max(100)`; this method also refuses a longer batch itself with
+    /// [`BATCH_IDS_MAX`] rather than sending a request the server rejects.
+    /// The endpoint has a cache of up to 1 s, so even the largest call is one
+    /// token of the batch budget.
     ///
     /// The `ids[]` array encoding is required, not cosmetic: the route's schema
     /// is `ids: z.array(z.string())` and Express 4's default query parser turns
@@ -423,6 +433,13 @@ impl ManifoldClient {
     ) -> AppResult<HashMap<MarketId, MarketProbs>> {
         if market_ids.is_empty() {
             return Ok(HashMap::new());
+        }
+        if market_ids.len() > BATCH_IDS_MAX {
+            bail!(
+                "GET /v0/market-probs accepts at most {BATCH_IDS_MAX} ids per request \
+                 (schema max), got {}",
+                market_ids.len()
+            );
         }
         let path = format!("/v0/market-probs?{}", ids_query(market_ids));
         let request = self.http.get(self.url(&path));
@@ -495,6 +512,13 @@ impl ManifoldClient {
     pub async fn users_by_id(&self, ids: &[String]) -> AppResult<Vec<LiteUserRow>> {
         if ids.is_empty() {
             return Ok(Vec::new());
+        }
+        if ids.len() > BATCH_IDS_MAX {
+            bail!(
+                "GET /v0/users/by-id accepts at most {BATCH_IDS_MAX} ids per request \
+                 (schema max), got {}",
+                ids.len()
+            );
         }
         let path = format!("/v0/users/by-id?{}", ids_query(ids));
         let request = self.http.get(self.url(&path));
@@ -1277,8 +1301,9 @@ struct OwnRestingOrder {
 /// Guarded by a [`SyncMutex`] exactly like [`TerminalMirrors`]: the guard is
 /// taken and released inside one synchronous block and never held across an
 /// await, so the REST cancels and fill applications can never deadlock with
-/// it (the fill path takes `execution_lock` first, and nothing takes
-/// `own_orders` after a lock anywhere).
+/// it. The maker-fill path takes `execution_lock` first and `own_orders` only
+/// for the delta/counter block; no path takes `execution_lock` while holding
+/// an `own_orders` guard.
 #[derive(Debug, Default)]
 struct OwnRestingOrders(HashMap<MarketId, HashMap<String, OwnRestingOrder>>);
 
@@ -2219,6 +2244,15 @@ impl TradeExecutor {
         }
 
         let strategy = book.strategy();
+        // A non-finite amount cannot be clamped or compared meaningfully
+        // (`f64::min` ignores NaN), so refuse it instead of letting it reach
+        // the budget check.
+        if !planned.decision.amount_mana.is_finite() {
+            return Ok(CapVerdict::Refused(format!(
+                "{strategy}_cap: planned amount {} is not finite",
+                planned.decision.amount_mana
+            )));
+        }
         let resting = self.resting_for_strategy(strategy);
         let remaining = match strategy {
             crate::types::STRATEGY_COPY => match self.copy.as_ref() {
@@ -2233,6 +2267,11 @@ impl TradeExecutor {
             _ => return Ok(CapVerdict::Allowed(planned.decision.amount_mana)),
         };
 
+        if !remaining.is_finite() {
+            return Ok(CapVerdict::Refused(format!(
+                "{strategy}_cap: remaining {remaining} is not finite"
+            )));
+        }
         let minimum = self.policy.params.min_trade_size;
         if remaining < minimum {
             return Ok(CapVerdict::Refused(format!(
@@ -3192,10 +3231,10 @@ impl TradeExecutor {
     /// delta beyond the stored counters is applied through the same book
     /// flow as an ordinary buy: `Book::apply_buy` + a `trade_ledger` row
     /// (provenance `maker_fill` in the trigger column) + a Discord
-    /// [`TradeEvent`], all under the execution lock. Duplicate broadcasts
-    /// are idempotent by construction — the delta is zero — and the stored
-    /// counters are overwritten with the server's values first, so a
-    /// double-send can never re-apply a consumed fill.
+    /// [`TradeEvent`], all under the execution lock. The delta is re-derived
+    /// from the stored counters under that lock, and the counters are
+    /// advanced there too, so duplicate broadcasts are idempotent: the
+    /// second event sees a zero delta.
     async fn on_own_bet_event(&self, bet: &BetEvent) -> AppResult<()> {
         if bet.user_id != self.client.bot_user_id() {
             // Not ours: the run arm normally filters these before calling,
@@ -3211,76 +3250,70 @@ impl TradeExecutor {
             return Ok(());
         }
 
-        let Some(order) = self
-            .own_orders()
-            .get(&bet.contract_id, &bet.id)
-            .cloned()
-        else {
-            // Either the placement broadcast of a bet the POST response
-            // already accounts (our own taker bet), or an order placed
-            // before this process started: not tracked here, so the event
-            // would double-count.
-            tracing::debug!(
-                contract_id = %bet.contract_id,
-                bet_id = %bet.id,
-                outcome = %bet.outcome,
-                "own bet broadcast is not a tracked resting order"
-            );
-            return Ok(());
-        };
-
-        let now_ms = Utc::now().timestamp_millis();
-        let update = own_bet_update(&order, bet, now_ms);
-
-        // The server's counters are authoritative: overwrite the stored view
-        // before (rather than only after) applying, so an interrupted
-        // application can never re-apply from a duplicate event.
-        if update.fill.is_some() {
-            let refreshed = OwnRestingOrder {
-                filled_amount: bet.amount,
-                filled_shares: bet.shares,
-                expires_ms: bet.expires_at.or(order.expires_ms),
-                ..order.clone()
-            };
-            self.own_orders().upsert(refreshed);
-        }
-
-        let Some((fill_mana, fill_shares)) = update.fill else {
-            if update.removed {
-                self.own_orders().remove(&bet.contract_id, &bet.id);
-                tracing::debug!(
-                    contract_id = %bet.contract_id,
-                    bet_id = %bet.id,
-                    "own resting order is dead; dropped from tracking"
-                );
-            }
-            return Ok(());
-        };
-
-        self.apply_maker_fill(&order, fill_mana, fill_shares, bet)
-            .await?;
-        if update.removed {
-            self.own_orders().remove(&bet.contract_id, &bet.id);
-        }
-        Ok(())
+        self.apply_maker_fill(bet).await
     }
 
     /// Posts one maker fill into the same book flow a taker fill uses.
     ///
     /// The fill happened on Manifold already — this is accounting, not a
-    /// decision. The budget invariant still gates the *local* application:
-    /// a fill that would breach the ceiling (only possible after external
-    /// interference with the market's budget columns) is refused locally and
-    /// left to the next reconcile pass, which trusts Manifold's positions
-    /// (`docs/SPEC.md` §6.6); a Discord error is emitted.
-    async fn apply_maker_fill(
-        &self,
-        order: &OwnRestingOrder,
-        fill_mana: f64,
-        fill_shares: f64,
-        bet: &BetEvent,
-    ) -> AppResult<()> {
+    /// decision. The delta and the counter advance are both derived under
+    /// `execution_lock`, before any book work, so a concurrent observer can
+    /// never see the old unfilled mana as free and a duplicate broadcast can
+    /// never re-apply a consumed fill. The budget invariant still gates the
+    /// *local* application: a fill that would breach the ceiling (only
+    /// possible after external interference with the market's budget columns)
+    /// is refused locally and left to the next reconcile pass, which trusts
+    /// Manifold's positions (`docs/SPEC.md` §6.6); a Discord error is emitted.
+    async fn apply_maker_fill(&self, bet: &BetEvent) -> AppResult<()> {
         let _guard = self.execution_lock.lock().await;
+
+        // Re-derive the delta from the stored counters and advance them under
+        // the same lock the fill is applied under. Two duplicate broadcasts
+        // serialize here: the first consumes the delta, the second sees a
+        // zero delta and applies nothing.
+        let now_ms = Utc::now().timestamp_millis();
+        let (order, fill_mana, fill_shares) = {
+            let mut orders = self.own_orders();
+            let Some(order) = orders.get(&bet.contract_id, &bet.id).cloned() else {
+                // Either the placement broadcast of a bet the POST response
+                // already accounts (our own taker bet), or an order placed
+                // before this process started: not tracked here, so the
+                // event would double-count.
+                tracing::debug!(
+                    contract_id = %bet.contract_id,
+                    bet_id = %bet.id,
+                    outcome = %bet.outcome,
+                    "own bet broadcast is not a tracked resting order"
+                );
+                return Ok(());
+            };
+            let update = own_bet_update(&order, bet, now_ms);
+            let Some((fill_mana, fill_shares)) = update.fill else {
+                if update.removed {
+                    orders.remove(&bet.contract_id, &bet.id);
+                    tracing::debug!(
+                        contract_id = %bet.contract_id,
+                        bet_id = %bet.id,
+                        "own resting order is dead; dropped from tracking"
+                    );
+                }
+                return Ok(());
+            };
+            if update.removed {
+                orders.remove(&bet.contract_id, &bet.id);
+            } else {
+                // The server's counters are authoritative. Advance them
+                // before the fill is applied, so no task can observe the
+                // old unfilled mana as free inside this critical section.
+                orders.upsert(OwnRestingOrder {
+                    filled_amount: bet.amount,
+                    filled_shares: bet.shares,
+                    expires_ms: bet.expires_at.or(order.expires_ms),
+                    ..order.clone()
+                });
+            }
+            (order, fill_mana, fill_shares)
+        };
 
         if self.store.cached(&bet.contract_id).is_none() {
             tracing::warn!(
@@ -4090,9 +4123,20 @@ fn analyze_buy_fill(result: &BetResult, requested_mana: f64, market_id: &str) ->
     Ok(true)
 }
 
-/// Truncates response text for an error message without splitting a character.
+/// Truncates response text for an error message without splitting a character
+/// and without letting control characters forge extra log records.
 fn snippet(text: &str) -> String {
-    let mut out: String = text.chars().take(ERROR_SNIPPET_CHARS).collect();
+    let mut out: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(ERROR_SNIPPET_CHARS)
+        .collect();
     if text.chars().count() > ERROR_SNIPPET_CHARS {
         out.push('…');
     }
@@ -4684,6 +4728,46 @@ mod tests {
             line.starts_with("GET /v0/users/by-id?ids%5B%5D=u1 "),
             "unexpected request line: {line}"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_routes_refuse_more_than_the_schema_max_ids() {
+        // The schema is `max(100)` on both routes; the client must not build
+        // a request that the server is guaranteed to reject.
+        let client = ManifoldClient::for_test("http://127.0.0.1:9");
+        let ids: Vec<String> = (0..=BATCH_IDS_MAX)
+            .map(|index| format!("id-{index}"))
+            .collect();
+        assert_eq!(ids.len(), 101);
+
+        let error = client
+            .market_probs(&ids)
+            .await
+            .expect_err("101 market ids must be refused locally");
+        assert!(
+            error.to_string().contains("at most 100 ids"),
+            "unexpected error: {error}"
+        );
+
+        let error = client
+            .users_by_id(&ids)
+            .await
+            .expect_err("101 user ids must be refused locally");
+        assert!(
+            error.to_string().contains("at most 100 ids"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn error_snippets_replace_control_characters() {
+        let body = "first line\r\nsecond line\twith a tab";
+        assert_eq!(snippet(body), "first line  second line with a tab");
+
+        let long: String = "x\n".repeat(ERROR_SNIPPET_CHARS);
+        let out = snippet(&long);
+        assert!(!out.chars().any(char::is_control), "control chars: {out:?}");
+        assert!(out.ends_with('…'), "a truncated snippet is marked: {out:?}");
     }
 
     #[test]
@@ -5533,6 +5617,11 @@ mod tests {
             "provenance shows the fill source"
         );
         assert_eq!(trades[0].manifold_bet_id.as_deref(), Some("rest-1"));
+        assert_eq!(
+            trades[0].limit_prob,
+            Some(0.49),
+            "the maker fill must keep the resting order's limit"
+        );
 
         // Budget invariant holds after the fill.
         let row = store.load("Market_test").expect("load").expect("row");
@@ -5567,6 +5656,42 @@ mod tests {
         // The fill was announced downstream (Discord embeds read these).
         // The order stays tracked (not fully filled, not cancelled, alive).
         assert!(executor.own_orders().get("Market_test", "rest-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_maker_broadcasts_apply_once() {
+        let market = market_with(100.0, 10.0, 0.0, 20.0, 0.0);
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let store = Arc::new(MarketStore::new(&db).expect("store loads"));
+        store.insert(&market).expect("insert market");
+        let executor = offline_executor(&db, &store);
+        let now_ms = Utc::now().timestamp_millis();
+        executor.own_orders().upsert(live_resting_order(now_ms));
+
+        let mut bet = own_bet_event("rest-1", 30.0, 60.0);
+        bet.expires_at = Some(now_ms + 40_000);
+
+        // Both deliveries carry the same cumulative counters and race for the
+        // same delta. The delta is derived under the execution lock and the
+        // counters advance there, so only the first sees a fill.
+        let (first, second) = tokio::join!(
+            executor.on_own_bet_event(&bet),
+            executor.on_own_bet_event(&bet)
+        );
+        first.expect("first delivery handled");
+        second.expect("second delivery handled");
+
+        let trades = db.recent_trades("Market_test", 10).expect("ledger");
+        assert_eq!(
+            trades.len(),
+            1,
+            "a concurrent duplicate must not apply the fill twice"
+        );
+        let book = Book::load(&store, &db, "Market_test")
+            .expect("load book")
+            .expect("tracked");
+        assert_close(book.leg(0).yes_shares, 60.0);
+        assert_close(book.leg(0).invested_mana, 30.0);
     }
 
     #[tokio::test]
@@ -5802,6 +5927,11 @@ mod tests {
         assert_eq!(trades[0].action, TradeAction::BuyYes);
         assert_eq!(trades[0].trigger_post_uri.as_deref(), Some("Market_snipe"));
         assert_eq!(trades[0].manifold_bet_id.as_deref(), Some("snipe-bet"));
+        assert_eq!(
+            trades[0].limit_prob,
+            Some(0.79),
+            "the ledger must record the fair-capped YES limit actually sent"
+        );
 
         // The snipe ledger recorded the real fill, not the intention.
         let snipes = db.recent_snipes(10).expect("snipes");
@@ -5976,6 +6106,11 @@ mod tests {
         assert_eq!(trades[0].action, TradeAction::BuyYes);
         assert_eq!(trades[0].trigger_post_uri.as_deref(), Some("source-bet"));
         assert_eq!(trades[0].manifold_bet_id.as_deref(), Some("copy-fill"));
+        assert_eq!(
+            trades[0].limit_prob,
+            Some(0.59),
+            "the ledger must record the fair-capped YES limit actually sent"
+        );
         assert!((trades[0].p_internal - 0.60).abs() < 1e-9);
 
         // The copy ledger recorded the same fill plus the decision outputs.
@@ -6232,6 +6367,59 @@ mod tests {
                 .is_empty(),
             "no wire call may happen after the refusal"
         );
+    }
+
+    #[tokio::test]
+    async fn a_non_finite_planned_amount_is_refused_not_clamped() {
+        let harness = copy_harness(0.60, 0.90, 0.50).await;
+        let CopyHarness {
+            executor,
+            db,
+            store,
+            manifold,
+        } = harness;
+        let mut market = crate::copy::copy_market_row("Market_copy", 0.0, 0.0);
+        market.budget_mana = 100.0;
+        store.insert(&market).expect("copy row");
+
+        let planned = PlannedTrade {
+            leg: 0,
+            decision: TradeDecision {
+                action: TradeAction::BuyYes,
+                amount_mana: f64::NAN,
+                shares: None,
+                answer_id: None,
+            },
+            p_internal: 0.6,
+            p_market: 0.5,
+        };
+        let outcome = executor
+            .execute_planned_with_provenance(
+                "Market_copy",
+                &planned,
+                Some("NaN-amount"),
+                Utc::now().timestamp(),
+                None,
+            )
+            .await
+            .expect("handled");
+
+        match outcome {
+            PlannedOutcome::Refused(reason) => {
+                assert!(reason.contains("not finite"), "{reason}");
+            }
+            other => panic!(
+                "a non-finite amount must be refused, got {:?}",
+                planned_outcome_label(&other)
+            ),
+        }
+        assert!(
+            db.recent_trades("Market_copy", 10)
+                .expect("trades")
+                .is_empty(),
+            "a refused amount writes no trade row"
+        );
+        assert_eq!(manifold.requests(), 0, "no wire call may run");
     }
 
     #[tokio::test]

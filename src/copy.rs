@@ -522,14 +522,17 @@ impl CopyStrategy {
         // It is already committed to this pool and to today's deployment, so
         // both remainders subtract it. The authoritative check under the
         // execution lock repeats this with a fresh read (see
-        // `TradeExecutor::execute_planned_with_provenance`).
+        // `TradeExecutor::execute_planned_with_provenance`); this pre-check
+        // mirrors its non-negative and finite guards so neither path can be
+        // widened by a bad input.
+        let resting_mana = resting_mana.max(0.0);
         let pool_remaining = self.pool_mana - self.db.copy_pool_invested()? - resting_mana;
-        if pool_remaining < self.min_trade_size {
+        if !pool_remaining.is_finite() || pool_remaining < self.min_trade_size {
             return self.skip(&draft, "pool_exhausted");
         }
         let spent = self.db.copy_spent_last_24h(now)?;
         let daily_remaining = self.daily_mana - spent - resting_mana;
-        if daily_remaining < self.min_trade_size {
+        if !daily_remaining.is_finite() || daily_remaining < self.min_trade_size {
             return self.skip(&draft, "daily_cap");
         }
         let cap = self
@@ -537,6 +540,9 @@ impl CopyStrategy {
             .min(pool_remaining)
             .min(daily_remaining)
             .max(0.0);
+        if !cap.is_finite() {
+            return self.skip(&draft, "cap_not_finite");
+        }
         if cap < self.min_trade_size {
             return self.skip(&draft, "cap_below_min_size");
         }
