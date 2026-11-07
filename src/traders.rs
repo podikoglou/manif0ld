@@ -64,6 +64,7 @@
 //! from the database alone.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -81,6 +82,15 @@ use crate::trade::{ManifoldClient, PortfolioHistoryPoint, LEADERBOARD_MAX_LIMIT}
 /// requests, so this leaves room for a much larger watch list without letting
 /// a typo drain the shared 500/min bucket.
 pub const MAX_REFRESH_REQUESTS: usize = 1_000;
+
+/// Waits before each retry of a failed refresh, in order: 30 s, 60 s, 120 s.
+///
+/// A failed refresh is usually one flaky public read (a direct `curl` answers
+/// 200 seconds later), so retrying inside the tick beats waiting the whole
+/// `TRADER_REFRESH_MIN` (60 min by default) for a working API. Three retries
+/// are the hard cap: their 210 s total still fits the smallest allowed
+/// interval (5 min), and the cap keeps an outage from becoming a retry storm.
+const RETRY_BACKOFF_SECS: [u64; 3] = [30, 60, 120];
 
 /// Ranking used for the skill core of the candidate universe: all-time profit.
 const PROFIT_LEADERBOARD: &str = "profit";
@@ -417,6 +427,12 @@ fn spend(rate: &RateLimiter, used: &mut usize, budget: usize) -> bool {
 /// A failure of a universe request aborts the pass (`?`) because there is
 /// nothing to score. Per-trader failures only skip that trader: the rest of
 /// the pass and the previous scores stay useful.
+///
+/// The pass is also all-or-nothing on disk: every candidate is scored into a
+/// local map, and the only write is [`TraderBoard::publish`], whose replace-all
+/// `DELETE` + `INSERT` runs in one SQLite transaction. An aborted pass
+/// therefore publishes nothing, so a retry after a failure starts from the
+/// last committed board rather than a half-written one.
 pub async fn refresh(
     client: &ManifoldClient,
     db: &Db,
@@ -557,12 +573,74 @@ pub async fn refresh(
     Ok(kept)
 }
 
+/// Delay before the next attempt after attempt number `attempt` (1-based)
+/// failed; `None` once [`RETRY_BACKOFF_SECS`] is spent.
+///
+/// Pure so the schedule is testable without a clock or a network call.
+fn next_retry_after(attempt: usize) -> Option<Duration> {
+    RETRY_BACKOFF_SECS
+        .get(attempt.checked_sub(1)?)
+        .map(|secs| Duration::from_secs(*secs))
+}
+
+/// Runs one refresh tick, retrying a failed pass on the
+/// [`RETRY_BACKOFF_SECS`] schedule.
+///
+/// A transient failure (the common case: one flaky public read) therefore
+/// recovers within the tick instead of waiting `TRADER_REFRESH_MIN`. Each
+/// failed attempt logs exactly one `warn!` with its attempt number and the
+/// full anyhow chain (`{error:#}`), so the line names the HTTP status,
+/// timeout, or parse cause rather than only the outer context. The cap is
+/// fixed: after the last retry the error is returned and the caller waits for
+/// the normal cadence.
+///
+/// The attempt closure and the pause are parameters so tests can script a
+/// flaky API and record the delays without touching the clock or the network.
+/// Production passes [`refresh`] and [`tokio::time::sleep`]; sleeping is
+/// abort-safe, and a cancelled attempt has published nothing (see [`refresh`]).
+async fn refresh_with_retries<A, Fut, P, PFut>(mut attempt_fn: A, mut pause: P) -> AppResult<usize>
+where
+    A: FnMut() -> Fut,
+    Fut: Future<Output = AppResult<usize>>,
+    P: FnMut(Duration) -> PFut,
+    PFut: Future<Output = ()>,
+{
+    let mut attempt = 1usize;
+    loop {
+        match attempt_fn().await {
+            Ok(kept) => return Ok(kept),
+            Err(error) => {
+                let chain = format!("{error:#}");
+                let Some(delay) = next_retry_after(attempt) else {
+                    tracing::warn!(
+                        attempt = attempt as u64,
+                        error = %chain,
+                        "trader refresh failed; giving up until the next interval"
+                    );
+                    return Err(error);
+                };
+                tracing::warn!(
+                    attempt = attempt as u64,
+                    retry_in_secs = delay.as_secs(),
+                    error = %chain,
+                    "trader refresh failed; retrying within the tick"
+                );
+                pause(delay).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Runs the leaderboard refresh forever, first pass immediately.
 ///
-/// One pass per `TRADER_REFRESH_MIN` minutes. A failed pass logs and waits for
-/// the next tick: the persisted board stays usable, and a transient API error
-/// must not stop the task. Aborting the returned future (Ctrl-C, as in
-/// [`crate::app`]) is safe at any await point — no lock is held across one.
+/// One pass per `TRADER_REFRESH_MIN` minutes, except that a failed pass is
+/// retried inside the same tick on the [`RETRY_BACKOFF_SECS`] schedule (at most
+/// three retries) before the task waits for the next period. Each failed
+/// attempt logs one `warn!` with the full error chain; after the cap the
+/// persisted board stays usable and the task keeps running. Aborting the
+/// returned future (Ctrl-C, as in [`crate::app`]) is safe at any await point —
+/// no lock is held across one.
 pub async fn run(
     client: ManifoldClient,
     db: Db,
@@ -578,9 +656,17 @@ pub async fn run(
     ticker.tick().await;
 
     loop {
-        match refresh(&client, &db, &config, &board, &rate).await {
+        match refresh_with_retries(
+            || refresh(&client, &db, &config, &board, &rate),
+            tokio::time::sleep,
+        )
+        .await
+        {
             Ok(kept) => tracing::debug!(kept, "trader refresh finished"),
-            Err(error) => tracing::warn!(error = %error, "trader refresh failed; retrying next tick"),
+            // Every attempt has already logged its own warning.
+            Err(_) => {
+                tracing::debug!("trader refresh exhausted its retries; waiting for the next tick")
+            }
         }
         ticker.tick().await;
     }
@@ -852,6 +938,162 @@ mod tests {
             .expect("publish trim");
         assert_eq!(board.len(), 1);
         assert_eq!(board.lookup("gated"), None);
+    }
+
+    #[test]
+    fn retry_schedule_is_30_60_120_seconds_and_then_stops() {
+        assert_eq!(next_retry_after(0), None, "attempt numbers are 1-based");
+        assert_eq!(next_retry_after(1), Some(Duration::from_secs(30)));
+        assert_eq!(next_retry_after(2), Some(Duration::from_secs(60)));
+        assert_eq!(next_retry_after(3), Some(Duration::from_secs(120)));
+        assert_eq!(
+            next_retry_after(4),
+            None,
+            "past the cap the backoff must not grow"
+        );
+        assert_eq!(next_retry_after(usize::MAX), None);
+
+        // The whole retry schedule still fits the smallest legal interval, so
+        // in-tick retries can never push a healthy pass past TRADER_REFRESH_MIN.
+        let total: u64 = RETRY_BACKOFF_SECS.iter().sum();
+        assert!(
+            total < 5 * 60,
+            "{total} s of retries must fit inside 5 minutes"
+        );
+    }
+
+    #[test]
+    fn a_flaky_refresh_retries_within_the_tick_and_publishes_the_board() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let board = TraderBoard::empty();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let pauses = std::sync::Mutex::new(Vec::new());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime builds");
+        let kept = runtime
+            .block_on(refresh_with_retries(
+                || {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let board = &board;
+                    let db = &db;
+                    async move {
+                        if attempt == 0 {
+                            // The exact outer context the soak logged, plus the
+                            // root cause the chain must carry.
+                            Err(crate::error::anyhow!(
+                                "fetching the creator leaderboard: Manifold GET /v0/leaderboard \
+                                 failed with HTTP 503: upstream unavailable"
+                            ))
+                        } else {
+                            board.publish(db, vec![trader("recovered", 1.0)])
+                        }
+                    }
+                },
+                |delay| {
+                    pauses.lock().expect("pause lock").push(delay);
+                    std::future::ready(())
+                },
+            ))
+            .expect("the retry succeeds");
+
+        assert_eq!(kept, 1);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            *pauses.lock().expect("pause lock"),
+            vec![Duration::from_secs(30)]
+        );
+        assert_eq!(
+            board.lookup("recovered").map(|row| row.user_id),
+            Some("recovered".to_owned()),
+            "the successful retry publishes the board"
+        );
+        let reloaded = TraderBoard::load(&db).expect("reload");
+        assert_eq!(
+            reloaded.lookup("recovered").map(|row| row.user_id),
+            Some("recovered".to_owned()),
+            "and persists it"
+        );
+    }
+
+    #[test]
+    fn an_api_that_keeps_failing_stops_at_the_attempt_cap() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let pauses = std::sync::Mutex::new(Vec::new());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime builds");
+        let error = runtime
+            .block_on(refresh_with_retries(
+                || {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {
+                        Err(crate::error::anyhow!(
+                            "fetching the creator leaderboard: Manifold GET /v0/leaderboard \
+                             failed with HTTP 500: internal error"
+                        ))
+                    }
+                },
+                |delay| {
+                    pauses.lock().expect("pause lock").push(delay);
+                    std::future::ready(())
+                },
+            ))
+            .expect_err("a dead API must give up instead of retrying forever");
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            RETRY_BACKOFF_SECS.len() + 1,
+            "one initial attempt plus one per retry in the schedule"
+        );
+        assert_eq!(
+            *pauses.lock().expect("pause lock"),
+            vec![
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                Duration::from_secs(120)
+            ],
+            "the last attempt waits for the normal cadence instead of pausing"
+        );
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "the original error must come back so the cadence loop can decide: {error}"
+        );
+    }
+
+    #[test]
+    fn a_failed_publish_rolls_back_and_keeps_the_previous_board() {
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let board = TraderBoard::empty();
+        board
+            .publish(&db, vec![trader("kept", 1.0), trader("old", 2.0)])
+            .expect("seed the board");
+
+        // A duplicate primary key fails the second INSERT of the replace-all
+        // transaction, which models any mid-pass write failure.
+        let error = board
+            .publish(&db, vec![trader("kept", 9.0), trader("kept", 8.0)])
+            .expect_err("a duplicate user_id must abort the write");
+        assert!(
+            format!("{error:#}").contains("inserting the score of trader kept"),
+            "the chain names the failing row: {error:#}"
+        );
+
+        // The committed board must survive untouched: no partial scoreboard.
+        let reloaded = TraderBoard::load(&db).expect("reload");
+        assert_eq!(reloaded.len(), 2, "the DELETE must have rolled back");
+        assert_eq!(
+            reloaded.lookup("old").map(|row| row.user_id),
+            Some("old".to_owned())
+        );
+        assert_eq!(reloaded.lookup("kept").map(|row| row.score), Some(1.0));
+        assert_eq!(
+            board.lookup("kept").map(|row| row.score),
+            Some(1.0),
+            "the cache is not swapped when the transaction fails"
+        );
     }
 
     /// End-to-end check of the live wire, in the style of the other `live_*`
