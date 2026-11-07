@@ -42,7 +42,7 @@ COPY_ENABLED=false
 TRADERS_ENABLED=true
 ```
 Watch:
-- `heartbeat` every 5 s with `messages_per_sec`, `messages_processed`, `active_markets`. A frozen counter means ingest is stuck.
+- `heartbeat` every 5 s with `messages_per_sec`, `messages_processed`, `active_markets`, and the Manifold socket's `manifold_ws_connected`, `manifold_ws_events`, `manifold_ws_connections`, `manifold_ws_idle_secs`. A frozen Jetstream counter means ingest is stuck; `manifold_ws_connected=false`, `manifold_ws_idle_secs=never`, or a growing idle value means the live-price mirror is stale. `manifold_ws_connections` above 1 is a reconnect, which is normal in isolation.
 - `manifold stream ended; reconnecting` / `reconnecting to manifold` with `retry_in_secs`. Occasional is normal; a tight loop is not.
 - `reconcile pass complete` every 5 minutes. `mismatches > 0` is a mirror bug, not tuning.
 - No snipe or copy errors are possible: both flags are off.
