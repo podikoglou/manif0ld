@@ -32,6 +32,8 @@
 //! socket read without ever stopping the app-level ping.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -84,6 +86,9 @@ const CHANNEL_FULL_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// How many bytes of an unparseable payload to show in a `debug!` log line.
 const BAD_PAYLOAD_SAMPLE_BYTES: usize = 240;
 
+/// Sentinel for "no inbound frame has arrived yet" in [`Stats`].
+const NO_FRAME_YET: u64 = u64::MAX;
+
 /// Event topics the bot subscribes to, in one immutable list.
 ///
 /// `global/updated-contract` and `global/new-bet` mirror price and order
@@ -108,6 +113,94 @@ pub fn channel() -> (mpsc::Sender<ManifoldEvent>, mpsc::Receiver<ManifoldEvent>)
     mpsc::channel(CHANNEL_CAPACITY)
 }
 
+/// Live connection statistics sampled by the INFO heartbeat in [`crate::app`].
+///
+/// The socket loop is the only writer and uses relaxed atomics, so recording
+/// costs a load/store pair per frame and a snapshot never blocks the
+/// connection. The heartbeat is the only reader; nobody waits on either side.
+#[derive(Debug)]
+pub struct Stats {
+    /// Origin for the timestamps below, close enough to "process start".
+    started: Instant,
+    /// True while an acked subscription is streaming.
+    connected: AtomicBool,
+    /// Acked connections since start; more than one means a reconnect.
+    connections: AtomicU64,
+    /// Parsed events delivered to the consumer since start.
+    events: AtomicU64,
+    /// Milliseconds since [`Stats::started`] of the last inbound frame, or
+    /// [`NO_FRAME_YET`] before the first one.
+    last_frame_millis: AtomicU64,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Stats {
+    /// Creates an empty statistics block, disconnected and frameless.
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            connected: AtomicBool::new(false),
+            connections: AtomicU64::new(0),
+            events: AtomicU64::new(0),
+            last_frame_millis: AtomicU64::new(NO_FRAME_YET),
+        }
+    }
+
+    /// Reports whether an acked subscription is streaming right now.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    /// Counts the acked connections since start; `> 1` means a reconnect.
+    pub fn connections(&self) -> u64 {
+        self.connections.load(Ordering::Relaxed)
+    }
+
+    /// Counts the parsed events delivered to the consumer since start.
+    pub fn events(&self) -> u64 {
+        self.events.load(Ordering::Relaxed)
+    }
+
+    /// Age of the most recent inbound frame, or `None` if none arrived yet.
+    pub fn last_frame_age(&self) -> Option<Duration> {
+        match self.last_frame_millis.load(Ordering::Relaxed) {
+            NO_FRAME_YET => None,
+            millis => Some(Duration::from_millis(millis)),
+        }
+    }
+
+    /// Records a freshly acked subscription.
+    fn mark_connected(&self) {
+        self.connections.fetch_add(1, Ordering::Relaxed);
+        self.connected.store(true, Ordering::Relaxed);
+    }
+
+    /// Records that the acked connection ended; the runner reconnects.
+    fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+    }
+
+    /// Records any inbound frame, including pongs, as a liveness signal.
+    fn record_frame(&self) {
+        let millis = self
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128 - 1) as u64;
+        self.last_frame_millis.store(millis, Ordering::Relaxed);
+    }
+
+    /// Records one event handed to the consumer.
+    fn record_event(&self) {
+        self.events.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Runs the broadcast client forever, queueing events on `tx`.
 ///
 /// Connection failures, ack failures, ack timeouts, and closed streams are
@@ -121,9 +214,17 @@ pub fn channel() -> (mpsc::Sender<ManifoldEvent>, mpsc::Receiver<ManifoldEvent>)
 /// signature so the `App::spawn` wiring keeps a stable call shape for future
 /// topic or endpoint configuration.
 ///
+/// `stats` is updated in place for the heartbeat: connection state, event
+/// count, and last-frame age. It is an [`Arc`] so the heartbeat can sample it
+/// while this runner owns the socket.
+///
 /// The function returns when no receiver of the event channel is left;
 /// reconnecting to nobody would only churn.
-pub async fn run(_config: Config, tx: mpsc::Sender<ManifoldEvent>) -> AppResult<()> {
+pub async fn run(
+    _config: Config,
+    tx: mpsc::Sender<ManifoldEvent>,
+    stats: Arc<Stats>,
+) -> AppResult<()> {
     let mut attempt: u32 = 0;
 
     loop {
@@ -144,7 +245,7 @@ pub async fn run(_config: Config, tx: mpsc::Sender<ManifoldEvent>) -> AppResult<
                 attempt = 0;
                 tracing::info!("manifold broadcast socket connected");
 
-                match consume(websocket, &tx).await {
+                match consume(websocket, &tx, &stats).await {
                     Ok(()) => tracing::warn!("manifold stream ended; reconnecting"),
                     Err(error) => {
                         if tx.is_closed() {
@@ -157,6 +258,9 @@ pub async fn run(_config: Config, tx: mpsc::Sender<ManifoldEvent>) -> AppResult<
                         tracing::error!(error = %error, "manifold stream failed");
                     }
                 }
+                // The heartbeat must not keep reporting a socket that is
+                // already gone while the backoff runs.
+                stats.mark_disconnected();
 
                 let delay = backoff_delay(attempt);
                 attempt = attempt.saturating_add(1);
@@ -305,6 +409,7 @@ pub struct NewContractEvent {
 async fn consume<T>(
     websocket: WebSocketStream<T>,
     tx: &mpsc::Sender<ManifoldEvent>,
+    stats: &Stats,
 ) -> AppResult<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -322,6 +427,7 @@ where
 
     match tokio::time::timeout(ACK_TIMEOUT, subscribe_ack(&mut stream, txid)).await {
         Ok(AckState::Granted) => {
+            stats.mark_connected();
             tracing::info!(
                 topics = ?default_topics(),
                 txid,
@@ -374,11 +480,18 @@ where
                 Ok(None) => break 'main Ok(()),
                 Ok(Some(Err(error))) =>
                     break 'main Err(error).context("reading a manifold message"),
-                Ok(Some(Ok(Message::Text(text)))) =>
-                    queue_frame(text.as_str(), &mut pending, &mut parse_warn),
-                Ok(Some(Ok(Message::Close(_)))) => break 'main Ok(()),
-                // Ping, Pong, and Binary frames carry no broadcast data.
-                Ok(Some(Ok(_))) => {}
+                Ok(Some(Ok(frame))) => {
+                    // Any frame proves the connection is alive; record it
+                    // before deciding what the frame carries.
+                    stats.record_frame();
+                    match frame {
+                        Message::Text(text) =>
+                            queue_frame(text.as_str(), &mut pending, &mut parse_warn),
+                        Message::Close(_) => break 'main Ok(()),
+                        // Ping, Pong, and Binary frames carry no broadcast data.
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -403,8 +516,11 @@ where
                 }
                 sent = tx.send(event) => {
                     pending.pop_front();
-                    if let Err(error) = sent {
-                        break 'main Err(error).context("queueing a manifold event");
+                    match sent {
+                        Ok(()) => stats.record_event(),
+                        Err(error) => {
+                            break 'main Err(error).context("queueing a manifold event");
+                        }
                     }
                 }
             }
@@ -1053,6 +1169,43 @@ mod tests {
         assert_eq!(backoff_delay(3), Duration::from_secs(8));
         assert_eq!(backoff_delay(10), Duration::from_secs(60));
         assert_eq!(backoff_delay(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn stats_start_disconnected_with_no_frames() {
+        let stats = Stats::new();
+
+        assert!(!stats.is_connected());
+        assert_eq!(stats.connections(), 0);
+        assert_eq!(stats.events(), 0);
+        assert_eq!(stats.last_frame_age(), None, "no frame means no age");
+    }
+
+    #[test]
+    fn stats_follow_the_connection_and_frame_cadence() {
+        let stats = Stats::new();
+
+        stats.mark_connected();
+        assert!(stats.is_connected());
+        assert_eq!(stats.connections(), 1);
+
+        stats.record_frame();
+        stats.record_event();
+        stats.record_event();
+        assert!(
+            stats
+                .last_frame_age()
+                .is_some_and(|age| age < Duration::from_secs(5)),
+            "a frame recorded now has a near-zero age"
+        );
+        assert_eq!(stats.events(), 2);
+
+        // A reconnect is a second acked connection, not a reset.
+        stats.mark_disconnected();
+        assert!(!stats.is_connected());
+        stats.mark_connected();
+        assert_eq!(stats.connections(), 2);
+        assert_eq!(stats.events(), 2);
     }
 
     #[test]

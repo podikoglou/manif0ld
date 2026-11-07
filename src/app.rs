@@ -179,6 +179,10 @@ impl App {
         let post_tx = ingest::channel();
         let post_rx = post_tx.subscribe();
         let (manifold_event_tx, manifold_event_rx) = manifold_ws::channel();
+        // Shared between the socket task (writer) and the heartbeat (reader),
+        // so the heartbeat can report socket health without touching the
+        // connection itself.
+        let manifold_ws_stats = Arc::new(manifold_ws::Stats::new());
 
         let discord_state = DiscordState {
             config: Arc::clone(&config),
@@ -200,6 +204,7 @@ impl App {
         let heartbeat_task = tokio::spawn({
             let pipeline = Arc::clone(&pipeline);
             let store = Arc::clone(&store);
+            let manifold_ws = Arc::clone(&manifold_ws_stats);
             async move {
                 let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -218,10 +223,20 @@ impl App {
                     } else {
                         0.0
                     };
+                    // `"never"` rather than a huge number keeps the first
+                    // heartbeat readable before the first ws frame arrives.
+                    let ws_idle = manifold_ws.last_frame_age().map_or_else(
+                        || "never".to_owned(),
+                        |age| format!("{:.1}", age.as_secs_f64()),
+                    );
                     tracing::info!(
                         messages_per_sec = %format!("{per_sec:.1}"),
                         messages_processed = count,
                         active_markets = store.active_count(),
+                        manifold_ws_connected = manifold_ws.is_connected(),
+                        manifold_ws_events = manifold_ws.events(),
+                        manifold_ws_connections = manifold_ws.connections(),
+                        manifold_ws_idle_secs = %ws_idle,
                         "heartbeat"
                     );
                     last_count = count;
@@ -243,8 +258,9 @@ impl App {
         // mirror; it is always part of the operate mode.
         let manifold_ws_task = tokio::spawn({
             let config = (*config).clone();
+            let stats = Arc::clone(&manifold_ws_stats);
             async move {
-                if let Err(error) = manifold_ws::run(config, manifold_event_tx).await {
+                if let Err(error) = manifold_ws::run(config, manifold_event_tx, stats).await {
                     tracing::error!(error = %error, "manifold websocket stopped");
                 }
             }
